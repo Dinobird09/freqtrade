@@ -437,3 +437,115 @@ Record fields:
   - a power curve (>= 4 strengths x >= 20 seeds) with the minimum detectable effect at
     50% / 80% power;
   - per candidate, how many seeds reached the TEST gate.
+
+---------------------------------------------------------------------------------------
+
+## v4 amendments (orchestrator, before gate cycle 3, the final cycle). Binding.
+
+### D1. Pinned label rule in the adoption gate (W3)
+- `label_params` in a record is a closed schema: `{seed, n_boot, m, alpha, max_dd_pct,
+  train_dd_p95_pct, mtm_max_dd_pct}`. Any other key blocks the check.
+- `m` must equal `metrics.M_CANDIDATES` (4) and `alpha` must equal `metrics.ALPHA` (0.05).
+- `n_boot` must be >= `metrics.N_BOOT` (4000) and `seed` must equal
+  `walkforward.SUMMARY_SEED`. Otherwise the check blocks with `ADOPT_walk_forward`.
+- Do not route parameters by introspecting signatures.
+- From HUMAN_REVIEW on, the C5 inputs are REQUIRED and RECOMPUTED:
+  - `train_dd_p95_pct` is recomputed from the hash-bound TRAIN journal with the pinned
+    seed and n_boot;
+  - `mtm_max_dd_pct` is recomputed from the hash-bound candle files for `real` provenance;
+  - a mismatch greater than 1e-9 blocks.
+- `StrategyConfig.is_test_only` is True for regime-off and for any `stop_fill_wick_k > 0`.
+  Such configs are blocked from HUMAN_REVIEW on with `ADOPT_test_only`.
+
+### D2. Manifest-backed provenance (W4 fetch_data/data, W5 run_research, W3 adoption)
+- `fetch_data` writes `manifest.json` next to the candles. It records the exchange id,
+  ccxt version, symbol, timeframe, since/until, fetched_at_utc, and per file its name,
+  rows, first/last ts and sha256.
+- `data.verify_manifest(data_dir, pairs, timeframe) -> (provenance, details)` returns
+  `"real"` only when every loaded file is listed with a matching sha256. Otherwise it
+  returns `"unverified-csv"`.
+- `run_research --data-dir` records that provenance plus the manifest path and sha256.
+- adoption allows only `"real"` with a hash-matching manifest past WALK_FORWARD. Anything
+  else is blocked with `ADOPT_provenance`.
+- An offline check cannot authenticate an exchange download. The manifest makes a
+  laundered CSV a deliberate act instead of an accident; docs must say so.
+- `data.load_candles_csv` / `load_dataset` reject any candle with `ts % timeframe_ms != 0`
+  ("not epoch-aligned").
+
+### D3. Holdout ledger: holdout reuse is controlled (W5 writes, W3 checks)
+- run_research appends one JSON line per pre-registered (adoptable) candidate that got a
+  TEST backtest. The ledger is `--ledger PATH`; the default is `<data-dir>/.test_looks.jsonl`
+  for real data and `<out-dir>/test_looks.jsonl` for synthetic data.
+- Each line records: run_utc, argv, variant, config_fingerprint, model_fingerprint or
+  null, split_utc, and per pair `{pair, file_sha256, test_start_ts, test_end_ts}`.
+- Context (non-selected) discovery variants and test-only variants are NOT adoptable. They
+  get no promotable record; any record for one is blocked with `ADOPT_holdout`, reason
+  "context variant".
+- From HUMAN_REVIEW on, check_promotion reads the ledger at `record.ledger_path` (required,
+  hash not bound because it is append-only). For each pair of the record it counts the
+  DISTINCT `(config_fingerprint, model_fingerprint)` among ledger lines for that pair whose
+  TEST window overlaps the record's TEST window. It blocks with `ADOPT_holdout` if the
+  count exceeds `metrics.M_CANDIDATES`.
+- Re-running the identical candidates is not a new look.
+- After a reviewer N, or any other revision, the variant needs TEST data it has never
+  seen: a TEST window starting at or after the latest `test_end_ts` of every earlier look.
+  It is never re-run on the same TEST window.
+- REPORT section 6 and the console print the cumulative distinct-look count per pair for
+  the run's TEST window.
+
+### D4. Execution realism
+- Stop-fill stress: with `cfg.stop_fill_wick_k = k > 0`, a non-gap stop fills at
+  `stop - k*(stop - exit_candle.low)`, then slippage.
+- invariants accepts r < -1 on non-gap stops only when k > 0.
+- The default (k = 0) must stay byte-identical.
+- Stress configs are test-only (D1).
+- W5 runs k = 0.5 and 1.0 on the five seed-1 worlds and reports the R shift and any label
+  change, TRAIN and TEST side by side.
+
+### D5. Live adapter and parity (W4)
+- `gatekeeper.LiveSession(cfg, events, journal_trades=(), starting_equity)` owns open
+  positions, open_risk, equity and breakers (rebuilt with `CircuitBreakers.from_journal`).
+- It exposes `on_candle_close(pair, candles) -> EntryDecision`,
+  `on_fill(pair, decision, market_price, fill_price) -> Trade|None` and
+  `on_exit(trade_id, exit_ts, exit_price, reason) -> Trade`, calling only
+  `Gatekeeper.evaluate` / `plan_fill`.
+- It must accept ACTUAL fills and exits injected from a journal so a replay can reproduce
+  a live or testnet run.
+- A whole-run parity test drives LiveSession candle by candle over a 6-year synthetic world,
+  including a mid-run restart from the written journal. The trade list must equal
+  run_backtest's exactly.
+- `invariants --live-journal`: exit offset 0; cross-trade R6/R9; per-candle R1-R5/R8
+  re-derived at each trade's signal_ts from supplied candles and events. The backtest
+  fill-price identities are not asserted.
+
+### D6. TESTNET evidence (W3; uses D5)
+- The record's testnet section requires:
+  - `journal_path`, `decisions_path` (a CSV of every evaluated signal:
+    pair, signal_ts, allowed, rule, reason) and `candles` (the 4H candle files the testnet
+    bot evaluated), each sha256-bound;
+  - `starting_equity`, `events_path` (optional; without it R5 is stated as not verified).
+- The check:
+  - duration >= 14 days;
+  - replay LiveSession over the candles, injecting the journal's actual fills and exits;
+    the replayed allowed `(pair, signal_ts)` set must equal the journal's entries AND the
+    decisions log's allowed rows, with every difference listed;
+  - `invariants` live-journal mode is clean.
+- The reason text states the expected trade count for the window at the measured baseline
+  rate, about 1 per 14 days. It also says Binance spot testnet prices and liquidity are not
+  mainnet, so this stage verifies execution and rule compliance, not edge.
+
+### D7. C5 revision
+- `metrics.DD_CAP_PCT = 15.0`.
+- Rationale: at the mandated 1% cluster risk budget, 15% is 15 consecutive full-size
+  losses. At the 2:1 break-even win probability p* = 1/3, that streak has probability
+  (2/3)^15 ≈ 0.23%, so a TEST drawdown beyond it is inconsistent with even a break-even
+  strategy at the mandated risk.
+- The TRAIN-bootstrap p95 bound usually binds first.
+- The 3% weekly-loss halt limits how fast the drawdown can accrue, not how deep it can go.
+
+### D8. Fitted layers' TRAIN gate is out of sample
+- For base+ml, the NO-EDGE TRAIN gate uses a purged chronological inner split: fit on the
+  first 70% of TRAIN candidates, evaluate the filtered backtest on the last 30% of TRAIN,
+  purged at the inner boundary.
+- The in-sample TRAIN figure is shown as context only.
+- The final model for TEST is still fit on all TRAIN candidates.

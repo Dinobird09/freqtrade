@@ -64,6 +64,8 @@ BASE = StrategyConfig()
         {"guard_window": 0},
         {"min_trade_risk_pct": 0.0},
         {"starting_capital": 0.0},
+        {"stop_fill_wick_k": -0.1},
+        {"stop_fill_wick_k": 1.5},
     ],
 )
 def test_loosening_is_rejected(changes):
@@ -219,3 +221,11 @@ def test_containers_are_frozen_against_later_mutation():
 def test_equal_content_gives_equal_config():
     a = StrategyConfig(pair_risk=dict(BASE.pair_risk), exclusive_bases=["BNB"])
     assert a == BASE
+
+
+@pytest.mark.parametrize("k", [0.25, 0.5, 1.0])
+def test_stop_fill_stress_configs_are_test_only(k):
+    cfg = BASE.with_changes(stop_fill_wick_k=k)
+    assert cfg.is_test_only
+    assert f"wick{k:g}" in cfg.variant_id()
+    assert not BASE.is_test_only

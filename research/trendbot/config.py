@@ -47,6 +47,8 @@ RULE_IDS = {
     "ADOPT_testnet": "Stage 4: >= 14 days on Binance testnet, zero rule violations, journal",
     "ADOPT_live": "Stage 5: live trading (never for an explicit test-only config)",
     "ADOPT_provenance": "Stages after walk-forward need real, hash-bound data (never synthetic)",
+    "ADOPT_holdout": "At most m adoptable TEST looks per pair on an overlapping TEST window",
+    "ADOPT_test_only": "Test-only / stress configs never go past walk-forward",
 }
 
 # Hard ceilings from the mandate. Variants may go lower, never higher.
@@ -131,6 +133,9 @@ class StrategyConfig:
     slippage_pct: float = 0.05  # adverse slippage on market fills (entries, stop fills)
     starting_capital: float = 10_000.0
     allow_leverage: bool = False
+    # Stop-fill stress (research only, CONTRACT v4 D4): 0 = touch model (stop*(1-slip));
+    # k > 0 fills a non-gap stop at stop - k*(stop - exit_candle.low), minus slippage.
+    stop_fill_wick_k: float = 0.0
 
     # --- optional layers (off by default; must pass the adoption path to be enabled) ---
     expectancy_guard: bool = False
@@ -247,6 +252,8 @@ class StrategyConfig:
             errs.append("min_trade_risk_pct must be > 0")
         if self.starting_capital <= 0:
             errs.append("starting_capital must be > 0")
+        if not (0.0 <= self.stop_fill_wick_k <= 1.0):
+            errs.append("stop_fill_wick_k must be in [0, 1] (0 = touch fill model)")
         if self.fee_rate < MIN_FEE_RATE:
             errs.append(f"fee_rate must be >= {MIN_FEE_RATE} per side (realistic costs)")
         if self.slippage_pct < MIN_SLIPPAGE_PCT:
@@ -259,8 +266,11 @@ class StrategyConfig:
     # ------------------------------------------------------------------ helpers
     @property
     def is_test_only(self) -> bool:
-        """True for configs that switch a rule off for research (regime filter off)."""
-        return not self.regime_filter
+        """True for research-only configs: regime filter off, or a stop-fill stress model.
+
+        Such configs may be backtested and walk-forward tested but never adopted.
+        """
+        return (not self.regime_filter) or self.stop_fill_wick_k > 0
 
     def risk_for(self, pair: str) -> PairRisk:
         base = base_of(pair)
@@ -283,4 +293,6 @@ class StrategyConfig:
             parts.append("regimeOFF")
         if self.expectancy_guard:
             parts.append("guard")
+        if self.stop_fill_wick_k > 0:
+            parts.append(f"wick{self.stop_fill_wick_k:g}")
         return "_".join(parts)
