@@ -285,3 +285,59 @@ def main(argv: list[str] | None = None) -> int
     # --data-dir DIR [--events events.csv]  | --synthetic WORLD --seed N
     # --out-dir research/results/<name>  [--calibrate-seeds N]
 ```
+
+---------------------------------------------------------------------------------------
+
+## v2 amendments (orchestrator, before gate cycle 1). These are binding and override v1.
+
+### A1. Cost-aware risk and reward (R7 and the 2:1 minimum hold NET of costs)
+With fill price `E` (entry slippage already included), stop `S`, `f = cfg.fee_rate` and
+`s = cfg.slippage_pct / 100`:
+- Assumed stop exit price: `S_x = S * (1 - s)`.
+- All-in loss per unit at the stop: `L_u = (E - S_x) + f*E + f*S_x`.
+- `qty = equity * risk_pct / 100 / L_u`. Notional or free-cash caps may only shrink qty.
+- `risk_amount = qty * L_u` and `risk_pct = risk_amount / equity * 100`: the planned all-in loss.
+- Target, so that the net win equals `reward_risk` times the all-in risk:
+  `T = (E*(1+f) + reward_risk*L_u) / (1 - f)`.
+- So a clean stop fill gives exactly `r = -1`, and a TP gives exactly `r = +reward_risk`.
+  Only gap-through stops can be worse than -1R. The price-distance ratio
+  `(T-E)/(E-S)` is then automatically > reward_risk.
+- `SizingResult.stop_distance` stays `E - S`.
+- Owners: W2 `sizing.size_position` / `size_for_pair`, W4 `gatekeeper.plan_fill` and
+  `invariants`. Invariants check: net RR >= reward_risk, price RR >= reward_risk,
+  `risk_amount == qty*L_u`, a clean SL has r == -1, and a TP has r == +reward_risk
+  (tolerance 1e-9).
+- A live bot sizes with the expected fill (last price * (1+s)), then recomputes the target
+  from the actual fill.
+
+### A2. R9 timing is measured from when an exit is certain
+Backtest `Trade.exit_ts` is the OPEN of the exit candle, but the fill happens somewhere in
+`[exit_ts, exit_ts + tf)`.
+- `CircuitBreakers(cfg, exit_time_uncertainty_ms: int = 0)` uses the effective exit time
+  `t_e = exit_ts + exit_time_uncertainty_ms`. The bench runs `[t_e, t_e + bench_hours)`.
+  The 7-day window counts trades with `t_e` in `(ts - loss_window_days, ts]`.
+- The backtester and gatekeeper pass `cfg.timeframe_ms`. A live bot journals real fill
+  times and passes 0.
+- `journal_rules.audit` / `risk_multiplier` and the CLI take the same parameter
+  (CLI flag `--backtest-journal`, which sets it to the timeframe). `invariants` recomputes
+  with the same convention.
+- Result: a bench always lasts >= 24h of real time.
+
+### A3. ML model fingerprint in the adoption path
+- `MLFilter.fingerprint() -> str`: sha256 of a canonical JSON of features, means, stds,
+  intercept, coefficients, threshold and l2.
+- `AdoptionRecord` gains `model_fingerprint: str | None`.
+- `check_promotion(..., model_fingerprint: str | None = None)`:
+  - if the record has a model fingerprint, the supplied current one must match it;
+  - a variant whose id contains "+ml" but has no recorded model fingerprint is blocked
+    (rule `ADOPT_fingerprint`).
+- run_research writes an adoption record for the ML variant, carrying its fingerprint.
+
+### A4. Harness cost floors and bounds (config.py, done)
+- Enforced by config: `fee_rate >= 0.0005`, `slippage_pct >= 0.01`, a 7-day loss limit in
+  `(0, 10]`%, and `0.05 <= min_stop_distance_pct < max_stop_distance_pct <= 25`. Tests may
+  not use zero-cost configs.
+- run_research gains `--fee-rate`, `--slippage-pct` and `--exchange-id`. Coinbase Advanced
+  Trade taker fees at low tiers are several times Binance's: pass the user's real tier.
+  Reports print the costs used.
+- `config.RULE_IDS` now includes the `ADOPT_*` ids.

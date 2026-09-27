@@ -110,7 +110,10 @@ class StopPlan:
 @dataclass(frozen=True, slots=True)
 class SizingResult:
     qty: float  # base-asset quantity
-    risk_amount: float  # quote currency lost if the stop fills exactly: qty * (entry - stop)
+    # ALL-IN quote currency lost if the stop fills at stop*(1-slippage), incl. both fees:
+    # qty * ((entry - stop_x) + fee_rate*entry + fee_rate*stop_x), stop_x = stop*(1-slip).
+    # (CONTRACT.md v2 cost-aware risk.)
+    risk_amount: float
     risk_pct: float  # risk_amount / equity * 100
     stop_distance: float  # entry - stop, quote currency per unit
     notional: float  # qty * entry
@@ -137,7 +140,7 @@ class Trade:
     stop: float
     target: float
     qty: float
-    risk_amount: float  # planned quote-currency risk: qty * (entry_price - stop)
+    risk_amount: float  # planned ALL-IN loss at the stop (see SizingResult.risk_amount)
     risk_pct: float  # planned risk as percent of equity at entry
     stop_method: str = ""
     exit_ts: int | None = None  # open time of the candle in which the exit filled

@@ -33,6 +33,14 @@ RULE_IDS = {
     "L_ml_filter": "Layer: logistic-regression filter (only removes trades, never adds)",
     "L_expectancy_guard": "Layer: halve a pair's risk while its last-N-trade expectancy < 0",
     "X_capital": "Execution: not enough free capital / size below minimum",
+    # Adoption-path gates (adoption.py); mirrored there as ADOPTION_RULE_IDS.
+    "ADOPT_record": "The adoption record names the variant it tracks",
+    "ADOPT_fingerprint": "The config (and ML model, if any) promoted is exactly the one tested",
+    "ADOPT_backtest": "Stage 1: a completed backtest with a report",
+    "ADOPT_walk_forward": "Stage 2: 70/30 walk-forward labelled ROBUST, drawdown within limit",
+    "ADOPT_human_review": "Stage 3: a named human reviewed EVERY trade and approved",
+    "ADOPT_testnet": "Stage 4: >= 14 days on Binance testnet, zero rule violations, journal",
+    "ADOPT_live": "Stage 5: live trading (never for an explicit test-only config)",
 }
 
 # Hard ceilings from the mandate. Variants may go lower, never higher.
@@ -45,6 +53,12 @@ MANDATE_MAX_NEWS_BLACKOUT_FLOOR_H = 2.0  # blackout may be widened, never narrow
 MANDATE_BNB_EVENT_FLOOR_H = 24.0
 MANDATE_MAX_CONSEC_SL = 3
 MANDATE_MIN_BENCH_H = 24.0
+
+# Harness sanity bounds (not from the mandate): keep research runs realistic.
+MIN_FEE_RATE = 0.0005  # 0.05 % per side; zero-cost backtests are optimistic by construction
+MIN_SLIPPAGE_PCT = 0.01
+MAX_WEEKLY_LOSS_LIMIT_PCT = 10.0
+STOP_DISTANCE_BOUNDS_PCT = (0.05, 25.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,14 +185,26 @@ class StrategyConfig:
             errs.append("consecutive_sl_limit must be in [1, 3]")
         if self.bench_hours < MANDATE_MIN_BENCH_H:
             errs.append("bench_hours may not be shorter than 24h")
-        if self.weekly_loss_limit_pct <= 0 or self.loss_window_days < 7:
-            errs.append("7-day loss limit must be > 0 and the window >= 7 days")
+        if not (0 < self.weekly_loss_limit_pct <= MAX_WEEKLY_LOSS_LIMIT_PCT):
+            errs.append(f"7-day loss limit must be in (0, {MAX_WEEKLY_LOSS_LIMIT_PCT}]%")
+        if self.loss_window_days < 7:
+            errs.append("the realized-loss window must be >= 7 days")
         if self.allow_leverage:
             errs.append("leverage is not supported by this research harness")
-        if self.fee_rate < 0 or self.slippage_pct < 0:
-            errs.append("fees and slippage must be non-negative")
+        errs.extend(self._harness_errors())
         if errs:
             raise ConfigError("; ".join(errs))
+
+    def _harness_errors(self) -> list[str]:
+        errs: list[str] = []
+        if self.fee_rate < MIN_FEE_RATE:
+            errs.append(f"fee_rate must be >= {MIN_FEE_RATE} per side (realistic costs)")
+        if self.slippage_pct < MIN_SLIPPAGE_PCT:
+            errs.append(f"slippage_pct must be >= {MIN_SLIPPAGE_PCT}% (realistic costs)")
+        lo, hi = STOP_DISTANCE_BOUNDS_PCT
+        if not (lo <= self.min_stop_distance_pct < self.max_stop_distance_pct <= hi):
+            errs.append(f"stop distance bounds must satisfy {lo} <= min < max <= {hi} (percent)")
+        return errs
 
     # ------------------------------------------------------------------ helpers
     @property
