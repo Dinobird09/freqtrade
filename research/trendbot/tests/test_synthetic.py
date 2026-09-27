@@ -180,7 +180,7 @@ def test_volume_spikes_and_bnb_wicks():
         obs = len(vol_spikes(w.candles[pair])) / len(w.candles[pair])
         assert 0.05 <= obs <= 0.10, f"{pair}: observable spike rate {obs:.3f}"
 
-    def wick_asymmetry(candles, frac=0.01):
+    def wick_asymmetry(candles, frac=0.02):
         """Rate(lower wick exceeds upper by > frac) minus the mirror rate; ~0 if symmetric."""
         down = up = 0
         for c in candles:
@@ -190,9 +190,10 @@ def test_volume_spikes_and_bnb_wicks():
             up += upper - lower > frac
         return (down - up) / len(candles)
 
-    assert wick_asymmetry(w.candles["BNB/USDT"]) > 0.01  # ~2 % of candles get news wicks
+    # ~2 % of BNB candles get a 1-3 % news wick; about half of those clear the 2 % bar.
+    assert wick_asymmetry(w.candles["BNB/USDT"]) > 0.005
     for pair in ("BTC/USDT", "ETH/USDT"):
-        assert abs(wick_asymmetry(w.candles[pair])) < 0.006, pair
+        assert abs(wick_asymmetry(w.candles[pair])) < 0.004, pair
 
 
 # ---------------------------------------------------------------------- ground truth

@@ -10,7 +10,8 @@ Generative model (pair p, candle t; t = 0 opens 2019-01-01T00:00Z, one candle pe
     f_t   = k_t * z_t          common market factor, shared by all pairs
     e_pt  = k_pt * z_pt        idiosyncratic shock
             z ~ N(0, 1);  k = K_LO w.p. 0.9, K_HI = 2.5 * K_LO w.p. 0.1, with E[k^2] = 1
-            (a Gaussian scale mixture: unit variance, excess kurtosis ~3, "fat-ish" tails)
+            (Gaussian scale mixture: unit variance, excess kurtosis 3.2 per component and
+            ~1.7-2.4 for the combined candle return: "fat-ish" tails)
     beta_p = sigma_p * sqrt(rho_p),  s_p = sigma_p * sqrt(1 - rho_p)
     v_pt  = beta_p^2 k_t^2 + s_p^2 k_pt^2                     conditional variance
     r_pt  = -v_pt / 2 + d_pt + beta_p f_t + s_p e_pt           log(close / open)
@@ -31,8 +32,9 @@ exp(-0.5 * sqrt(v_pt) * |z'|). BNB additionally gets a "news wick" on 2 % of can
 extended down by a further U(1 %, 3 %).
 
 Volume: log V_pt = log(base_p) + slow_pt + 0.25 z, where slow is an AR(1) with phi = 0.998
-(half-life ~1 month) and stationary sd 0.35. With probability 7 % a candle is a SPIKE and
-its volume is multiplied by U(2, 4). Spike flags are drawn independently of every return.
+(half-life ~350 candles, ~2 months) and stationary sd 0.35. With probability 7 % a candle
+is a SPIKE and its volume is multiplied by U(2, 4). Spike flags are drawn independently of
+every return.
 
 Planted drift d_pt (the only thing that differs between worlds, all noise is shared):
 a TRIGGER is a spike candle s that closes up (close > open) and qualifies for the world;
@@ -46,9 +48,16 @@ the next EFFECT_HORIZON = 12 candles s+1..s+12 get d = +0.35 * sigma_p each (exp
                 the history is exactly the null world.
     hour_edge : only triggers whose CLOSE hour (UTC) h satisfies 12 <= h <= 20 qualify,
                 i.e. the 4H candles opening 08:00, 12:00 and 16:00 (closing 12:00, 16:00,
-                20:00): half of the day carries the edge, the other half is null.
+                20:00). Spikes closing at 00:00, 04:00 or 08:00 trigger nothing, although
+                a window opened by an earlier edge-hour trigger keeps running through them.
 
 A long entered at the next open after a qualifying trigger therefore has a genuine edge.
+
+Caveat on magnitude: with these parameters roughly 7 % x 1/2 x 12 of all candles sit in a
+drift window (~36 % in "planted", ~20 % in "hour_edge"), so the planted worlds also trend
+up strongly UNCONDITIONALLY (planted BTC gains ~+21 log units over 6 years). Any long-biased
+rule profits there; "planted" vs "null" shows the pipeline can find an edge, while only the
+hour_edge / decay contrasts test whether it finds the RIGHT (conditional, persistent) edge.
 
 Synthetic news (identical in every world, NO price impact; they exercise R5 only), all with
 note "synthetic": 1-3 (mean 2) high-impact "macro" events scoped "ALL" per calendar month;

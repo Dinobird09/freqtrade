@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import math
+import re
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from itertools import groupby, pairwise
@@ -33,6 +34,7 @@ CSV_COLUMNS = ("ts", "open", "high", "low", "close", "volume")
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _ONE_MS = timedelta(milliseconds=1)
+_ISO_PREFIX = re.compile(r"\d{4}-\d{2}-\d{2}([T ]|$)")  # extended format only: YYYY-MM-DD
 _UNIT_MS = {"m": 60_000, "h": HOUR_MS, "d": DAY_MS, "w": 7 * DAY_MS}
 
 
@@ -46,18 +48,34 @@ def timeframe_to_ms(timeframe: str) -> int:
     return int(num) * _UNIT_MS[unit]
 
 
+def parse_iso_utc(text: str, assume_utc: bool = False) -> int:
+    """Extended-format ISO-8601 (``YYYY-MM-DD[THH:MM[:SS[.fff]]][Z|+HH:MM]``) -> epoch ms.
+
+    Offset-less values raise unless ``assume_utc``. Basic-format strings are rejected on
+    purpose: ``datetime.fromisoformat`` would read ``"1704081600000.0"`` as the year 1704.
+    """
+    s = text.strip()
+    try:
+        if not _ISO_PREFIX.match(s):
+            raise ValueError
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(f"{text!r} is not an ISO-8601 date/time (YYYY-MM-DD...)") from None
+    if dt.tzinfo is None:
+        if not assume_utc:
+            raise ValueError(f"ISO-8601 ts {text!r} has no UTC offset (write e.g. '...T00:00:00Z')")
+        dt = dt.replace(tzinfo=UTC)
+    return (dt - _EPOCH) // _ONE_MS
+
+
 def parse_ts(text: str) -> int:
     """Parse integer milliseconds or an offset-aware ISO-8601 string to epoch ms (UTC)."""
     s = text.strip()
     if s.isascii() and s.isdigit():
         return int(s)
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        raise ValueError(f"ts {text!r} is neither integer milliseconds nor ISO-8601") from None
-    if dt.tzinfo is None:
-        raise ValueError(f"ISO-8601 ts {text!r} has no UTC offset (write e.g. '...T00:00:00Z')")
-    return (dt - _EPOCH) // _ONE_MS
+    if not _ISO_PREFIX.match(s):
+        raise ValueError(f"ts {text!r} is neither integer milliseconds nor ISO-8601")
+    return parse_iso_utc(s)
 
 
 def ts_to_iso(ts: int) -> str:
