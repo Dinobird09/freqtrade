@@ -1,0 +1,11 @@
+seed,base_label,base_train_avg_r,base_test_avg_r,base_test_n,base_dd_ok,selected,selected_label,selected_test_avg_r,selected_test_n,ml_label,ml_test_avg_r,ml_test_n,ml_fit_error,verdict_robust,violations
+1,ROBUST,0.254,0.4049,53,True,rr2.5_vol2_rsi55-70,ROBUST,0.7844,34,UNTESTED,0.1858,36,,True,0
+2,ROBUST,0.2452,0.4539,51,True,rr3_vol1.5_rsi55-70,UNTESTED,0.5672,34,ROBUST,0.5877,47,,True,0
+3,ROBUST,0.5345,0.3878,62,True,rr3_vol2_rsi50-70,ROBUST,0.558,40,ROBUST,0.3332,58,,True,0
+4,ROBUST,0.495,0.754,41,True,rr2_vol2_rsi50-70,ROBUST,0.8618,34,ROBUST,0.754,41,,True,0
+5,ROBUST,0.3791,0.4991,47,True,rr2_vol2_rsi50-70,ROBUST,0.5565,38,ROBUST,0.5119,43,,True,0
+6,UNTESTED,0.3784,0.3669,43,True,rr2_vol2_rsi50-70,ROBUST,0.479,36,UNTESTED,0.3299,42,,True,0
+7,ROBUST,0.5945,0.3546,61,True,rr2_vol2_rsi55-70,ROBUST,0.6399,44,ROBUST,0.3809,58,,True,0
+8,ROBUST,0.412,0.5102,52,True,rr2_vol1.5_rsi55-70,ROBUST,0.5519,49,ROBUST,0.4917,45,,True,0
+9,ROBUST,0.4862,0.5656,53,True,rr2.5_vol1.5_rsi50-70,ROBUST,0.5975,46,ROBUST,0.5982,52,,True,0
+10,UNTESTED,0.4022,0.1424,42,True,rr2_vol2_rsi50-70,UNTESTED,0.4357,28,UNTESTED,0.1618,39,,False,0

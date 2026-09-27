@@ -188,6 +188,21 @@ def test_buffer_comes_from_config():
     assert plan.stop == pytest.approx(97.0 * 0.992)
 
 
+def test_config_keeps_the_bnb_buffer_in_the_mandated_range():
+    def with_buffer(base: str, buffer: float) -> StrategyConfig:
+        risk = dict(CFG.pair_risk)
+        risk[base] = PairRisk(max_risk_pct=CFG.pair_risk[base].max_risk_pct, stop_buffer_pct=buffer)
+        return CFG.with_changes(pair_risk=MappingProxyType(risk))
+
+    for ok in (0.5, 0.8):  # both ends of the mandated 0.5-0.8 % are legal
+        assert with_buffer("BNB", ok).risk_for("BNB/USDT").stop_buffer_pct == ok
+    for bad in (0.25, 0.49, 0.81):
+        with pytest.raises(ConfigError, match="BNB buffer"):
+            with_buffer("BNB", bad)
+    with pytest.raises(ConfigError, match="BEHIND structure"):  # a stop ON the swing low
+        with_buffer("BTC", 0.0)
+
+
 # ------------------------------------------------------------------------------ rejection
 def test_too_tight_stop_rejected_and_bnb_buffer_can_widen_it():
     lows = [100.01] * 15

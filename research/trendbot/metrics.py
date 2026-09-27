@@ -208,10 +208,12 @@ def label(
     5. otherwise                              -> ROBUST
     """
     if train.n < min_train or test.n < min_test:
-        return "UNTESTED", (
-            f"Too few trades to judge: train n={train.n} (need {min_train}) and "
-            f"test n={test.n} (need {min_test})."
-        )
+        short = [
+            f"{name} n={s.n} (need {need})"
+            for name, s, need in (("train", train, min_train), ("test", test, min_test))
+            if s.n < need
+        ]
+        return "UNTESTED", f"Too few trades to judge: {' and '.join(short)}."
     if train.avg_r <= 0:
         return "NO-EDGE", (
             f"Train expectancy is {train.avg_r:+.3f}R over {train.n} trades, so there is "

@@ -1,0 +1,37 @@
+{
+  "variant": "rr2_vol2_rsi50-70",
+  "config_fingerprint": "6e2fad76b754fe09037dbf9eaaf819ae1ad864db105a161ae9574f94da001f74",
+  "backtest": {
+    "report_path": "REPORT.md",
+    "completed_utc": "2026-09-27T11:17:22Z"
+  },
+  "walk_forward": {
+    "label": "NO-EDGE",
+    "dd_ok": true,
+    "split_utc": "2023-03-14T00:00:00Z",
+    "train_n": 96,
+    "test_n": 54,
+    "test_avg_r": -0.2579803176894093,
+    "report_path": "REPORT.md"
+  },
+  "human_review": {
+    "reviewer": null,
+    "date_utc": null,
+    "trades_reviewed": null,
+    "trades_total": null,
+    "approved": null,
+    "notes": null
+  },
+  "testnet": {
+    "exchange": null,
+    "start_utc": null,
+    "end_utc": null,
+    "trades": null,
+    "rule_violations": null,
+    "journal_path": null,
+    "notes": null
+  },
+  "live": {
+    "enabled_utc": null
+  }
+}

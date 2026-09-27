@@ -1,0 +1,37 @@
+{
+  "variant": "base",
+  "config_fingerprint": "9be9d6da6ad86d8579570ae32c09984ac335bda8ac8a52bbb11751042e1e03b9",
+  "backtest": {
+    "report_path": "REPORT.md",
+    "completed_utc": "2026-09-27T11:17:22Z"
+  },
+  "walk_forward": {
+    "label": "ROBUST",
+    "dd_ok": true,
+    "split_utc": "2023-03-14T00:00:00Z",
+    "train_n": 115,
+    "test_n": 53,
+    "test_avg_r": 0.40489603437669625,
+    "report_path": "REPORT.md"
+  },
+  "human_review": {
+    "reviewer": null,
+    "date_utc": null,
+    "trades_reviewed": null,
+    "trades_total": null,
+    "approved": null,
+    "notes": null
+  },
+  "testnet": {
+    "exchange": null,
+    "start_utc": null,
+    "end_utc": null,
+    "trades": null,
+    "rule_violations": null,
+    "journal_path": null,
+    "notes": null
+  },
+  "live": {
+    "enabled_utc": null
+  }
+}

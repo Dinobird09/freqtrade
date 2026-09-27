@@ -3,7 +3,12 @@
 The edge tests use only what a strategy could observe (volume / previous-20 mean >= 1.5 and
 an up close), with forward windows thinned to be non-overlapping so the standard errors are
 honest. Statistics are on 12-candle forward log returns from the signal close (= entry at
-the next open) to the close 12 candles later.
+the next open) to the close 12 candles later, compared with what the generator's recorded
+ground truth (``PairTruth.drift``) implies for exactly those windows.
+
+The planted drift is conditional only (zero mean over the active region), so outside the
+effect windows every candle drifts down by ``truth.offset``; "absent" therefore means "no
+more than the background the ground truth implies", not "exactly zero".
 """
 
 from __future__ import annotations
@@ -42,11 +47,6 @@ def sigma(pair: str) -> float:
     return PAIR_SPECS[pair.split("/")[0]].sigma
 
 
-def effect(pair: str) -> float:
-    """Planted expected forward log return over the K-candle window."""
-    return K * EFFECT_MU_SIGMAS * sigma(pair)
-
-
 def vol_spikes(candles, mult: float = 1.5, n: int = 20) -> list[int]:
     """Indices whose volume >= mult * mean of the previous n volumes (observable, causal)."""
     out = []
@@ -72,10 +72,13 @@ def thin(idxs, gap: int = K) -> list[int]:
     return out
 
 
+def kept(candles, idxs) -> list[int]:
+    return [i for i in thin(idxs) if i + K < len(candles)]
+
+
 def fwd_stats(candles, idxs) -> tuple[float, float, int]:
     """(mean, standard error, n) of the K-candle forward log return after each index."""
-    kept = [i for i in thin(idxs) if i + K < len(candles)]
-    vals = [math.log(candles[i + K].close / candles[i].close) for i in kept]
+    vals = [math.log(candles[i + K].close / candles[i].close) for i in kept(candles, idxs)]
     n = len(vals)
     assert n >= 30, f"too few samples ({n}) for a meaningful test"
     mean = sum(vals) / n
@@ -83,16 +86,32 @@ def fwd_stats(candles, idxs) -> tuple[float, float, int]:
     return mean, sd / math.sqrt(n), n
 
 
-def assert_present(pair: str, candles, idxs) -> None:
+def expected_fwd(pair: str, candles, truth: syn.PairTruth, idxs) -> float:
+    """Ground-truth expected K-candle forward log return over exactly the tested windows:
+    the recorded planted drift plus the martingale convexity term -K * sigma^2 / 2."""
+    ks = kept(candles, idxs)
+    planted = sum(math.fsum(truth.drift[i + 1 : i + K + 1]) for i in ks) / len(ks)
+    return planted - K * sigma(pair) ** 2 / 2
+
+
+def assert_present(pair: str, candles, truth, idxs) -> None:
+    """Detectably positive AND consistent with the ground truth of those windows."""
     mean, se, n = fwd_stats(candles, idxs)
     assert mean / se > 3.0, f"{pair}: effect not detected, t={mean / se:.2f} (n={n})"
+    exp = expected_fwd(pair, candles, truth, idxs)
+    assert exp > 0.5 * K * (truth.mu - truth.offset), f"{pair}: windows not planted ({exp})"
+    assert abs(mean - exp) / se < 3.5, f"{pair}: {mean:.4f} vs truth {exp:.4f} (se {se:.4f})"
 
 
-def assert_absent(pair: str, candles, idxs) -> None:
-    """Consistent with zero AND inconsistent with the planted effect size (power check)."""
+def assert_absent(pair: str, candles, truth, idxs) -> None:
+    """No conditional effect beyond the ground-truth background, with power to rule out a
+    planted-size effect (K * mu on top of that background)."""
     mean, se, n = fwd_stats(candles, idxs)
-    assert abs(mean / se) < 3.0, f"{pair}: spurious effect, t={mean / se:.2f} (n={n})"
-    assert (mean - effect(pair)) / se < -3.0, f"{pair}: cannot rule out the effect (n={n})"
+    background = expected_fwd(pair, candles, truth, idxs)
+    planted = K * EFFECT_MU_SIGMAS * sigma(pair)
+    t = (mean - background) / se
+    assert abs(t) < 3.0, f"{pair}: spurious effect, t={t:.2f} vs background (n={n})"
+    assert (mean - background - planted) / se < -3.0, f"{pair}: cannot rule out the effect"
 
 
 def log_returns(candles) -> list[float]:
@@ -200,8 +219,9 @@ def test_volume_spikes_and_bnb_wicks():
 def test_null_has_no_edge():
     w = world("null")
     for pair in PAIRS:
-        assert not any(w.truth[pair].drift) and not w.truth[pair].triggers
-        assert_absent(pair, w.candles[pair], up_spikes(w.candles[pair]))
+        truth = w.truth[pair]
+        assert not any(truth.drift) and not truth.triggers and truth.offset == 0.0
+        assert_absent(pair, w.candles[pair], truth, up_spikes(w.candles[pair]))
 
 
 def test_planted_edge_is_detectable():
@@ -209,12 +229,12 @@ def test_planted_edge_is_detectable():
     for pair in PAIRS:
         truth = w.truth[pair]
         assert truth.mu == pytest.approx(EFFECT_MU_SIGMAS * sigma(pair))
-        assert any(truth.drift) and all(d in (0.0, truth.mu) for d in truth.drift)
+        assert 0.2 * truth.mu < truth.offset < 0.5 * truth.mu  # ~1/3 of candles in a window
+        assert all(d in (truth.mu - truth.offset, -truth.offset) for d in truth.drift)
         assert all(truth.spike[i] for i in truth.triggers)
+        assert all(truth.in_window(i + 1) for i in truth.triggers if i + 1 < len(truth.drift))
         candles = w.candles[pair]
-        assert_present(pair, candles, up_spikes(candles))
-        mean, _, _ = fwd_stats(candles, up_spikes(candles))
-        assert 0.5 * effect(pair) < mean < 1.5 * effect(pair)
+        assert_present(pair, candles, truth, up_spikes(candles))
         # Down-closing spikes do not trigger: whatever follows them is not planted by them.
         down = [i for i in vol_spikes(candles) if candles[i].close <= candles[i].open]
         assert not set(down) & set(truth.triggers)
@@ -227,11 +247,17 @@ def test_decay_edge_only_before_split():
     for pair in PAIRS:
         truth = w.truth[pair]
         assert not any(truth.drift[split:]), "no planted drift after the split"
+        assert truth.active_end == split
         assert truth.triggers and max(truth.triggers) < split
+        # The offset is computed over the pre-split region only.
+        assert abs(math.fsum(truth.drift[:split])) <= 2 * K * truth.mu
         candles = w.candles[pair]
         spikes = up_spikes(candles)
-        assert_present(pair, candles, [i for i in spikes if i + K < split])
-        assert_absent(pair, candles, [i for i in spikes if i >= split])
+        assert_present(pair, candles, truth, [i for i in spikes if i + K < split])
+        assert_absent(pair, candles, truth, [i for i in spikes if i >= split])
+        assert expected_fwd(pair, candles, truth, [i for i in spikes if i >= split]) == (
+            pytest.approx(-K * sigma(pair) ** 2 / 2)
+        )
 
 
 def test_decay_respects_split_frac():
@@ -257,7 +283,7 @@ def test_hour_edge_only_for_12_to_20_utc_closes():
         spikes = vol_spikes(candles)
         edge_spikes = {i for i in spikes if syn.close_hour(i) in edge_hours}
         ups = [i for i in spikes if candles[i].close > candles[i].open]
-        assert_present(pair, candles, [i for i in ups if i in edge_spikes])
+        assert_present(pair, candles, truth, [i for i in ups if i in edge_spikes])
         # Non-edge spikes, excluding any whose forward window could overlap the drift of
         # an edge-hour spike (volume/hour only: both independent of returns, so no bias).
         isolated = [
@@ -265,7 +291,35 @@ def test_hour_edge_only_for_12_to_20_utc_closes():
             for i in ups
             if i not in edge_spikes and not any(j in edge_spikes for j in range(i - K + 1, i + K))
         ]
-        assert_absent(pair, candles, isolated)
+        assert_absent(pair, candles, truth, isolated)
+        # ... and whose forward windows (almost all) carry only the background offset. The
+        # few exceptions follow a generator spike that is not observable as a >= 1.5x candle.
+        ks = kept(candles, isolated)
+        clean = [i for i in ks if not any(truth.in_window(t) for t in range(i + 1, i + K + 1))]
+        assert len(clean) >= 0.8 * len(ks)
+
+
+@pytest.mark.parametrize("name", ["planted", "decay", "hour_edge"])
+def test_planted_drift_is_conditional_only(name):
+    """Zero-mean planted drift: the world's terminal prices equal the null world's up to
+    the (tiny) residual of the offset search, so buy-and-hold gains nothing from it."""
+    null, w = world("null"), world(name)
+    for pair in PAIRS:
+        truth = w.truth[pair]
+        total = math.fsum(truth.drift)
+        assert abs(total) <= 2 * K * truth.mu, f"{pair}: residual drift {total}"
+        bh_log_ratio = math.log(w.candles[pair][-1].close / null.candles[pair][-1].close)
+        assert bh_log_ratio == pytest.approx(total, abs=1e-9)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
+def test_buy_and_hold_stays_bounded(seed):
+    """Six-year buy-and-hold multiples stay in [0.05x, 20x] (null; the other worlds match it
+    up to the residual checked above), so no world is a crash or a moonshot."""
+    data, _ = make_world("null", seed)
+    for pair, candles in data.items():
+        multiple = candles[-1].close / candles[0].open
+        assert 0.05 <= multiple <= 20.0, f"seed {seed} {pair}: buy-and-hold {multiple:.3f}x"
 
 
 # ---------------------------------------------------------------------- news events

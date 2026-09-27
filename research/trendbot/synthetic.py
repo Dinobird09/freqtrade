@@ -16,7 +16,7 @@ Generative model (pair p, candle t; t = 0 opens 2019-01-01T00:00Z, one candle pe
     v_pt  = beta_p^2 k_t^2 + s_p^2 k_pt^2                     conditional variance
     r_pt  = -v_pt / 2 + d_pt + beta_p f_t + s_p e_pt           log(close / open)
 
-    sigma (per-candle vol): BTC 1.2 %, ETH 1.5 %, BNB 1.4 %
+    sigma (per-candle vol): BTC 0.8 %, ETH 1.0 %, BNB 0.9 %
     rho (factor share of variance): BTC 0.80, ETH 0.70, BNB 0.55
         -> return correlations BTC-ETH ~0.75, BTC-BNB ~0.66, ETH-BNB ~0.62
     start prices: BTC 4000, ETH 150, BNB 6 (unknown pairs: 100, sigma 1.5 %, rho 0.6)
@@ -25,6 +25,13 @@ Martingale choice: the -v/2 convexity term makes E[exp(r) | k] = 1 whenever d = 
 PRICE (not the log-price) is an exact martingale. By optional stopping, any entry/exit rule
 then has zero expected P&L before costs and negative expectancy after fees and slippage.
 (The median log-price drifts down by sigma^2/2 per candle as a consequence.)
+
+Why these (lowish) sigmas: over 6 years (13,140 candles) the terminal log-price of a
+martingale has sd sigma * sqrt(n) and median -n * sigma^2 / 2. With the wave-1 values
+(1.2-1.5 %) that was sd 1.4-1.7 and median -0.9 to -1.5 log units, so null-world
+buy-and-hold landed below 0.05x for several of seeds 1-5. At 0.8-1.0 % every pair's 6-year
+buy-and-hold multiple stays within [0.05x, 20x] for seeds 1-10 in EVERY world (measured
+range 0.07x-5.1x), so no world is dominated by a crash or a moonshot.
 
 Candles: open_t = close_{t-1} (no gaps), close_t = open_t * exp(r_pt),
 high_t = max(open, close) * exp(0.5 * sqrt(v_pt) * |z|), low_t = min(open, close) *
@@ -38,26 +45,46 @@ every return.
 
 Planted drift d_pt (the only thing that differs between worlds, all noise is shared):
 a TRIGGER is a spike candle s that closes up (close > open) and qualifies for the world;
-the next EFFECT_HORIZON = 12 candles s+1..s+12 get d = +0.35 * sigma_p each (expected
-+4.2 sigma over the window). Windows do not stack: a new trigger extends the window.
+the next EFFECT_HORIZON = 12 candles s+1..s+12 form an effect WINDOW. Windows do not stack:
+a new trigger extends the window. Inside the ACTIVE region [0, active_end)::
 
-    null      : no trigger ever qualifies (d = 0 everywhere; volume says nothing).
-    planted   : every up-closing spike qualifies, over the whole history.
-    decay     : only triggers s < split_idx qualify, and no candle t >= split_idx is ever
-                drifted (split_idx = int(split_frac * n)), so the last (1 - split_frac) of
-                the history is exactly the null world.
+    d_pt = mu_p * 1[t in a window] - offset_p,     mu_p = EFFECT_MU_SIGMAS * sigma_p = 0.7 sigma_p
+    offset_p = mu_p * (share of active-region candles inside a window)
+
+so the planted drift is CONDITIONAL ONLY: it sums to (almost exactly) zero over the active
+region, the unconditional log-price drift is the null world's, and buy-and-hold gains
+nothing from the planted effect (a world's terminal price equals the null world's up to a
+residual of at most ~1 window of drift, see ``_conditional_offset``). A long entered at the
+next open after a qualifying trigger expects about +12 * (mu - offset) ~ +5.6 sigma over the
+window, while a long entered at an arbitrary time expects nothing; every candle outside
+the windows drifts DOWN by ``offset`` (~0.33 mu in "planted", ~0.18 mu in "hour_edge").
+From ``active_end`` on, d = 0 exactly.
+
+    null      : no trigger ever qualifies (d = 0 everywhere, offset 0; volume says nothing).
+    planted   : every up-closing spike qualifies, over the whole history (active_end = n).
+    decay     : only triggers s < split_idx qualify and active_end = split_idx =
+                int(split_frac * n): the offset is computed over the pre-split region only
+                and the last (1 - split_frac) of the history is EXACTLY the null world.
     hour_edge : only triggers whose CLOSE hour (UTC) h satisfies 12 <= h <= 20 qualify,
                 i.e. the 4H candles opening 08:00, 12:00 and 16:00 (closing 12:00, 16:00,
                 20:00). Spikes closing at 00:00, 04:00 or 08:00 trigger nothing, although
                 a window opened by an earlier edge-hour trigger keeps running through them.
 
-A long entered at the next open after a qualifying trigger therefore has a genuine edge.
+Calibration of EFFECT_MU_SIGMAS / EFFECT_HORIZON (a POSITIVE-CONTROL fixture strength, not
+a market claim): measured with ``backtester.run_backtest`` over the full 6-year history,
+default config, seeds 1-5 (about 25-30 trades per year across the three pairs):
 
-Caveat on magnitude: with these parameters roughly 7 % x 1/2 x 12 of all candles sit in a
-drift window (~36 % in "planted", ~20 % in "hour_edge"), so the planted worlds also trend
-up strongly UNCONDITIONALLY (planted BTC gains ~+21 log units over 6 years). Any long-biased
-rule profits there; "planted" vs "null" shows the pipeline can find an edge, while only the
-hour_edge / decay contrasts test whether it finds the RIGHT (conditional, persistent) edge.
+    null      avg R -0.10 (per seed -0.32 .. +0.05): costs only
+    planted   avg R +0.42 (per seed +0.31 .. +0.57)
+    decay     avg R +0.24; before the 70 % split +0.28 .. +0.47, after it -0.29 .. +0.29
+              (the post-split tail is the null world, so it matches null's noise)
+    hour_edge avg R +0.12 for the hour-blind base strategy; its trades whose signal candle
+              closes 12-20 UTC average +0.49 R (per seed +0.34 .. +0.73), the others -0.19 R,
+              so an hour-aware filter has something real to learn
+
+At the wave-1 strength (0.35 sigma), once made conditional, the base strategy earned only
+~+0.05 to +0.14 R in "planted": its trades on down-closing spike candles and on trend
+states that follow a finished window pay the offset, which dilutes the conditional edge.
 
 Synthetic news (identical in every world, NO price impact; they exercise R5 only), all with
 note "synthetic": 1-3 (mean 2) high-impact "macro" events scoped "ALL" per calendar month;
@@ -91,7 +118,11 @@ START_TS = 1_546_300_800_000  # 2019-01-01T00:00:00Z
 
 # Ground truth of the planted effect.
 EFFECT_HORIZON = 12  # candles of extra drift after a qualifying trigger
-EFFECT_MU_SIGMAS = 0.35  # extra drift per candle, in units of the pair's sigma
+EFFECT_MU_SIGMAS = 0.7  # in-window extra drift per candle (before the offset), sigma units
+# Numerical search for the zero-mean offset (see _conditional_offset).
+_OFFSET_MAX_ITER = 40
+_OFFSET_FIXED_STEPS = 6
+_OFFSET_TOL = 1e-9
 HOUR_EDGE_CLOSE_HOURS = (12, 20)  # inclusive window on the trigger candle's UTC close hour
 
 # Volume model.
@@ -125,10 +156,10 @@ class PairSpec:
 
 
 PAIR_SPECS: dict[str, PairSpec] = {
-    "BTC": PairSpec(start_price=4000.0, sigma=0.012, factor_share=0.80, base_volume=3_000.0),
-    "ETH": PairSpec(start_price=150.0, sigma=0.015, factor_share=0.70, base_volume=60_000.0),
+    "BTC": PairSpec(start_price=4000.0, sigma=0.008, factor_share=0.80, base_volume=3_000.0),
+    "ETH": PairSpec(start_price=150.0, sigma=0.010, factor_share=0.70, base_volume=60_000.0),
     "BNB": PairSpec(
-        start_price=6.0, sigma=0.014, factor_share=0.55, base_volume=500_000.0, news_wick_prob=0.02
+        start_price=6.0, sigma=0.009, factor_share=0.55, base_volume=500_000.0, news_wick_prob=0.02
     ),
 }
 DEFAULT_SPEC = PairSpec(start_price=100.0, sigma=0.015, factor_share=0.60, base_volume=100_000.0)
@@ -139,9 +170,17 @@ class PairTruth:
     """What the generator actually did for one pair (for verification, never for trading)."""
 
     spike: tuple[bool, ...]  # candle t is a volume-spike candle
-    drift: tuple[float, ...]  # planted extra log drift applied to candle t (0.0 or mu)
+    # Planted extra log drift of candle t: mu - offset inside an effect window, -offset
+    # elsewhere in [0, active_end), exactly 0.0 from active_end on. Sums to ~0.
+    drift: tuple[float, ...]
     triggers: tuple[int, ...]  # indices of spike candles that switched the drift on
     mu: float  # EFFECT_MU_SIGMAS * sigma for this pair
+    offset: float = 0.0  # mu * share of in-window candles in [0, active_end)
+    active_end: int = 0  # first candle index that is never drifted (n, or split_idx for decay)
+
+    def in_window(self, t: int) -> bool:
+        """True if candle ``t`` received the planted effect (not just the offset)."""
+        return t < self.active_end and self.drift[t] > -self.offset
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +274,84 @@ def _pair_noise(seed: int, pair: str, spec: PairSpec, n: int) -> _PairNoise:
 
 
 # ---------------------------------------------------------------------- price paths
+def _drift_windows(
+    spec: PairSpec,
+    noise: _PairNoise,
+    factor: tuple[list[float], list[float]],
+    qualifies: Callable[[int], bool],
+    drift_end: int,
+    offset: float,
+) -> tuple[list[bool], list[int]]:
+    """(in-window flag per candle, trigger indices) of the close path with this ``offset``.
+
+    Uses exactly the float arithmetic of :func:`_simulate_pair`, so the trigger test
+    ``close > open`` agrees bit-for-bit with the candles that are finally emitted.
+    """
+    f_shock, f_var = factor
+    beta = spec.sigma * math.sqrt(spec.factor_share)
+    idio = spec.sigma * math.sqrt(1.0 - spec.factor_share)
+    beta2, idio2 = beta * beta, idio * idio
+    mu = EFFECT_MU_SIGMAS * spec.sigma
+    exp = math.exp
+    window: list[bool] = []
+    triggers: list[int] = []
+    active_until = -1
+    o = spec.start_price
+    for t in range(len(noise.shock)):
+        v = beta2 * f_var[t] + idio2 * noise.var[t]
+        on = t <= active_until and t < drift_end
+        d = (mu if on else 0.0) - offset if t < drift_end else 0.0
+        c = o * exp(-0.5 * v + d + beta * f_shock[t] + idio * noise.shock[t])
+        window.append(on)
+        if noise.spike[t] and c > o and qualifies(t):
+            active_until = t + EFFECT_HORIZON
+            triggers.append(t)
+        o = c
+    return window, triggers
+
+
+def _conditional_offset(
+    spec: PairSpec,
+    noise: _PairNoise,
+    factor: tuple[list[float], list[float]],
+    qualifies: Callable[[int], bool],
+    drift_end: int,
+) -> float:
+    """Offset that makes the planted drift average (almost exactly) zero over [0, drift_end).
+
+    The offset changes the returns and therefore which spike candles close up, i.e. which
+    windows exist, so the zero of ``residual(offset) = mu * in-window share - offset`` is
+    found numerically: a few fixed-point steps, then bisection inside the bracket they
+    establish (``residual(0) >= 0 >= residual(mu)``). The offset with the smallest
+    ``|residual|`` seen is returned; ``residual`` is a step function, so an exact zero need
+    not exist, but the leftover is a few candles' worth of drift over the whole history.
+    """
+    if drift_end <= 0:
+        return 0.0
+    mu = EFFECT_MU_SIGMAS * spec.sigma
+
+    def residual(offset: float) -> float:
+        window, _ = _drift_windows(spec, noise, factor, qualifies, drift_end, offset)
+        return mu * sum(window[:drift_end]) / drift_end - offset
+
+    lo, hi = 0.0, mu
+    best_off, best_res = 0.0, residual(0.0)
+    offset = best_res  # first fixed-point step: offset = mu * share(offset=0)
+    for step in range(_OFFSET_MAX_ITER):
+        if best_res == 0.0 or hi - lo <= _OFFSET_TOL * mu:
+            break
+        res = residual(offset)
+        if abs(res) < abs(best_res):
+            best_off, best_res = offset, res
+        if res > 0:
+            lo = max(lo, offset)
+        else:
+            hi = min(hi, offset)
+        nxt = offset + res  # fixed-point step while it stays inside the bracket
+        offset = nxt if step < _OFFSET_FIXED_STEPS and lo < nxt < hi else 0.5 * (lo + hi)
+    return best_off
+
+
 def _simulate_pair(
     spec: PairSpec,
     noise: _PairNoise,
@@ -247,6 +364,7 @@ def _simulate_pair(
     idio = spec.sigma * math.sqrt(1.0 - spec.factor_share)
     beta2, idio2 = beta * beta, idio * idio
     mu = EFFECT_MU_SIGMAS * spec.sigma
+    offset = _conditional_offset(spec, noise, factor, qualifies, drift_end)
     exp, sqrt = math.exp, math.sqrt
     candles: list[Candle] = []
     drift: list[float] = []
@@ -255,7 +373,8 @@ def _simulate_pair(
     price = spec.start_price
     for t in range(len(noise.shock)):
         v = beta2 * f_var[t] + idio2 * noise.var[t]
-        d = mu if t <= active_until and t < drift_end else 0.0
+        on = t <= active_until and t < drift_end
+        d = (mu if on else 0.0) - offset if t < drift_end else 0.0
         o = price
         c = o * exp(-0.5 * v + d + beta * f_shock[t] + idio * noise.shock[t])
         sd = sqrt(v)
@@ -267,7 +386,7 @@ def _simulate_pair(
             active_until = t + EFFECT_HORIZON
             triggers.append(t)
         price = c
-    truth = PairTruth(tuple(noise.spike), tuple(drift), tuple(triggers), mu)
+    truth = PairTruth(tuple(noise.spike), tuple(drift), tuple(triggers), mu, offset, drift_end)
     return candles, truth
 
 

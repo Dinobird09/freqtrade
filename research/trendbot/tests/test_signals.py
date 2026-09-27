@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from research.trendbot.config import RULE_IDS, StrategyConfig
+from research.trendbot.config import RULE_IDS, ConfigError, StrategyConfig
 from research.trendbot.models import FeatureRow
 from research.trendbot.signals import (
     GATE_RULE_IDS,
@@ -174,6 +174,26 @@ def test_regime_disabled_is_an_explicit_pass(ema_regime):
     regime = _gates(check)["regime"]
     assert regime.passed
     assert regime.detail == REGIME_DISABLED == "disabled (explicit test variant)"
+
+
+# ------------------------------------------------------------------------------ config guard
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"ema_fast": 8},  # R1: EMA periods are fixed at 9/21/200
+        {"ema_slow": 20},
+        {"ema_regime": 100},  # R4
+        {"rsi_period": 10},  # R2: RSI(14)
+        {"rsi_min": 45.0},  # R2: the window may only shrink inside [50, 70]
+        {"rsi_max": 75.0},
+        {"rsi_min": 70.0},  # empty window
+        {"vol_mult": 1.4},  # R3: the multiple may only rise above 1.5
+        {"vol_lookback": 10},  # R3: previous-20-candle average
+    ],
+)
+def test_config_refuses_loosened_entry_gates(changes):
+    with pytest.raises(ConfigError):
+        CFG.with_changes(**changes)
 
 
 # ------------------------------------------------------------------------------ None inputs
