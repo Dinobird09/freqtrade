@@ -8,8 +8,9 @@ rule. The single documented exception is ``regime_filter=False``, which the rule
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from types import MappingProxyType
 
 from .models import HOUR_MS, base_of
@@ -30,7 +31,11 @@ RULE_IDS = {
     "R7_position_risk": "Risk <= 1% (BTC/ETH) / 0.5% (BNB); size derived from stop distance",
     "R8_structure_stop": "Stop behind a confirmed swing low with a buffer (BNB 0.5-0.8%)",
     "R9_circuit_breaker": "3 consecutive SLs bench a pair 24h; 7d realized loss limit halts all",
-    "L_ml_filter": "Layer: logistic-regression filter (only removes trades, never adds)",
+    "L_ml_filter": (
+        "Layer: logistic-regression veto; it can only veto an entry that passed every "
+        "mandatory rule and never approves one a rule denies (a veto can free R6 budget or "
+        "change R9 state, which may admit other rule-compliant trades)"
+    ),
     "L_expectancy_guard": "Layer: halve a pair's risk while its last-N-trade expectancy < 0",
     "X_capital": "Execution: not enough free capital / size below minimum",
     # Adoption-path gates (adoption.py); mirrored there as ADOPTION_RULE_IDS.
@@ -41,6 +46,7 @@ RULE_IDS = {
     "ADOPT_human_review": "Stage 3: a named human reviewed EVERY trade and approved",
     "ADOPT_testnet": "Stage 4: >= 14 days on Binance testnet, zero rule violations, journal",
     "ADOPT_live": "Stage 5: live trading (never for an explicit test-only config)",
+    "ADOPT_provenance": "Stages after walk-forward need real, hash-bound data (never synthetic)",
 }
 
 # Hard ceilings from the mandate. Variants may go lower, never higher.
@@ -132,10 +138,24 @@ class StrategyConfig:
     guard_risk_mult: float = 0.5
 
     def __post_init__(self) -> None:
+        # Freeze caller-supplied containers so validation cannot be bypassed by mutating the
+        # original dict/list after construction.
+        frozen_pairs = {
+            str(k): PairRisk(float(v.max_risk_pct), float(v.stop_buffer_pct))
+            for k, v in dict(self.pair_risk).items()
+        }
+        object.__setattr__(self, "pair_risk", MappingProxyType(frozen_pairs))
+        for name in ("correlated_cluster", "exclusive_bases", "bnb_event_kinds"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
         self.validate()
 
     # ------------------------------------------------------------------ validation
     def validate(self) -> None:  # noqa: C901 - flat list of independent mandate checks
+        nonfinite = self._nonfinite_fields()
+        if nonfinite:
+            # Checked first: NaN compares False with everything, so it would slip past
+            # every range check below (e.g. reward_risk=NaN would drop the 2:1 rule).
+            raise ConfigError(f"non-finite values are not allowed: {', '.join(nonfinite)}")
         errs: list[str] = []
         if (self.ema_fast, self.ema_slow, self.ema_regime) != (9, 21, 200):
             errs.append("EMA periods are fixed by the mandate at 9/21/200")
@@ -195,8 +215,38 @@ class StrategyConfig:
         if errs:
             raise ConfigError("; ".join(errs))
 
-    def _harness_errors(self) -> list[str]:
+    def _nonfinite_fields(self) -> list[str]:
+        bad: list[str] = []
+        for f in fields(self):
+            v = getattr(self, f.name)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and not math.isfinite(v):
+                bad.append(f.name)
+        for base, pr in self.pair_risk.items():
+            for name in ("max_risk_pct", "stop_buffer_pct"):
+                if not math.isfinite(getattr(pr, name)):
+                    bad.append(f"pair_risk[{base}].{name}")
+        return bad
+
+    def _harness_errors(self) -> list[str]:  # noqa: C901 - flat list of independent checks
         errs: list[str] = []
+        if self.timeframe_ms != 4 * HOUR_MS:
+            errs.append("timeframe is fixed by the mandate at 4H (R1 is a 4H trend gate)")
+        if not {"bnb_burn", "launchpool"} <= set(self.bnb_event_kinds):
+            errs.append("bnb_event_kinds must include 'bnb_burn' and 'launchpool' (R5)")
+        if self.swing_pivot_k < 1:
+            errs.append("swing_pivot_k must be >= 1 (a pivot needs higher lows on each side)")
+        if self.swing_lookback < 2 * self.swing_pivot_k + 1:
+            errs.append("swing_lookback must be >= 2*swing_pivot_k+1 to find a confirmed pivot")
+        if self.fallback_lookback < 2:
+            errs.append("fallback_lookback must be >= 2 (a stop behind more than one candle)")
+        if not (0 < self.guard_risk_mult <= 1):
+            errs.append("guard_risk_mult must be in (0, 1]: a layer may only reduce risk")
+        if self.guard_window < 1:
+            errs.append("guard_window must be >= 1")
+        if self.min_trade_risk_pct <= 0:
+            errs.append("min_trade_risk_pct must be > 0")
+        if self.starting_capital <= 0:
+            errs.append("starting_capital must be > 0")
         if self.fee_rate < MIN_FEE_RATE:
             errs.append(f"fee_rate must be >= {MIN_FEE_RATE} per side (realistic costs)")
         if self.slippage_pct < MIN_SLIPPAGE_PCT:

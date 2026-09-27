@@ -341,3 +341,99 @@ Backtest `Trade.exit_ts` is the OPEN of the exit candle, but the fill happens so
   Trade taker fees at low tiers are several times Binance's: pass the user's real tier.
   Reports print the costs used.
 - `config.RULE_IDS` now includes the `ADOPT_*` ids.
+
+---------------------------------------------------------------------------------------
+
+## v3 amendments (orchestrator, before gate cycle 2). These are binding and override v1/v2.
+
+### C1. Layers veto, they do not "only remove trades" (wording + reporting)
+- An entry layer (ML filter, expectancy guard) can only VETO an entry that passed every
+  mandatory rule. It never approves an entry that a rule denies.
+- Because a veto can free R6 budget or change R9 state, the layer's trade list may contain
+  other rule-compliant trades the base never took. Every claim must use this wording
+  (config.RULE_IDS["L_ml_filter"], models.EntryFilter).
+- Reports show, per window (TRAIN and TEST): signals vetoed, base trades absent from the
+  layer's journal, and layer trades absent from the base journal, matched by
+  (pair, signal_ts).
+
+### C2. R5 without look-ahead: scheduled vs unscheduled news
+- `NewsEvent.known_from_ts` (models.py, done). The block interval is
+  `[max(ts - w, known_from), ts + w]`.
+- The default known_from is -inf for scheduled kinds (macro, unlock, bnb_burn, launchpool)
+  and `ts` for unscheduled kinds (regulatory, legal, other), so an unscheduled headline
+  blocks only from the moment it happened.
+- events.csv gains an optional `known_from_utc` column. It is backward compatible, and an
+  empty cell means the kind default.
+- Owner: W2 (news.py, events_example.csv). synthetic.make_events must set known_from
+  consistently (W4).
+
+### C3. The adoption record is bound to its evidence (W3 adoption.py; W5 writes the fields)
+Record fields:
+- `provenance`: "synthetic:<world>:<seed>" or "real".
+- `data_files`: {path: sha256}, plus `events_file` {path, sha256} or null.
+- `backtest.report_sha256`.
+- `walk_forward.train_journal_path` / `_sha256`, `walk_forward.test_journal_path` /
+  `_sha256`, `walk_forward.min_train` / `min_test`, `walk_forward.train_avg_r`, and the
+  label parameters (C4).
+- `human_review.review_path` / `review_sha256` (the trades_review.csv of the review pack).
+
+`check_promotion`:
+- From WALK_FORWARD on:
+  - every recorded file must exist and its sha256 must match;
+  - both journals are re-parsed and `metrics.summarize` + `metrics.label` are recomputed
+    with the recorded parameters; the check blocks unless label, n, avg R and dd_ok match
+    the typed fields;
+  - ROBUST additionally requires train_n and test_n >= 30.
+- From HUMAN_REVIEW on:
+  - provenance must be "real" and data file hashes must be present;
+  - synthetic or missing provenance is blocked with `ADOPT_provenance`
+    (add it to ADOPTION_RULE_IDS; ORCH mirrors it into config.RULE_IDS).
+- HUMAN_REVIEW:
+  - trades_review.csv row count must equal train_n + test_n;
+  - the (window, trade_id) set must equal the journals';
+  - every reviewer_ok must be Y or N;
+  - any N blocks. Policy: the variant is revised and restarts at BACKTEST.
+- TESTNET:
+  - run the invariants cross-trade checks on the testnet journal with exit offset 0: R6 (no
+    BNB stacking, no concurrent full-size cluster risk, budget respected) and R9 (no entry
+    inside a bench, no entry during a 7-day halt);
+  - R5 is checked only if `testnet.events_path` (+ sha256) is given; otherwise the reason
+    text and the README say R5 is not journal-verifiable.
+- ML variants keep the v2 A3 model fingerprint.
+- `expectancy_guard=True` configs need the same walk-forward evidence as any other variant
+  (W5 pre-registers `base+guard`).
+
+### C4. Label rule with multiplicity control and a conservative CI (W5 metrics.py)
+- The pre-registered candidates that get a TEST look are: base, discovery-selected,
+  base+ml, base+guard, so `m = 4`.
+- ROBUST requires ALL of:
+  - n >= 30 in both windows;
+  - TRAIN avg R > 0;
+  - TEST avg R > 0;
+  - the one-sided lower bound at confidence `1 - 0.05/m` is > 0 for BOTH the iid bootstrap
+    AND a calendar-month block bootstrap of the TEST R sequence (use the more conservative
+    of the two; n_boot >= 4000; seeded).
+- A positive TEST mean that fails only the CI is UNTESTED ("positive but not
+  distinguishable from zero after multiplicity correction").
+- The rule is fixed now, from the FWER argument. It is never tuned on TEST outcomes.
+- Non-selected discovery variants and the regime-OFF test variant are reported as
+  "context: <label>, not judged".
+
+### C5. Drawdown
+- Report both the realised (closed-trade) and the mark-to-market (4H close) max drawdown.
+- `dd_ok` requires TEST MTM max DD <= min(20%, the 95th percentile of max DD from
+  bootstrapping TRAIN R sequences at TEST length, in the same risk units).
+- Both numbers and the rule appear in every report.
+
+### C6. Calibration and power (W4 synthetic.py, W5 runs)
+- A new `zero_edge` world: planted pre-cost drift sized so the base strategy's expected net
+  R is ~0 in both windows.
+- `make_world(..., effect_strength=None)` exposes EFFECT_MU_SIGMAS for power curves.
+- An opt-in `gaps=True` mode (occasional opens away from the previous close).
+- Defaults stay byte-identical to the current committed worlds.
+- Runs, all reported with 90% Wilson intervals, TRAIN and TEST side by side:
+  - calibration at >= 50 seeds for zero_edge and decay;
+  - the existing null/planted/hour_edge calibrations;
+  - a power curve (>= 4 strengths x >= 20 seeds) with the minimum detectable effect at
+    50% / 80% power;
+  - per candidate, how many seeds reached the TEST gate.

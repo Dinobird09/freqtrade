@@ -127,6 +127,10 @@ class NewsEvent:
     impact: str  # "high" | "medium" | "low"
     kind: str  # "macro" | "regulatory" | "legal" | "unlock" | "bnb_burn" | "launchpool" | "other"
     note: str = ""
+    # When the event became knowable (ms UTC). None -> kind default (CONTRACT v3 C2):
+    # scheduled kinds (macro, unlock, bnb_burn, launchpool) are known in advance; unscheduled
+    # kinds (regulatory, legal, other) are only known from their own timestamp onward.
+    known_from_ts: int | None = None
 
 
 @dataclass(slots=True)
@@ -177,5 +181,8 @@ class CandidateOutcome:
 
 
 # An optional layer consulted after all mandatory rules pass: (pair, row, check) ->
-# (allow, probability_or_None, one-sentence reason). Layers may only REMOVE trades.
+# (allow, probability_or_None, one-sentence reason). A layer can only VETO an entry that
+# passed every mandatory rule; it never approves an entry a rule denies. Because a veto can
+# free R6 budget or change R9 state, the resulting trade list may contain other
+# rule-compliant trades the base variant did not take (reports count both directions).
 EntryFilter = Callable[[str, FeatureRow, SignalCheck], tuple[bool, float | None, str]]

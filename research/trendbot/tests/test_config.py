@@ -1,5 +1,8 @@
 """StrategyConfig must reject every loosening of a mandatory rule (orchestrator-owned)."""
 
+import math
+from dataclasses import fields
+
 import pytest
 
 from research.trendbot.config import (
@@ -45,6 +48,22 @@ BASE = StrategyConfig()
         {"min_stop_distance_pct": 0.0},
         {"max_stop_distance_pct": 30.0},
         {"min_stop_distance_pct": 5.0, "max_stop_distance_pct": 5.0},
+        {"bnb_event_kinds": ()},
+        {"bnb_event_kinds": ("bnb_burn",)},
+        {"bnb_event_kinds": ("launchpool",)},
+        {"timeframe_ms": 3_600_000},
+        {"timeframe_ms": 86_400_000},
+        {"swing_pivot_k": 0},
+        {"swing_lookback": 0},
+        {"swing_lookback": 4},
+        {"fallback_lookback": 1},
+        {"fallback_lookback": 0},
+        {"guard_risk_mult": 5.0},
+        {"guard_risk_mult": 0.0},
+        {"guard_risk_mult": 1.01},
+        {"guard_window": 0},
+        {"min_trade_risk_pct": 0.0},
+        {"starting_capital": 0.0},
     ],
 )
 def test_loosening_is_rejected(changes):
@@ -123,3 +142,80 @@ def test_rule_ids_cover_every_mandatory_rule():
         "R9_circuit_breaker",
     ):
         assert rid in RULE_IDS
+
+
+FLOAT_FIELDS = [f.name for f in fields(StrategyConfig) if isinstance(getattr(BASE, f.name), float)]
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("name", FLOAT_FIELDS)
+def test_non_finite_float_fields_are_rejected(name, value):
+    with pytest.raises(ConfigError, match="non-finite"):
+        BASE.with_changes(**{name: value})
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf])
+@pytest.mark.parametrize("attr", ["max_risk_pct", "stop_buffer_pct"])
+def test_non_finite_pair_risk_is_rejected(attr, value):
+    pr = dict(BASE.pair_risk)
+    kwargs = {"max_risk_pct": pr["BTC"].max_risk_pct, "stop_buffer_pct": pr["BTC"].stop_buffer_pct}
+    kwargs[attr] = value
+    pr["BTC"] = PairRisk(**kwargs)
+    with pytest.raises(ConfigError, match="non-finite"):
+        BASE.with_changes(pair_risk=pr)
+
+
+def test_nan_regressions_from_cycle_1():
+    # Found by the boss gate: NaN used to slip past every range check.
+    with pytest.raises(ConfigError):
+        StrategyConfig(news_blackout_hours=float("nan"))
+    with pytest.raises(ConfigError):
+        StrategyConfig(reward_risk=float("nan"))
+
+
+def test_float_fields_cover_the_risk_critical_parameters():
+    for name in (
+        "reward_risk",
+        "vol_mult",
+        "news_blackout_hours",
+        "bnb_event_blackout_hours",
+        "bench_hours",
+        "loss_window_days",
+        "weekly_loss_limit_pct",
+        "fee_rate",
+        "slippage_pct",
+        "cluster_risk_budget_pct",
+        "min_trade_risk_pct",
+        "min_stop_distance_pct",
+        "max_stop_distance_pct",
+        "starting_capital",
+        "guard_risk_mult",
+        "rsi_min",
+        "rsi_max",
+    ):
+        assert name in FLOAT_FIELDS
+
+
+def test_containers_are_frozen_against_later_mutation():
+    pr = dict(BASE.pair_risk)
+    exclusive = ["BNB"]
+    cluster = ["BTC", "ETH", "BNB"]
+    kinds = ["bnb_burn", "launchpool"]
+    cfg = StrategyConfig(
+        pair_risk=pr, exclusive_bases=exclusive, correlated_cluster=cluster, bnb_event_kinds=kinds
+    )
+    pr["BTC"] = PairRisk(max_risk_pct=50.0, stop_buffer_pct=0.25)
+    exclusive.clear()
+    cluster.remove("BNB")
+    kinds.clear()
+    assert cfg.risk_for("BTC/USDT").max_risk_pct == 1.0
+    assert cfg.exclusive_bases == ("BNB",)
+    assert cfg.correlated_cluster == ("BTC", "ETH", "BNB")
+    assert cfg.bnb_event_kinds == ("bnb_burn", "launchpool")
+    with pytest.raises(TypeError):
+        cfg.pair_risk["BTC"] = PairRisk(max_risk_pct=50.0, stop_buffer_pct=0.25)  # type: ignore[index]
+
+
+def test_equal_content_gives_equal_config():
+    a = StrategyConfig(pair_risk=dict(BASE.pair_risk), exclusive_bases=["BNB"])
+    assert a == BASE
