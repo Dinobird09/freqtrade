@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 import statistics
@@ -9,6 +11,7 @@ from collections.abc import Callable
 
 import pytest
 
+from research.trendbot.adoption import is_sha256_hex
 from research.trendbot.ml_filter import (
     FEATURES,
     InsufficientData,
@@ -334,3 +337,82 @@ def test_feature_vector_and_breakeven() -> None:
     assert breakeven_probability(2.0, -1.0) == pytest.approx(1 / 3)
     with pytest.raises(ValueError):
         breakeven_probability(-0.1, -1.0)
+
+
+# ------------------------------------------------------------------ fingerprint (CONTRACT v2 A3)
+def _independent_fingerprint(ml: MLFilter) -> str:
+    """sha256 of the canonical JSON, rebuilt here from the public attributes only."""
+    intercept, weights = ml.model.coefficients()
+    doc = {
+        "coefficients": [repr(float(w)) for w in weights],
+        "features": list(FEATURES),
+        "intercept": repr(float(intercept)),
+        "l2": repr(float(ml.l2)),
+        "means": [repr(float(v)) for v in ml.means],
+        "stds": [repr(float(v)) for v in ml.stds],
+        "threshold": repr(float(ml.threshold)),
+    }
+    text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_fingerprint_is_a_deterministic_sha256_of_the_canonical_model() -> None:
+    cands = _candidates(11, 400, _hour_edge)
+    ml = MLFilter.fit(cands)
+    fp = ml.fingerprint()
+    assert is_sha256_hex(fp) and fp == fp.lower()
+    assert fp == _independent_fingerprint(ml)
+    assert fp == hashlib.sha256(ml.canonical_json().encode("utf-8")).hexdigest()
+    doc = json.loads(ml.canonical_json())
+    assert sorted(doc) == sorted(
+        ("features", "means", "stds", "intercept", "coefficients", "threshold", "l2")
+    )
+    assert doc["features"] == list(FEATURES) and len(doc["coefficients"]) == len(FEATURES)
+    # floats are repr strings: they round-trip bit for bit
+    assert float(doc["threshold"]) == ml.threshold and doc["l2"] == "1.0"
+    assert tuple(float(v) for v in doc["means"]) == ml.means
+    # deterministic: the same TRAIN candidates always give the same model and fingerprint
+    assert MLFilter.fit(list(cands)).fingerprint() == fp
+    assert make_factory()(cands).ml.fingerprint() == fp
+
+
+def test_fingerprint_changes_whenever_the_model_changes() -> None:
+    cands = _candidates(12, 400, _hour_edge)
+    ml = MLFilter.fit(cands)
+    fp = ml.fingerprint()
+    others = {
+        "refit on other TRAIN data": MLFilter.fit(_candidates(13, 400, _hour_edge)),
+        "one more TRAIN candidate": MLFilter.fit([*cands, _candidates(14, 1, _hour_edge)[0]]),
+        "another l2": MLFilter.fit(cands, l2=2.0),
+    }
+    fps = {name: other.fingerprint() for name, other in others.items()}
+    assert fp not in fps.values() and len(set(fps.values())) == len(fps), fps
+
+    def tweaked(**changes: object) -> str:
+        args = {
+            "model": ml.model,
+            "means": ml.means,
+            "stds": ml.stds,
+            "threshold": ml.threshold,
+            "train_n": ml.train_n,
+            "train_wins": ml.train_wins,
+            "avg_win_r": ml.avg_win_r,
+            "avg_loss_r": ml.avg_loss_r,
+        }
+        args.update(changes)
+        return MLFilter(**args).fingerprint()  # type: ignore[arg-type]
+
+    assert tweaked() == fp  # same parameters -> same identity
+    # train statistics that do not change a decision are not part of the identity
+    assert tweaked(train_n=1, train_wins=0) == fp
+    one_ulp = math.nextafter(ml.threshold, 1.0)
+    assert tweaked(threshold=one_ulp) != fp
+    assert tweaked(means=(math.nextafter(ml.means[0], math.inf), *ml.means[1:])) != fp
+    assert tweaked(stds=(*ml.stds[:-1], ml.stds[-1] * 2)) != fp
+    model = LogisticModel()
+    model.intercept, model.weights, model.l2 = ml.model.intercept, ml.model.weights, ml.l2
+    assert tweaked(model=model) == fp
+    model.weights = (*ml.model.weights[:-1], math.nextafter(ml.model.weights[-1], math.inf))
+    assert tweaked(model=model) != fp
+    model.weights, model.intercept = ml.model.weights, ml.model.intercept + 1e-9  # type: ignore[operator]
+    assert tweaked(model=model) != fp

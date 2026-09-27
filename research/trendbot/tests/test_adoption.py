@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import math
 from pathlib import Path
 from types import MappingProxyType
 
@@ -37,9 +38,10 @@ from research.trendbot.adoption import (
     require_stage,
     save_record,
 )
-from research.trendbot.config import ConfigError, PairRisk, StrategyConfig
+from research.trendbot.config import RULE_IDS, ConfigError, PairRisk, StrategyConfig
 from research.trendbot.journal import iso_to_ms, write_journal
 from research.trendbot.models import DAY_MS, EXIT_TP, HOUR_MS, Decision, Trade
+from research.trendbot.review_sheet import auto_flags
 
 
 CFG = StrategyConfig()
@@ -108,28 +110,42 @@ def blocking_rules(decisions: list[Decision]) -> set[str]:
     return {d.rule for d in decisions}
 
 
+def a1_levels(entry: float, stop: float, cfg: StrategyConfig = CFG) -> tuple[float, float]:
+    """(all-in loss per unit L_u, target T) exactly as CONTRACT.md v2 A1 defines them."""
+    f, s = cfg.fee_rate, cfg.slippage_pct / 100
+    stop_x = stop * (1 - s)
+    loss_per_unit = (entry - stop_x) + f * entry + f * stop_x
+    return loss_per_unit, (entry * (1 + f) + cfg.reward_risk * loss_per_unit) / (1 - f)
+
+
 def make_testnet_trade(k: int, variant: str = "base", **changes: object) -> Trade:
-    """A clean BTC trade (RR 2, risk 0.1% <= cap) entered k days into the testnet window."""
+    """A clean BTC take-profit (A1 cost-aware size and target, net RR exactly 2, risk 0.1%
+    <= cap) entered k days into the testnet window."""
     signal = TESTNET_START + k * DAY_MS
+    entry, stop, qty = 100.0, 95.0, 2.0
+    loss_per_unit, target = a1_levels(entry, stop)
+    risk_amount = qty * loss_per_unit
+    fees = CFG.fee_rate * qty * (entry + target)
+    pnl = qty * (target - entry) - fees  # == reward_risk * risk_amount by construction
     t = Trade(
         trade_id=k + 1,
         pair="BTC/USDT",
         variant=variant,
         signal_ts=signal,
         entry_ts=signal + 4 * HOUR_MS,
-        entry_price=100.0,
-        stop=95.0,
-        target=110.0,
-        qty=2.0,
-        risk_amount=10.0,
+        entry_price=entry,
+        stop=stop,
+        target=target,
+        qty=qty,
+        risk_amount=risk_amount,
         risk_pct=0.1,
         stop_method="pivot",
         exit_ts=signal + 12 * HOUR_MS,
-        exit_price=110.0,
+        exit_price=target,
         exit_reason=EXIT_TP,
-        fees=0.42,
-        pnl=19.58,
-        r_multiple=1.958,
+        fees=fees,
+        pnl=pnl,
+        r_multiple=pnl / risk_amount,
     )
     return dataclasses.replace(t, **changes)
 
@@ -141,6 +157,12 @@ def write_evidence(base: Path, trades: list[Trade] | None = None) -> None:
     write_journal(
         trades if trades is not None else [make_testnet_trade(k) for k in range(3)], base / JOURNAL
     )
+
+
+def test_testnet_fixture_trade_is_clean_under_the_review_flags():
+    t = make_testnet_trade(0)
+    assert auto_flags(t, CFG) == []
+    assert math.isclose(t.r_multiple, CFG.reward_risk, rel_tol=1e-12)
 
 
 # ---------------------------------------------------------------------------- fingerprint
@@ -702,3 +724,137 @@ def test_cli_errors(tmp_path: Path, capsys):
     with pytest.raises(SystemExit) as info:
         main(["check", "--record", str(path), "--stage", "PAPER"])
     assert info.value.code == 2
+
+
+def test_adoption_rule_ids_agree_with_config_rule_ids():
+    adopt_ids = {k: v for k, v in RULE_IDS.items() if k.startswith("ADOPT_")}
+    assert dict(ADOPTION_RULE_IDS) == adopt_ids
+    assert list(ADOPTION_RULE_IDS) == list(adopt_ids)  # same order as the config listing
+
+
+# ---------------------------------------------------------------------------- v2 A3 ML model
+MODEL_FP = "ab" * 32  # a sha256 hex digest (as MLFilter.fingerprint() returns)
+OTHER_FP = "cd" * 32
+
+
+def ml_record(model_fp: str | None = MODEL_FP, variant: str = "base+ml") -> AdoptionRecord:
+    return dataclasses.replace(valid_record(variant=variant), model_fingerprint=model_fp)
+
+
+def test_model_fingerprint_round_trips_and_is_optional_in_old_records(tmp_path: Path):
+    path = tmp_path / "rec.json"
+    for record in (ml_record(), empty_record("base+ml", CFG, MODEL_FP), valid_record()):
+        save_record(record, path)
+        assert load_record(path) == record
+    save_record(valid_record(), path)
+    assert json.loads(path.read_text())["model_fingerprint"] is None
+    # a record written before v2 A3 has no model_fingerprint key at all: still loads
+    data = json.loads(path.read_text())
+    del data["model_fingerprint"]
+    path.write_text(json.dumps(data))
+    old = load_record(path)
+    assert old.model_fingerprint is None and old == valid_record()
+    assert check_promotion(old, LIVE, CFG, NOW) == []
+    assert empty_record("base+ml", model_fingerprint=MODEL_FP).model_fingerprint == MODEL_FP
+
+
+@pytest.mark.parametrize("bad", ["5", "true", "[]", '{"a": 1}'])
+def test_load_record_rejects_non_string_model_fingerprint(tmp_path: Path, bad: str):
+    path = tmp_path / "rec.json"
+    path.write_text(f'{{"variant": "b", "config_fingerprint": "x", "model_fingerprint": {bad}}}')
+    with pytest.raises(ValueError, match="model_fingerprint must be a string or null"):
+        load_record(path)
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_matching_model_fingerprint_passes_every_stage(stage: str):
+    assert check_promotion(ml_record(), stage, CFG, NOW, model_fingerprint=MODEL_FP) == []
+    require_stage(ml_record(), stage, CFG, NOW, model_fingerprint=MODEL_FP)  # no raise
+
+
+def model_block(record: AdoptionRecord, stage: str, supplied: str | None) -> str:
+    decisions = check_promotion(record, stage, CFG, NOW, model_fingerprint=supplied)
+    assert blocking_rules(decisions) == {ADOPT_FINGERPRINT}, decisions
+    assert len(decisions) == 1
+    return decisions[0].reason
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_model_fingerprint_mismatch_blocks_every_stage(stage: str):
+    reason = model_block(ml_record(), stage, OTHER_FP)
+    assert "not the one that was tested" in reason
+    assert MODEL_FP[:16] in reason and OTHER_FP[:16] in reason
+    assert "not the one that was tested" in model_block(ml_record(), stage, MODEL_FP.upper())
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_recorded_model_but_none_supplied_blocks_every_stage(stage: str):
+    assert "cannot be verified" in model_block(ml_record(), stage, None)
+    # a recorded model pins the variant even when its id has no "+ml" marker
+    assert "cannot be verified" in model_block(ml_record(variant="base"), stage, None)
+
+
+@pytest.mark.parametrize("variant", ["base+ml", "rr2.5_vol2+ml", "base+ML"])
+@pytest.mark.parametrize("stage", STAGES)
+def test_ml_variant_without_recorded_model_fingerprint_blocks(stage: str, variant: str):
+    record = ml_record(model_fp=None, variant=variant)
+    for supplied in (None, MODEL_FP):  # supplying one now cannot repair the record
+        reason = model_block(record, stage, supplied)
+        assert "has no model_fingerprint" in reason and "+ml" in reason
+
+
+def test_model_fingerprint_supplied_for_a_record_without_one_blocks():
+    reason = model_block(valid_record(), LIVE, MODEL_FP)
+    assert "never tested under this record" in reason
+    assert check_promotion(valid_record(), LIVE, CFG, NOW, model_fingerprint=None) == []
+
+
+@pytest.mark.parametrize("recorded", ["", "   ", "abc", "zz" * 32, MODEL_FP + "0"])
+def test_malformed_recorded_model_fingerprint_blocks_even_if_supplied_equal(recorded: str):
+    reason = model_block(ml_record(recorded), LIVE, recorded)
+    assert "is not a sha256 hex digest" in reason
+
+
+def test_model_and_config_mismatch_are_both_reported():
+    record = dataclasses.replace(
+        valid_record(CFG.with_changes(reward_risk=2.5), "rr2.5+ml"), model_fingerprint=MODEL_FP
+    )
+    decisions = check_promotion(record, LIVE, CFG, NOW, model_fingerprint=OTHER_FP)
+    assert blocking_rules(decisions) == {ADOPT_FINGERPRINT} and len(decisions) == 2
+    with pytest.raises(AdoptionBlocked) as info:
+        require_stage(record, LIVE, CFG, NOW, model_fingerprint=OTHER_FP)
+    assert len(info.value.decisions) == 2
+
+
+def test_cli_model_fingerprint_check(tmp_path: Path, capsys):
+    write_evidence(tmp_path, [make_testnet_trade(k, variant="base+ml") for k in range(3)])
+    path = tmp_path / "rec.json"
+    save_record(ml_record(), path)
+    assert run_check(path, LIVE, "--model-fingerprint", MODEL_FP) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("PASS") and f"model {MODEL_FP[:16]}" in out
+    assert run_check(path, LIVE, "--model-fingerprint", f"  {MODEL_FP}\n") == 0  # stripped
+    capsys.readouterr()
+    assert run_check(path, LIVE) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("BLOCKED") and f"[{ADOPT_FINGERPRINT}]" in out
+    assert "cannot be verified" in out
+    assert run_check(path, LIVE, "--model-fingerprint", OTHER_FP) == 1
+    assert "not the one that was tested" in capsys.readouterr().out
+
+
+def test_cli_init_records_the_model_fingerprint(tmp_path: Path, capsys):
+    path = tmp_path / "rec.json"
+    argv = ["init", "--variant", "base+ml", "--out", str(path)]
+    assert main(argv) == 1  # a +ml variant needs its model fingerprint
+    assert "--model-fingerprint is required" in capsys.readouterr().err
+    assert not path.exists()
+    assert main([*argv, "--model-fingerprint", "not-a-hash"]) == 1
+    assert "not a sha256 hex digest" in capsys.readouterr().err
+    assert main([*argv, "--model-fingerprint", MODEL_FP]) == 0
+    assert MODEL_FP in capsys.readouterr().out
+    assert load_record(path) == empty_record("base+ml", CFG, MODEL_FP)
+    assert run_check(path, "BACKTEST", "--model-fingerprint", MODEL_FP) == 0
+    assert run_check(path, "BACKTEST") == 1
+    assert main(["init", "--variant", "base", "--out", str(tmp_path / "b.json")]) == 0
+    assert load_record(tmp_path / "b.json").model_fingerprint is None

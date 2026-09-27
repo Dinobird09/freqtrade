@@ -8,28 +8,42 @@ used by the tests, by the research report and for human review of any journal.
 
 Timing conventions used throughout (the same the backtester documents): a trade's
 decision time is ``signal_ts + timeframe_ms`` (close of the signal candle = open of the fill
-candle); ``exit_ts`` is the OPEN of the candle in which the exit filled, so at a decision
-time ``d`` the bot knows exactly the trades with ``exit_ts < d``. A trade occupies the
-portfolio over ``[signal_ts, exit_ts)`` in candle time (from its decision until its exit
-candle, whose exits are processed before that candle's entry decisions).
+candle); ``exit_ts`` is the OPEN of the candle in which the exit filled, and the fill happens
+somewhere inside that candle. Following CONTRACT.md v2 A2, an exit is therefore counted from
+its EFFECTIVE time ``t_e = exit_ts + timeframe_ms`` (the exit candle close, the latest moment
+it can have filled): at a decision time ``d`` the bot knows exactly the trades with
+``t_e <= d``, a bench runs ``[t_e, t_e + bench_hours)`` and the 7-day window holds the trades
+with ``t_e`` in ``(d - loss_window, d]``. A trade occupies the portfolio over
+``[signal_ts, exit_ts)`` in candle time (from its decision until its exit candle, whose exits
+are processed before that candle's entry decisions).
 
-Checked, per trade: closed; ``stop < entry < target``; planned reward:risk
-``(target - entry) / (entry - stop) >= cfg.reward_risk - 1e-9`` with ``cfg.reward_risk >= 2``;
-``risk_pct <= pair cap + 1e-9`` and ``risk_amount == qty * (entry - stop)`` and ``risk_pct``
+Cost-aware R (CONTRACT.md v2 A1), with fill ``E``, stop ``S``, ``f = fee_rate`` and
+``s = slippage_pct / 100``: ``L_u = (E - S*(1-s)) + f*E + f*S*(1-s)`` is the all-in loss per
+unit at the stop, recomputed here from the trade row and the config alone.
+
+Checked, per trade: closed; ``stop < entry < target``; NET reward:risk
+``((target - entry) - f*(entry + target)) / L_u >= reward_risk`` and PRICE reward:risk
+``(target - entry) / (entry - stop) >= reward_risk``, with ``cfg.reward_risk >= 2``;
+``risk_pct <= pair cap`` and ``risk_amount == qty * L_u`` (relative 1e-9) and ``risk_pct``
 equal to ``risk_amount`` over the realized equity at the decision (size derived from the stop);
 stop distance within the configured bounds from the fill; signal window, fill timing and
 fill price (next open plus slippage); R1-R4 on the signal candle; R8: the stop sits
 ``buffer`` below a real low that was a CONFIRMED pivot at decision time (or the fallback
 lookback low), strictly below that low, BNB buffer within 0.5-0.8 %; exit on the FIRST
 candle that touches stop or target, at the documented price (exits never paused or
-delayed); fee/pnl/R arithmetic; no data at or after ``end_ts``.
+delayed); fee/pnl/R arithmetic; outcome in R: a clean stop-loss (exit candle opens above
+the stop, fill at ``stop * (1 - s)``) is exactly -1R, a take-profit exactly
++``reward_risk`` R (both within 1e-9), a gap-through stop-loss is at most -1R, and NOTHING
+else is below -1R or above +``reward_risk`` R; no data at or after ``end_ts``.
 
 Checked across trades: no pyramiding; BNB never overlaps another cluster position; open
 cluster risk never exceeds the shared budget; under a config where one full-size
 cluster position exhausts the budget (the default) no two cluster positions overlap; no
 entry inside a news blackout (R5); no entry while benched (R9, recomputed from the SL
-streaks); no entry while the 7-day realized loss halt is active (R9, recomputed from the
-closed pnl); equity curve and final equity consistent with the trades.
+streaks); every bench lasts at least ``bench_hours`` of real time from the close of the
+exit candle of the stop-loss that completed the streak, i.e. the pair's next entry decision
+is at least that late (R9, A2); no entry while the 7-day realized loss halt is active (R9,
+recomputed from the closed pnl); equity curve and final equity consistent with the trades.
 
 CLI (exit code 1 if any violation is found)::
 
@@ -39,7 +53,9 @@ CLI (exit code 1 if any violation is found)::
 
 Audit a journal against the candles it was traded on (the journal must hold every trade of
 the run, since the breakers and the correlation cap are recomputed from it), or run and
-audit a backtest of a synthetic world. Both use the default ``StrategyConfig``.
+audit a backtest of a synthetic world. Both use the default ``StrategyConfig`` and the
+backtest timing convention above (a journal of the backtester, whose ``exit_ts`` is the exit
+candle open).
 """
 
 from __future__ import annotations
@@ -90,6 +106,17 @@ def _who(t: Trade) -> str:
     return f"trade #{t.trade_id} {t.pair} (signal {_iso(t.signal_ts)})"
 
 
+def effective_exit(t: Trade, cfg: StrategyConfig) -> int:
+    """A2: the exit candle CLOSE ``exit_ts + timeframe_ms``, when a backtest exit is certain."""
+    return t.exit_ts + cfg.timeframe_ms  # type: ignore[operator]
+
+
+def all_in_unit_loss(t: Trade, cfg: StrategyConfig) -> float:
+    """A1: ``L_u = (E - S_x) + f*E + f*S_x`` with ``S_x = stop * (1 - slippage)``."""
+    stop_x = t.stop * (1.0 - cfg.slippage_pct / 100.0)
+    return (t.entry_price - stop_x) + cfg.fee_rate * t.entry_price + cfg.fee_rate * stop_x
+
+
 @dataclass(slots=True)
 class _PairData:
     candles: list[Candle]
@@ -124,22 +151,23 @@ class _Audit:
             (t for t in self.trades if t.exit_ts is not None and t.pnl is not None),
             key=lambda t: (t.exit_ts, t.trade_id),
         )
-        self.exit_ts = [t.exit_ts for t in closed]
+        # Effective exit times t_e = exit_ts + tf (A2), ascending.
+        self.certain_ts = [effective_exit(t, cfg) for t in closed]
         self.cum_pnl = [0.0, *accumulate(float(t.pnl) for t in closed)]  # type: ignore[arg-type]
 
     def decision_ts(self, t: Trade) -> int:
         return t.signal_ts + self.tf
 
     def equity_before(self, ts: int) -> float:
-        """Realized equity from the trades known at ``ts`` (``exit_ts < ts``)."""
-        return self.cfg.starting_capital + self.cum_pnl[bisect_left(self.exit_ts, ts)]
+        """Realized equity from the trades known at ``ts`` (``t_e <= ts``)."""
+        return self.cfg.starting_capital + self.cum_pnl[bisect_right(self.certain_ts, ts)]
 
     def window_pnl_before(self, ts: int) -> float:
-        """Pnl of trades with ``ts - loss_window < exit_ts < ts`` (known at ``ts``)."""
+        """Pnl of trades with ``ts - loss_window < t_e <= ts`` (known at ``ts``)."""
         window_ms = round(self.cfg.loss_window_days * DAY_MS)
-        lo = bisect_right(self.exit_ts, ts - window_ms)
-        hi = bisect_left(self.exit_ts, ts)
-        return self.cum_pnl[hi] - self.cum_pnl[max(lo, 0)] if hi > lo else 0.0
+        lo = bisect_right(self.certain_ts, ts - window_ms)
+        hi = bisect_right(self.certain_ts, ts)
+        return self.cum_pnl[hi] - self.cum_pnl[lo] if hi > lo else 0.0
 
     def halted(self, ts: int) -> tuple[bool, float, float]:
         """(halted, window pnl, threshold) for an entry decision at ``ts``."""
@@ -164,18 +192,32 @@ def _check_closed(t: Trade) -> list[str]:
 
 def _check_geometry(t: Trade, cfg: StrategyConfig) -> list[str]:
     out: list[str] = []
-    if not t.stop < t.entry_price < t.target:
-        return [f"{_who(t)} violates stop < entry < target ({t.stop}, {t.entry_price}, {t.target})"]
-    rr = (t.target - t.entry_price) / (t.entry_price - t.stop)
-    if rr < cfg.reward_risk - TOL or cfg.reward_risk < MANDATE_MIN_RR:
-        out.append(f"{_who(t)} plans reward:risk {rr:.6f}, below {cfg.reward_risk:g} (min 2)")
+    entry, stop, target = t.entry_price, t.stop, t.target
+    if not stop < entry < target:
+        return [f"{_who(t)} violates stop < entry < target ({stop}, {entry}, {target})"]
+    rr, fee = cfg.reward_risk, cfg.fee_rate
+    unit_loss = all_in_unit_loss(t, cfg)
+    net_rr = ((target - entry) - fee * (entry + target)) / unit_loss
+    price_rr = (target - entry) / (entry - stop)
+    if rr < MANDATE_MIN_RR:
+        out.append(f"{_who(t)} was traded with reward_risk {rr:g}, below the mandated 2:1")
+    if net_rr < rr * (1.0 - TOL):
+        out.append(
+            f"{_who(t)} plans a net reward:risk of {net_rr:.6f} after fees and slippage, "
+            f"below {rr:g}:1 (min 2:1, A1)"
+        )
+    if price_rr < rr * (1.0 - TOL):
+        out.append(f"{_who(t)} plans a price reward:risk of {price_rr:.6f}, below {rr:g}:1 (min 2)")
     base = base_of(t.pair)
     cap = min(cfg.risk_for(t.pair).max_risk_pct, MANDATE_MAX_RISK_PCT.get(base, 0.0))
     if t.risk_pct > cap + TOL:
         out.append(f"{_who(t)} risks {t.risk_pct:.6f}% above the {cap:g}% cap (R7)")
-    if not (t.qty > 0 and _close(t.risk_amount, t.qty * (t.entry_price - t.stop))):
-        out.append(f"{_who(t)} risk_amount {t.risk_amount} != qty * (entry - stop) (R7)")
-    dist = (t.entry_price - t.stop) / t.entry_price * 100.0
+    if not (t.qty > 0 and _close(t.risk_amount, t.qty * unit_loss)):
+        out.append(
+            f"{_who(t)} risk_amount {t.risk_amount} != qty * all-in loss per unit "
+            f"{t.qty * unit_loss} (stop fill, slippage and both fees; R7, A1)"
+        )
+    dist = (entry - stop) / entry * 100.0
     lo, hi = cfg.min_stop_distance_pct, cfg.max_stop_distance_pct
     if not lo - TOL <= dist <= hi + TOL:
         out.append(f"{_who(t)} stop distance {dist:.4f}% from the fill is outside [{lo}, {hi}]%")
@@ -313,11 +355,32 @@ def _check_accounting(t: Trade, a: _Audit) -> list[str]:
     scale = max(t.risk_amount, 1e-12)
     if abs(t.fees - fees) > TOL * scale or abs(t.pnl - pnl) > TOL * scale:
         out.append(f"{_who(t)} fees/pnl {t.fees}/{t.pnl} != {fees}/{pnl} (fee on both legs)")
-    if abs(t.r_multiple - pnl / t.risk_amount) > 1e-7:
+    if abs(t.r_multiple - pnl / t.risk_amount) > TOL:
         out.append(f"{_who(t)} r_multiple {t.r_multiple} != pnl / planned risk")
     equity = a.equity_before(a.decision_ts(t))
     if not _close(t.risk_pct, t.risk_amount / equity * 100.0, 1e-7):
         out.append(f"{_who(t)} risk_pct {t.risk_pct} is not risk_amount / realized equity {equity}")
+    return out
+
+
+def _check_r_outcome(t: Trade, a: _Audit) -> list[str]:
+    """A1 in R: clean SL exactly -1, TP exactly +reward_risk; only gap-through SLs below -1R."""
+    r, x = t.r_multiple, a.pairs[t.pair].index.get(t.exit_ts or -1)
+    if r is None or x is None:
+        return []  # missing exits / candles are reported by _check_closed / _check_exit
+    rr, reason = a.cfg.reward_risk, t.exit_reason
+    gap = reason == EXIT_SL and a.pairs[t.pair].candles[x].open <= t.stop
+    out: list[str] = []
+    if reason == EXIT_TP and abs(r - rr) > TOL:
+        out.append(f"{_who(t)} take-profit made {r:.12f}R, not exactly +{rr:g}R net of costs (A1)")
+    if reason == EXIT_SL and not gap and abs(r + 1.0) > TOL:
+        out.append(f"{_who(t)} clean stop-loss made {r:.12f}R, not exactly -1R all-in (A1)")
+    if gap and r > -1.0 + TOL:
+        out.append(f"{_who(t)} gap-through stop-loss made {r:.12f}R, better than -1R (A1)")
+    if r < -1.0 - TOL and not gap:
+        out.append(f"{_who(t)} lost {r:.6f}R, below -1R without a gap through the stop (A1)")
+    if r > rr + TOL and reason != EXIT_TP:
+        out.append(f"{_who(t)} made {r:.6f}R, above the +{rr:g}R take-profit (A1)")
     return out
 
 
@@ -408,7 +471,12 @@ def _check_news(a: _Audit) -> list[str]:
 
 
 def benches(trades: Sequence[Trade], cfg: StrategyConfig) -> dict[str, list[tuple[int, int]]]:
-    """Recomputed R9 benches: pair -> [(start, until)] from consecutive-SL streaks."""
+    """Recomputed R9 benches: pair -> [(start, until)] from consecutive-SL streaks.
+
+    ``start`` is the effective exit time ``t_e = exit_ts + timeframe_ms`` (the exit candle
+    close, A2) of the stop-loss that completed the streak; the bench covers
+    ``start <= ts < until = start + bench_hours``.
+    """
     bench_ms = round(cfg.bench_hours * HOUR_MS)
     out: dict[str, list[tuple[int, int]]] = {}
     streak: dict[str, int] = {}
@@ -421,21 +489,46 @@ def benches(trades: Sequence[Trade], cfg: StrategyConfig) -> dict[str, list[tupl
             continue
         streak[t.pair] = streak.get(t.pair, 0) + 1
         if streak[t.pair] >= cfg.consecutive_sl_limit:
-            out.setdefault(t.pair, []).append((t.exit_ts, t.exit_ts + bench_ms))  # type: ignore[operator]
+            start = effective_exit(t, cfg)
+            out.setdefault(t.pair, []).append((start, start + bench_ms))
             streak[t.pair] = 0
     return out
 
 
-def _check_benches(a: _Audit) -> list[str]:
+def _check_benches(a: _Audit, all_benches: Mapping[str, list[tuple[int, int]]]) -> list[str]:
     out: list[str] = []
-    all_benches = benches(a.trades, a.cfg)
     for t in a.trades:
         ts = a.decision_ts(t)
         for start, until in all_benches.get(t.pair, ()):
-            if start < ts < until:
+            if start <= ts < until:
                 out.append(
                     f"{_who(t)} entered at {_iso(ts)} while {t.pair} was benched from "
                     f"{_iso(start)} until {_iso(until)} after consecutive stop-losses (R9)"
+                )
+    return out
+
+
+def _check_bench_duration(a: _Audit, all_benches: Mapping[str, list[tuple[int, int]]]) -> list[str]:
+    """A2: after a streak-completing stop-loss, the pair's NEXT entry decision comes at least
+    ``bench_hours`` after the exit candle close, so >= 24h of real time wherever inside that
+    candle the stop filled.
+
+    "Next" = the first decision strictly after the exit candle OPEN ``start - timeframe``: a
+    stop-loss hit on its own fill candle was DECIDED at that open, and any other same-pair
+    decision at or before it would overlap the open trade (reported as pyramiding).
+    """
+    bench_ms = round(a.cfg.bench_hours * HOUR_MS)
+    out: list[str] = []
+    for pair, spans in all_benches.items():
+        decisions = sorted(a.decision_ts(t) for t in a.trades if t.pair == pair)
+        for start, _until in spans:
+            k = bisect_right(decisions, start - a.tf)
+            if k < len(decisions) and decisions[k] - start < bench_ms:
+                out.append(
+                    f"{pair} was benched too briefly: its next entry was decided at "
+                    f"{_iso(decisions[k])}, {(decisions[k] - start) / HOUR_MS:g}h after the exit "
+                    f"candle close {_iso(start)} of the stop-loss that completed the streak, "
+                    f"less than the {a.cfg.bench_hours:g}h bench (R9)"
                 )
     return out
 
@@ -485,7 +578,7 @@ def blocked_open_trades(result: BacktestResult, cfg: StrategyConfig | None = Non
         if t.exit_ts is None:
             continue
         for ts in range(t.entry_ts + cfg.timeframe_ms, t.exit_ts + 1, cfg.timeframe_ms):
-            bench = any(s < ts < u for s, u in all_benches.get(t.pair, ()))
+            bench = any(s <= ts < u for s, u in all_benches.get(t.pair, ()))
             if bench or audit.halted(ts)[0]:
                 out.append(t)
                 break
@@ -514,9 +607,12 @@ def check_invariants(
         if not closed:
             out.extend(_check_exit(t, audit))
             out.extend(_check_accounting(t, audit))
+            out.extend(_check_r_outcome(t, audit))
     out.extend(_check_portfolio(audit))
     out.extend(_check_news(audit))
-    out.extend(_check_benches(audit))
+    all_benches = benches(audit.trades, audit.cfg)
+    out.extend(_check_benches(audit, all_benches))
+    out.extend(_check_bench_duration(audit, all_benches))
     out.extend(_check_halt(audit))
     out.extend(_check_equity(audit))
     return out

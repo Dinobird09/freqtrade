@@ -72,15 +72,23 @@ From ``active_end`` on, d = 0 exactly.
 
 Calibration of EFFECT_MU_SIGMAS / EFFECT_HORIZON (a POSITIVE-CONTROL fixture strength, not
 a market claim): measured with ``backtester.run_backtest`` over the full 6-year history,
-default config, seeds 1-5 (about 25-30 trades per year across the three pairs):
+default config, seeds 1-5, with the cost-aware R of CONTRACT.md v2 A1 (a clean stop is
+exactly -1R, a take-profit exactly +2R, so costs show up as a lower TP hit rate) and the
+A2 breaker timing; 125-175 trades per seed (about 21-29 per year across the three pairs):
 
-    null      avg R -0.10 (per seed -0.32 .. +0.05): costs only
-    planted   avg R +0.42 (per seed +0.31 .. +0.57)
-    decay     avg R +0.24; before the 70 % split +0.28 .. +0.47, after it -0.29 .. +0.29
-              (the post-split tail is the null world, so it matches null's noise)
-    hour_edge avg R +0.12 for the hour-blind base strategy; its trades whose signal candle
-              closes 12-20 UTC average +0.49 R (per seed +0.34 .. +0.73), the others -0.19 R,
-              so an hour-aware filter has something real to learn
+    null      avg R -0.10 (per seed -0.40 .. +0.07; 707 trades): costs only
+    planted   avg R +0.42 (per seed +0.34 .. +0.51; 815 trades)
+    decay     avg R +0.26 (804 trades); before the 70 % split +0.32 .. +0.46 per seed, after
+              it -0.34 .. +0.50 (the post-split tail is the null world, ~50 trades per seed,
+              so it matches null's noise)
+    hour_edge avg R +0.15 for the hour-blind base strategy (831 trades); its trades whose
+              signal candle closes 12-20 UTC average +0.53 R (per seed +0.41 .. +0.65), the
+              others -0.19 R (per seed -0.37 .. +0.16), so an hour-aware filter has
+              something real to learn
+
+The v1 arithmetic (risk = price distance only, target = entry + 2 x stop distance) gave
+null -0.10, planted +0.42, decay +0.24, hour_edge +0.12 (+0.49 / -0.19): A1 moved every world
+by at most 0.03 R, so EFFECT_MU_SIGMAS was left at 0.7.
 
 At the wave-1 strength (0.35 sigma), once made conditional, the base strategy earned only
 ~+0.05 to +0.14 R in "planted": its trades on down-closing spike candles and on trend

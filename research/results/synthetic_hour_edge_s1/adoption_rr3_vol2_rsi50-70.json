@@ -1,17 +1,18 @@
 {
   "variant": "rr3_vol2_rsi50-70",
   "config_fingerprint": "5cbe1d74d6aa0330ebefe615d16767a6e6b366aa8bebb88edf460c16059eba47",
+  "model_fingerprint": null,
   "backtest": {
     "report_path": "REPORT.md",
-    "completed_utc": "2026-09-27T11:17:22Z"
+    "completed_utc": "2026-09-27T12:00:00Z"
   },
   "walk_forward": {
     "label": "UNTESTED",
     "dd_ok": true,
     "split_utc": "2023-03-14T00:00:00Z",
-    "train_n": 76,
-    "test_n": 43,
-    "test_avg_r": 0.30657271884412934,
+    "train_n": 72,
+    "test_n": 39,
+    "test_avg_r": 0.43589743589743424,
     "report_path": "REPORT.md"
   },
   "human_review": {

@@ -28,10 +28,26 @@ from research.trendbot.invariants import (
     result_from_journal,
 )
 from research.trendbot.journal import read_journal, write_journal
-from research.trendbot.models import EXIT_SL, Decision, NewsEvent, StopPlan
+from research.trendbot.models import (
+    EXIT_SL,
+    EXIT_TP,
+    HOUR_MS,
+    Decision,
+    NewsEvent,
+    SizingResult,
+    StopPlan,
+)
 from research.trendbot.news import NewsCalendar
 from research.trendbot.synthetic import WORLDS, make_world
-from research.trendbot.tests.bt_helpers import TF, Scenario, data_of, news, slot
+from research.trendbot.tests.bt_helpers import (
+    TF,
+    Scenario,
+    bench_scenario,
+    data_of,
+    news,
+    slot,
+    unit_loss,
+)
 
 
 CFG = StrategyConfig()
@@ -89,10 +105,18 @@ def _first(bad, pair=None):
     return next(t for t in bad.trades if pair is None or t.pair == pair)
 
 
+def _resettle(t, exit_price):
+    """Move a trade's exit price and recompute fees, pnl and R consistently."""
+    t.exit_price = exit_price
+    t.fees = CFG.fee_rate * t.qty * (t.entry_price + exit_price)
+    t.pnl = t.qty * (exit_price - t.entry_price) - t.fees
+    t.r_multiple = t.pnl / t.risk_amount
+
+
 def _stop_above_structure(bad, data):
     t = _first(bad)
     t.stop *= 1.004
-    t.risk_amount = t.qty * (t.entry_price - t.stop)
+    t.risk_amount = t.qty * unit_loss(t.entry_price, t.stop, CFG)
 
 
 def _risk_above_cap(bad, data):
@@ -102,6 +126,27 @@ def _risk_above_cap(bad, data):
 def _rr_below_2(bad, data):
     t = _first(bad)
     t.target = t.entry_price + 1.5 * (t.entry_price - t.stop)
+
+
+def _net_rr_below_2(bad, data):
+    t = _first(bad)
+    t.target = t.entry_price + 2 * (t.entry_price - t.stop)  # the v1 price-only target
+
+
+def _risk_amount_price_only(bad, data):
+    t = _first(bad)
+    t.risk_amount = t.qty * (t.entry_price - t.stop)  # v1: ignores fees and stop slippage
+
+
+def _loss_beyond_1r_without_gap(bad, data):
+    t = next(t for t in bad.trades if t.exit_reason == EXIT_SL)
+    _resettle(t, t.exit_price * 0.995)
+
+
+def _take_profit_above_rr(bad, data):
+    t = next(t for t in bad.trades if t.exit_reason == EXIT_TP)
+    t.target *= 1.001
+    _resettle(t, t.target)
 
 
 def _fill_not_next_open(bad, data):
@@ -163,12 +208,26 @@ def _bench_ignored(bad, data):
     mine[3].signal_ts, mine[3].entry_ts = mine[2].exit_ts, mine[2].exit_ts + TF
 
 
+def _bench_from_the_candle_open(bad, data):
+    """The next entry decided exactly 24h after the 3rd SL's exit candle OPEN (v1 timing)."""
+    pair = bad.trades[0].pair
+    mine = [t for t in bad.trades if t.pair == pair]
+    for t in mine[:3]:
+        t.exit_reason = EXIT_SL
+    decided = mine[2].exit_ts + 24 * HOUR_MS
+    mine[3].signal_ts, mine[3].entry_ts = decided - TF, decided
+
+
 @pytest.mark.parametrize(
     ("corruption", "expected"),
     [
         (_stop_above_structure, "(R8)"),
         (_risk_above_cap, "cap (R7)"),
-        (_rr_below_2, "reward:risk"),
+        (_rr_below_2, "price reward:risk"),
+        (_net_rr_below_2, "net reward:risk"),
+        (_risk_amount_price_only, "all-in loss per unit"),
+        (_loss_beyond_1r_without_gap, "below -1R without a gap"),
+        (_take_profit_above_rr, "take-profit made"),
         (_fill_not_next_open, "next open plus slippage"),
         (_exit_delayed, "exit delayed"),
         (_not_closed, "is not closed"),
@@ -180,6 +239,7 @@ def _bench_ignored(bad, data):
         (_future_data, "at/after end_ts"),
         (_big_loss_before_entry, "halt limit"),
         (_bench_ignored, "benched"),
+        (_bench_from_the_candle_open, "benched too briefly"),
     ],
 )
 def test_corrupted_trade_is_caught(corruption, expected):
@@ -195,7 +255,8 @@ def test_benches_are_recomputed_from_streaks():
         t.exit_reason = EXIT_SL
     btc[3].exit_reason = "TP"
     found = benches(trades, CFG)["BTC/USDT"]
-    assert found[0] == (btc[2].exit_ts, btc[2].exit_ts + 24 * 3_600_000)
+    # A2: from the exit candle CLOSE (when the stop is certain), for 24h.
+    assert found[0] == (btc[2].exit_ts + TF, btc[2].exit_ts + TF + 24 * HOUR_MS)
 
 
 # ---------------------------------------------------------------------------- engine sabotage
@@ -248,6 +309,50 @@ def test_disabled_correlation_cap_is_caught(monkeypatch):
     )
     violations = check_invariants(run_backtest(data, CFG), data, (), CFG)
     assert any("BNB never stacks" in v for v in violations)
+
+
+def test_price_only_target_is_caught(monkeypatch):
+    """If the engine used the v1 target E + 2 (E - S), fees would eat into the 2:1."""
+    data = data_of(Scenario().spike(slot(0)).take_profit(slot(0), CFG))
+    assert check_invariants(run_backtest(data, CFG), data, (), CFG) == []
+    monkeypatch.setattr(
+        gk_mod, "cost_aware_target", lambda e, s, cfg: e + cfg.reward_risk * (e - s)
+    )
+    violations = check_invariants(run_backtest(data, CFG), data, (), CFG)
+    assert any("net reward:risk" in v for v in violations)
+    assert any("take-profit made" in v for v in violations)
+
+
+def test_price_only_sizing_is_caught(monkeypatch):
+    """If the engine sized from the price distance only, a clean stop would lose > 1R."""
+    data = data_of(Scenario().spike(slot(0)).stop_out(slot(0), CFG))
+    assert check_invariants(run_backtest(data, CFG), data, (), CFG) == []
+
+    def v1_size(pair, equity, entry, stop, risk_pct, cfg):
+        qty = equity * risk_pct / 100 / (entry - stop)
+        return SizingResult(qty, qty * (entry - stop), risk_pct, entry - stop, qty * entry, None)
+
+    monkeypatch.setattr(gk_mod, "size_for_pair", v1_size)
+    violations = check_invariants(run_backtest(data, CFG), data, (), CFG)
+    assert any("all-in loss per unit" in v for v in violations)
+    assert any("clean stop-loss made" in v for v in violations)
+    assert any("below -1R without a gap" in v for v in violations)
+
+
+def test_bench_counted_from_the_exit_candle_open_is_caught(monkeypatch):
+    """A2: an engine that counted the bench from the recorded exit_ts (the exit candle OPEN)
+    re-enters 24h after that open, only 20h after the stop is certain; the audit flags it."""
+    data = data_of(bench_scenario(CFG))
+    assert check_invariants(run_backtest(data, CFG), data, (), CFG) == []
+
+    class OpenTimed(gk_mod.Gatekeeper):
+        def __init__(self, cfg, events=(), breakers=None, exit_time_uncertainty_ms=None):
+            super().__init__(cfg, events, breakers, exit_time_uncertainty_ms=0)
+
+    monkeypatch.setattr(bt, "Gatekeeper", OpenTimed)
+    violations = check_invariants(run_backtest(data, CFG), data, (), CFG)
+    assert any("benched too briefly" in v and "20h after the exit" in v for v in violations)
+    assert any("while BNB/USDT was benched" in v for v in violations)
 
 
 def test_stop_not_behind_structure_is_caught(monkeypatch):

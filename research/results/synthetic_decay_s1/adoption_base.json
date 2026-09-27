@@ -1,17 +1,18 @@
 {
   "variant": "base",
   "config_fingerprint": "9be9d6da6ad86d8579570ae32c09984ac335bda8ac8a52bbb11751042e1e03b9",
+  "model_fingerprint": null,
   "backtest": {
     "report_path": "REPORT.md",
-    "completed_utc": "2026-09-27T11:17:22Z"
+    "completed_utc": "2026-09-27T12:00:00Z"
   },
   "walk_forward": {
     "label": "TRAIN-ONLY",
     "dd_ok": true,
     "split_utc": "2023-03-14T00:00:00Z",
-    "train_n": 115,
-    "test_n": 58,
-    "test_avg_r": -0.20102114436967852,
+    "train_n": 114,
+    "test_n": 56,
+    "test_avg_r": -0.1428571428571436,
     "report_path": "REPORT.md"
   },
   "human_review": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from collections import Counter
 from dataclasses import replace
 from functools import cache
 
@@ -20,10 +21,20 @@ from research.trendbot.backtester import (
 from research.trendbot.config import StrategyConfig
 from research.trendbot.gatekeeper import Gatekeeper
 from research.trendbot.invariants import blocked_open_trades, check_invariants
-from research.trendbot.models import EXIT_END, EXIT_SL, EXIT_TP, Candle
+from research.trendbot.journal import ms_to_iso
+from research.trendbot.models import DAY_MS, EXIT_END, EXIT_SL, EXIT_TP, HOUR_MS, Candle
 from research.trendbot.structure import find_stop
 from research.trendbot.synthetic import make_world
-from research.trendbot.tests.bt_helpers import TF, Scenario, data_of, news, slot, ts
+from research.trendbot.tests.bt_helpers import (
+    TF,
+    Scenario,
+    bench_scenario,
+    data_of,
+    news,
+    slot,
+    ts,
+    unit_loss,
+)
 
 
 CFG = StrategyConfig()
@@ -164,7 +175,8 @@ def test_three_stop_losses_bench_the_pair_for_24h():
     bnb = Scenario("BNB/USDT", start=10.0)
     for k in range(3):
         bnb.spike(slot(k)).stop_out(slot(k), CFG)
-    bnb.spike(slot(3), slot(4))  # slot 3 decides 20h after the 3rd SL, slot 4 after 44h
+    # slot 3 decides 16h after the 3rd SL's exit candle closes, slot 4 after 40h
+    bnb.spike(slot(3), slot(4))
     btc = Scenario().spike(slot(3)).take_profit(slot(3), CFG)  # other pairs are unaffected
     res = run_backtest(data_of(bnb, btc), CFG)
     bnb_trades = [t for t in res.trades if t.pair == "BNB/USDT"]
@@ -173,8 +185,31 @@ def test_three_stop_losses_bench_the_pair_for_24h():
     assert (when, pair) == (ts(slot(3)), "BNB/USDT") and "consecutive stop-losses" in why
     assert [signal_idx(t) for t in bnb_trades] == [slot(0), slot(1), slot(2), slot(4)]
     assert [signal_idx(t) for t in res.trades if t.pair == "BTC/USDT"] == [slot(3)]
-    assert any("benched" in msg for _, msg in res.breaker_log)
+    # A2: the bench runs 24h from the exit candle CLOSE, not from its recorded open.
+    until = bnb_trades[2].exit_ts + TF + 24 * HOUR_MS
+    assert any(f"benched until {ms_to_iso(until)}" in msg for _, msg in res.breaker_log)
     assert check_invariants(res, data_of(bnb, btc), (), CFG) == []
+
+
+def test_bench_lasts_24h_from_the_exit_candle_close():
+    """A2 end to end: the third SL fills somewhere inside the candle opening at
+    ``ts(slot(2) + 1)``. The signal decided exactly 24h after that OPEN is still benched
+    (only 20h after the candle's close, when the fill is certain); 24h after the close the
+    pair trades again (the next signal, 44h after the close, is taken)."""
+    bnb = bench_scenario(CFG)
+    res = run_backtest(data_of(bnb), CFG)
+    trades = res.trades
+    assert [t.exit_reason for t in trades[:3]] == [EXIT_SL] * 3
+    third = trades[2]
+    assert third.exit_ts == third.entry_ts == ts(slot(2) + 1)  # stopped on its fill candle
+    [(when, _, _, why)] = denials(res, "R9_circuit_breaker")
+    decided = when + TF
+    assert when == ts(slot(3)) and decided == third.exit_ts + 24 * HOUR_MS
+    assert f"until {ms_to_iso(third.exit_ts + TF + 24 * HOUR_MS)}" in why
+    assert "can have filled" in why
+    assert [signal_idx(t) for t in trades] == [slot(0), slot(1), slot(2), slot(4)]
+    assert trades[3].signal_ts + TF - (third.exit_ts + TF) >= 24 * HOUR_MS
+    assert check_invariants(res, data_of(bnb), (), CFG) == []
 
 
 def test_seven_day_loss_limit_halts_every_pair_then_lifts():
@@ -184,12 +219,18 @@ def test_seven_day_loss_limit_halts_every_pair_then_lifts():
     btc.spike(slot(2)).stop_out(slot(2), CFG)  # BTC streak is only 2: no bench
     eth.spike(slot(3))
     bnb.spike(slot(4))
-    k_lift = next(k for k in range(5, 20) if ts(slot(k)) + TF > ts(slot(0) + 2) + 7 * 24 * 3600_000)
+    # A2: the first loss counts from its exit candle CLOSE, ts(slot(0) + 3), for 7 days.
+    first_certain = ts(slot(0) + 3)
+    k_lift = next(k for k in range(5, 20) if ts(slot(k)) + TF >= first_certain + 7 * DAY_MS)
     eth.spike(slot(k_lift))
     data = data_of(btc, eth, bnb)
     res = run_backtest(data, CFG)
     losses = [t for t in res.trades if t.exit_reason == EXIT_SL]
-    assert len(losses) == 3 and sum(t.pnl for t in losses) < -0.03 * CFG.starting_capital
+    assert [t.r_multiple for t in losses] == pytest.approx([-1.0] * 3, abs=1e-12)
+    # Three clean -1R stops at 1 % each (-100, -99, -98.01) exceed 3 % of the REALIZED equity.
+    total = sum(t.pnl for t in losses)
+    assert total == pytest.approx(-297.01, rel=1e-9)
+    assert total < -0.03 * (CFG.starting_capital + total)
     halted = denials(res, "R9_circuit_breaker")
     assert [(signal_idx_ts(d[0]), d[1]) for d in halted] == [
         (slot(3), "ETH/USDT"),
@@ -265,9 +306,12 @@ def test_risk_caps_and_size_derived_from_the_stop():
     for pair, cap in (("BTC/USDT", 1.0), ("BNB/USDT", 0.5)):
         t = by_pair[pair]
         equity = CFG.starting_capital + sum(o.pnl for o in res.trades if o.exit_ts < t.entry_ts)
+        lu = unit_loss(t.entry_price, t.stop, CFG)  # A1: all-in loss per unit at the stop
+        assert lu > t.entry_price - t.stop  # fees and stop slippage make each unit riskier
         assert t.risk_pct == pytest.approx(cap, rel=1e-12)
-        assert t.qty == pytest.approx(equity * cap / 100 / (t.entry_price - t.stop), rel=1e-12)
-        assert t.risk_amount == pytest.approx(t.qty * (t.entry_price - t.stop), rel=1e-12)
+        assert t.qty == pytest.approx(equity * cap / 100 / lu, rel=1e-12)
+        assert t.risk_amount == pytest.approx(t.qty * lu, rel=1e-12)
+        assert t.risk_amount == pytest.approx(equity * cap / 100, rel=1e-12)
 
 
 def test_every_trade_has_rr_at_least_2_and_stop_below_structure():
@@ -276,8 +320,13 @@ def test_every_trade_has_rr_at_least_2_and_stop_below_structure():
         res = run_backtest(data, cfg, events)
         assert len(res.trades) > 30
         for t in res.trades:
-            rr = (t.target - t.entry_price) / (t.entry_price - t.stop)
-            assert rr == pytest.approx(cfg.reward_risk, rel=1e-12) and rr >= 2.0
+            # A1: the minimum holds NET of both fees and the stop slippage ...
+            lu = unit_loss(t.entry_price, t.stop, cfg)
+            net_win = (t.target - t.entry_price) - FEE * (t.entry_price + t.target)
+            assert net_win / lu == pytest.approx(cfg.reward_risk, rel=1e-12)
+            # ... so the price distance ratio is strictly larger than reward_risk.
+            price_rr = (t.target - t.entry_price) / (t.entry_price - t.stop)
+            assert price_rr > cfg.reward_risk >= 2.0
             candles = data[t.pair]
             i = next(k for k, c in enumerate(candles) if c.ts == t.signal_ts)
             plan, _ = find_stop(candles[: i + 1], i, t.pair, cfg)
@@ -289,10 +338,12 @@ def test_every_trade_has_rr_at_least_2_and_stop_below_structure():
 
 
 def test_free_cash_caps_the_second_position():
-    """Tight stops (~0.76 %) + the guard's half risk: two positions may overlap, but the
-    second one's notional is shrunk to the free cash (its risk only goes DOWN)."""
+    """Tight stops + the guard's half risk: two positions may overlap, but the second one's
+    notional is shrunk to the free cash (its risk only goes DOWN). BTC re-enters at 0.5 %
+    behind the wick of its earlier stop-out (~1 % stop, ~40 % of equity); ETH's ~0.53 %
+    stop (all-in ~0.78 % per unit) would need ~64 % of equity at 0.5 % risk."""
     cfg = StrategyConfig(expectancy_guard=True, guard_window=1)
-    btc, eth = Scenario(amp=0.2), Scenario("ETH/USDT", start=50.0, amp=0.2)
+    btc, eth = Scenario(amp=0.1), Scenario("ETH/USDT", start=50.0, amp=0.1)
     btc.spike(slot(0)).stop_out(slot(0), cfg)
     btc.spike(slot(1))
     eth.spike(slot(1))
@@ -303,6 +354,9 @@ def test_free_cash_caps_the_second_position():
     )
     assert first.pair == "BTC/USDT" and first.risk_pct == pytest.approx(0.5)
     assert "free_cash" in second.notes and second.risk_pct < 0.5
+    assert second.risk_amount == pytest.approx(
+        second.qty * unit_loss(second.entry_price, second.stop, cfg)
+    )
     equity = CFG.starting_capital + res.trades[0].pnl
     cost = lambda t: t.qty * t.entry_price * (1 + cfg.fee_rate)  # noqa: E731
     assert cost(first) + cost(second) <= equity * (1 + 1e-12)
@@ -324,8 +378,12 @@ def test_gap_through_stop_fills_at_the_open_minus_slippage():
     s.gap_open(i + 3, gap)
     t = _one_trade(s)
     assert (t.exit_reason, t.exit_ts) == (EXIT_SL, ts(i + 3))
-    assert t.exit_price == pytest.approx(gap * (1 - SLIP), rel=1e-15)
-    assert t.r_multiple < -1.0  # worse than the planned 1R
+    x = gap * (1 - SLIP)
+    assert t.exit_price == pytest.approx(x, rel=1e-15)
+    # The only way to lose more than the planned all-in 1R: price loss to the gap + fees.
+    lu = unit_loss(t.entry_price, t.stop, CFG)
+    expected = -((t.entry_price - x) + FEE * (t.entry_price + x)) / lu
+    assert t.r_multiple == pytest.approx(expected, rel=1e-12) and t.r_multiple < -1.0
 
 
 def test_candle_touching_stop_and_target_is_a_stop_loss():
@@ -335,6 +393,7 @@ def test_candle_touching_stop_and_target_is_a_stop_loss():
     t = _one_trade(s)
     assert (t.exit_reason, t.exit_ts) == (EXIT_SL, ts(i + 2))
     assert t.exit_price == pytest.approx(t.stop * (1 - SLIP), rel=1e-15)
+    assert t.r_multiple == pytest.approx(-1.0, abs=1e-12)  # a clean stop is exactly -1R
 
 
 def test_take_profit_is_a_limit_fill_without_slippage():
@@ -342,29 +401,57 @@ def test_take_profit_is_a_limit_fill_without_slippage():
     s = Scenario().spike(i).take_profit(i, CFG, j=i + 3)
     t = _one_trade(s)
     assert (t.exit_reason, t.exit_ts, t.exit_price) == (EXIT_TP, ts(i + 3), t.target)
+    assert t.r_multiple == pytest.approx(2.0, abs=1e-12)  # a take-profit is exactly +2R net
 
 
 def test_fee_and_r_arithmetic_by_hand():
+    """A1 by hand from the candles: E = next open * 1.0005, S_x = S * 0.9995,
+    L_u = (E - S_x) + 0.001 * (E + S_x), qty = 100 / L_u, T = (1.001 E + 2 L_u) / 0.999.
+    A take-profit then nets exactly +200 = +2R and a clean stop exactly -100 = -1R."""
     i = slot(0)
     s = Scenario().spike(i).take_profit(i, CFG)
     t = _one_trade(s)
     entry = s.candles[i + 1].open * 1.0005
     stop = s.stop(i, CFG)
-    target = entry + 2 * (entry - stop)
-    qty = 10_000 * 0.01 / (entry - stop)
+    stop_x = stop * 0.9995
+    lu = (entry - stop_x) + 0.001 * entry + 0.001 * stop_x
+    qty = 10_000 * 0.01 / lu
+    target = (entry * 1.001 + 2 * lu) / 0.999
     fees = 0.001 * qty * entry + 0.001 * qty * target
     pnl = qty * (target - entry) - fees
     assert (t.entry_price, t.stop, t.target) == pytest.approx((entry, stop, target), rel=1e-14)
+    assert (t.qty, t.risk_amount) == pytest.approx((qty, qty * lu), rel=1e-12)
+    assert t.risk_amount == pytest.approx(100.0, rel=1e-12) and t.risk_pct == pytest.approx(1.0)
     assert t.fees == pytest.approx(fees, rel=1e-12) and t.pnl == pytest.approx(pnl, rel=1e-12)
-    assert t.r_multiple == pytest.approx(pnl / (qty * (entry - stop)), rel=1e-12)
-    # Costs in R: 2R gross minus fees on both legs, e.g. ~0.12R at a ~2.5 % stop.
-    cost_r = 2 - t.r_multiple
-    assert cost_r == pytest.approx(0.001 * (entry + target) / (entry - stop), rel=1e-9)
+    assert t.pnl == pytest.approx(200.0, rel=1e-12)
+    assert t.r_multiple == pytest.approx(2.0, abs=1e-12)
+    # The costs moved into the size and the target: the target sits further than 2x the stop.
+    assert t.target - entry == pytest.approx(2 * (0.001 * entry + lu) / 0.999, rel=1e-12)
     sl = _one_trade(Scenario().spike(i).stop_out(i, CFG))
-    loss = sl.qty * (sl.stop * (1 - SLIP) - sl.entry_price) - FEE * sl.qty * (
-        sl.entry_price + sl.stop * (1 - SLIP)
-    )
-    assert sl.pnl == pytest.approx(loss, rel=1e-12) and sl.r_multiple < -1
+    loss = sl.qty * (stop_x - sl.entry_price) - FEE * sl.qty * (sl.entry_price + stop_x)
+    assert sl.exit_price == pytest.approx(stop_x, rel=1e-15)
+    assert sl.pnl == pytest.approx(loss, rel=1e-12) and sl.pnl == pytest.approx(-100.0, rel=1e-12)
+    assert sl.r_multiple == pytest.approx(-1.0, abs=1e-12)
+
+
+def test_outcomes_in_r_are_exact_on_a_synthetic_run():
+    """A1 across a whole run: every clean stop is -1R and every take-profit +reward_risk R
+    (to 1e-9), forced closes lie strictly between, and nothing loses more than 1R (synthetic
+    candles open at the previous close, so no stop is ever gapped through)."""
+    data, events = synth()
+    for cfg in (CFG, CFG.with_changes(reward_risk=3.0)):
+        res = run_backtest(data, cfg, events)
+        kinds: Counter[str] = Counter()
+        for t in res.trades:
+            kinds[t.exit_reason] += 1
+            if t.exit_reason == EXIT_TP:
+                assert t.r_multiple == pytest.approx(cfg.reward_risk, abs=1e-9)
+            elif t.exit_reason == EXIT_SL:
+                assert t.exit_price == pytest.approx(t.stop * (1 - SLIP), rel=1e-15)
+                assert t.r_multiple == pytest.approx(-1.0, abs=1e-9)
+            else:
+                assert -1.0 < t.r_multiple < cfg.reward_risk
+        assert kinds[EXIT_TP] >= 10 and kinds[EXIT_SL] >= 10, kinds
 
 
 def test_entry_that_gaps_through_the_stop_is_skipped():

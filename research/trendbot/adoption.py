@@ -29,6 +29,11 @@ What "complete" means (every item is a separate blocking reason, rule ``ADOPT_<s
   recorded, is not before the testnet run ended.
 - Always: ``variant`` named (``ADOPT_record``) and ``config_fingerprint`` equal to
   ``config_fingerprint(cfg)`` (``ADOPT_fingerprint``).
+- Always, ML model (``ADOPT_fingerprint``, CONTRACT.md v2 A3): if the record has a
+  ``model_fingerprint`` (a sha256 hex digest, ``MLFilter.fingerprint()``) the caller must supply
+  the fingerprint of the model it is promoting and the two must be equal; a variant whose id
+  contains ``"+ml"`` must have a recorded ``model_fingerprint``; and a model fingerprint may
+  not be supplied for a record that has none (that model was never tested under the record).
 
 Evidence files. With ``base_dir`` (the CLI always passes the record file's directory) the
 referenced files must exist; relative paths are resolved against ``base_dir``. The testnet
@@ -44,6 +49,7 @@ Record file (JSON, written by :func:`save_record`, every value ``null`` until fi
 times are ISO-8601 UTC strings such as ``"2024-03-12T12:30:00Z"``)::
 
     {"variant": "base", "config_fingerprint": "<sha256 hex>",
+     "model_fingerprint": "<sha256 hex>" or null (optional key; absent means null),
      "backtest": {"report_path", "completed_utc"},
      "walk_forward": {"label", "dd_ok", "split_utc", "train_n", "test_n", "test_avg_r",
                       "report_path"},
@@ -56,7 +62,9 @@ times are ISO-8601 UTC strings such as ``"2024-03-12T12:30:00Z"``)::
 CLI::
 
     python -m research.trendbot.adoption init --variant base --out rec.json [--config c.json]
+        [--model-fingerprint HEX]
     python -m research.trendbot.adoption check --record rec.json --stage LIVE [--now ISO]
+        [--config c.json] [--model-fingerprint HEX]
     python -m research.trendbot.adoption fingerprint [--config c.json]
 
 ``--config`` is a JSON object of ``StrategyConfig`` field overrides (validated: a loosening
@@ -71,6 +79,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import string
 import sys
 import time
 import typing
@@ -79,7 +88,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
 
-from .config import ConfigError, PairRisk, StrategyConfig
+from .config import RULE_IDS, ConfigError, PairRisk, StrategyConfig
 from .journal import iso_to_ms, ms_to_iso, read_journal
 from .metrics import LABELS
 from .models import DAY_MS, Decision, Trade
@@ -115,17 +124,20 @@ ADOPT_HUMAN_REVIEW = "ADOPT_human_review"
 ADOPT_TESTNET = "ADOPT_testnet"
 ADOPT_LIVE = "ADOPT_live"
 
-# Rule ids of this module (the adoption path is not a trading rule, so they are kept here
-# next to the checks rather than in config.RULE_IDS).
+# Rule ids of this module. The single source of truth is config.RULE_IDS (which holds every
+# Decision.rule id of the package); this is the ADOPT_* slice of it, so the two cannot drift.
 ADOPTION_RULE_IDS: Mapping[str, str] = MappingProxyType(
     {
-        ADOPT_RECORD: "The adoption record names the variant it tracks",
-        ADOPT_FINGERPRINT: "The config promoted is exactly the config tested (sha256)",
-        ADOPT_BACKTEST: "Stage 1: a completed backtest with a report",
-        ADOPT_WALK_FORWARD: "Stage 2: 70/30 walk-forward labelled ROBUST, drawdown within limit",
-        ADOPT_HUMAN_REVIEW: "Stage 3: a named human reviewed EVERY trade and approved",
-        ADOPT_TESTNET: "Stage 4: >= 14 days on Binance testnet, zero rule violations, journal",
-        ADOPT_LIVE: "Stage 5: live trading (never for an explicit test-only config)",
+        rule: RULE_IDS[rule]
+        for rule in (
+            ADOPT_RECORD,
+            ADOPT_FINGERPRINT,
+            ADOPT_BACKTEST,
+            ADOPT_WALK_FORWARD,
+            ADOPT_HUMAN_REVIEW,
+            ADOPT_TESTNET,
+            ADOPT_LIVE,
+        )
     }
 )
 STAGE_RULES: Mapping[str, str] = MappingProxyType(
@@ -162,6 +174,8 @@ _LABEL_WHY = {
 }
 _MAX_IDS_SHOWN = 5
 _FP_SHOWN = 16
+ML_VARIANT_MARKER = "+ml"  # a variant id containing this (any case) runs an ML entry filter
+_SHA256_HEX_LEN = 64
 
 
 # ---------------------------------------------------------------------------- fingerprint
@@ -189,6 +203,20 @@ def canonical_config_json(cfg: StrategyConfig) -> str:
 def config_fingerprint(cfg: StrategyConfig) -> str:
     """sha256 hex digest of :func:`canonical_config_json` (``pair_risk`` included)."""
     return hashlib.sha256(canonical_config_json(cfg).encode("utf-8")).hexdigest()
+
+
+def is_sha256_hex(value: object) -> bool:
+    """True for a 64-character hexadecimal string (the form of every fingerprint here)."""
+    return (
+        isinstance(value, str)
+        and len(value) == _SHA256_HEX_LEN
+        and all(c in string.hexdigits for c in value)
+    )
+
+
+def is_ml_variant(variant: str) -> bool:
+    """True if the variant id marks an ML layer (contains ``"+ml"``, case-insensitive)."""
+    return ML_VARIANT_MARKER in variant.lower()
 
 
 def _coerce_override(name: str, value: object, default: object) -> object:
@@ -308,6 +336,8 @@ class LiveStage:
 class AdoptionRecord:
     variant: str
     config_fingerprint: str
+    # sha256 of the ML model that was tested (MLFilter.fingerprint()), None if no ML layer.
+    model_fingerprint: str | None = None
     backtest: BacktestStage = field(default_factory=BacktestStage)
     walk_forward: WalkForwardStage = field(default_factory=WalkForwardStage)
     human_review: HumanReviewStage = field(default_factory=HumanReviewStage)
@@ -336,9 +366,16 @@ STAGE_SECTIONS: Mapping[str, str] = MappingProxyType(
 _KIND_NAMES = {str: "a string", int: "an integer", float: "a number", bool: "true/false"}
 
 
-def empty_record(variant: str, cfg: StrategyConfig | None = None) -> AdoptionRecord:
-    """A record with no stage completed, fingerprinted with ``cfg`` (default config)."""
-    return AdoptionRecord(variant, config_fingerprint(cfg if cfg is not None else StrategyConfig()))
+def empty_record(
+    variant: str, cfg: StrategyConfig | None = None, model_fingerprint: str | None = None
+) -> AdoptionRecord:
+    """A record with no stage completed, fingerprinted with ``cfg`` (default config).
+
+    ``model_fingerprint`` is the tested ML model's ``MLFilter.fingerprint()`` (required for a
+    ``"+ml"`` variant before any promotion; ``None`` for a variant without an ML layer).
+    """
+    fp = config_fingerprint(cfg if cfg is not None else StrategyConfig())
+    return AdoptionRecord(variant, fp, model_fingerprint)
 
 
 def _kind(hint: object) -> type:
@@ -390,15 +427,19 @@ def record_from_dict(data: object, where: str = "record") -> AdoptionRecord:
     """Strictly validated record: unknown keys and wrong JSON types raise ``ValueError``."""
     if not isinstance(data, dict):
         raise ValueError(f"{where} must be a JSON object")
-    known = ("variant", "config_fingerprint", *_SECTIONS)
+    known = ("variant", "config_fingerprint", "model_fingerprint", *_SECTIONS)
     unknown = sorted(set(data) - set(known))
     if unknown:
         raise ValueError(f"{where}: unknown keys {unknown} (expected {list(known)})")
-    head = {}
+    head: dict[str, object] = {}
     for key in ("variant", "config_fingerprint"):
         if not isinstance(data.get(key), str):
             raise ValueError(f"{where}.{key} must be a string (got {data.get(key)!r})")
         head[key] = data[key]
+    # Optional (CONTRACT.md v2 A3): records written before it have no such key.
+    head["model_fingerprint"] = _typed(
+        data.get("model_fingerprint"), str, f"{where}.model_fingerprint"
+    )
     stages = {k: _section(cls, data.get(k), f"{where}.{k}") for k, cls in _SECTIONS.items()}
     return AdoptionRecord(**head, **stages)  # type: ignore[arg-type]
 
@@ -429,6 +470,7 @@ class _Ctx:
     cfg: StrategyConfig
     now: int
     base_dir: Path | None
+    model_fingerprint: str | None = None  # fingerprint of the ML model being promoted
 
 
 def _is_int(value: object) -> bool:
@@ -520,7 +562,45 @@ def _record_problems(ctx: _Ctx) -> list[Decision]:
             "digits shown), so the promoted variant is not the one that was tested."
         )
         out.append(Decision(False, ADOPT_FINGERPRINT, reason))
+    model_problem = _model_fingerprint_problem(rec, ctx.model_fingerprint)
+    if model_problem is not None:
+        out.append(Decision(False, ADOPT_FINGERPRINT, model_problem))
     return out
+
+
+def _model_fingerprint_problem(record: AdoptionRecord, supplied: str | None) -> str | None:
+    """CONTRACT.md v2 A3: the ML model promoted must be exactly the ML model tested."""
+    recorded = record.model_fingerprint
+    if recorded is None:
+        if is_ml_variant(record.variant):
+            return (
+                f"variant {record.variant!r} runs an ML filter ({ML_VARIANT_MARKER!r} in its id) "
+                "but the record has no model_fingerprint, so the tested ML model cannot be "
+                "identified."
+            )
+        if supplied is not None:
+            return (
+                f"a model fingerprint {supplied[:_FP_SHOWN]!r} was supplied but the record has "
+                "no model_fingerprint, so that ML model was never tested under this record."
+            )
+        return None
+    if not is_sha256_hex(recorded):
+        return (
+            f"model_fingerprint {recorded[:_SHA256_HEX_LEN]!r} is not a sha256 hex digest "
+            f"({_SHA256_HEX_LEN} hex characters); use null for a variant without an ML model."
+        )
+    if supplied is None:
+        return (
+            f"the record was tested with ML model {recorded[:_FP_SHOWN]} but no current model "
+            "fingerprint was supplied, so the model being promoted cannot be verified."
+        )
+    if supplied != recorded:
+        return (
+            f"model_fingerprint {recorded[:_FP_SHOWN]} was tested but the ML model being "
+            f"promoted has fingerprint {supplied[:_FP_SHOWN]!r} (first {_FP_SHOWN} characters "
+            "shown), so the promoted model is not the one that was tested."
+        )
+    return None
 
 
 def _backtest_problems(ctx: _Ctx) -> list[str]:
@@ -748,19 +828,24 @@ def check_promotion(
     cfg: StrategyConfig,
     now_utc_ms: int,
     base_dir: str | Path | None = None,
+    model_fingerprint: str | None = None,
 ) -> list[Decision]:
     """Every reason ``record`` may NOT be promoted to ``target_stage`` (empty = allowed).
 
     All stages before ``target_stage`` must be complete (see the module docstring); a stage
     with nothing recorded yields one "no recorded result" decision. The record's
-    ``config_fingerprint`` must equal ``config_fingerprint(cfg)`` for every target. With
-    ``base_dir`` the evidence files must exist and the testnet journal is cross-checked.
-    Each decision has ``allowed=False``, a rule id from :data:`ADOPTION_RULE_IDS` and a
-    one-sentence reason. Raises ``ValueError`` for an unknown ``target_stage``.
+    ``config_fingerprint`` must equal ``config_fingerprint(cfg)`` for every target, and
+    ``model_fingerprint`` (the ``MLFilter.fingerprint()`` of the ML model being promoted, or
+    ``None`` if there is none) must equal the record's ``model_fingerprint``; a ``"+ml"``
+    variant without a recorded model fingerprint is always blocked. With ``base_dir`` the
+    evidence files must exist and the testnet journal is cross-checked. Each decision has
+    ``allowed=False``, a rule id from :data:`ADOPTION_RULE_IDS` and a one-sentence reason.
+    Raises ``ValueError`` for an unknown ``target_stage``.
     """
     if target_stage not in STAGES:
         raise ValueError(f"unknown adoption stage {target_stage!r}; expected one of {STAGES}")
-    ctx = _Ctx(record, cfg, now_utc_ms, None if base_dir is None else Path(base_dir))
+    root = None if base_dir is None else Path(base_dir)
+    ctx = _Ctx(record, cfg, now_utc_ms, root, model_fingerprint)
     out = _record_problems(ctx)
     for stage in STAGES[: STAGES.index(target_stage)]:
         rule = STAGE_RULES[stage]
@@ -793,13 +878,15 @@ def require_stage(
     cfg: StrategyConfig,
     now_utc_ms: int,
     base_dir: str | Path | None = None,
+    model_fingerprint: str | None = None,
 ) -> None:
     """Raise :class:`AdoptionBlocked` unless :func:`check_promotion` allows ``stage``.
 
-    The live bot calls this with ``"LIVE"`` (and the record's directory as ``base_dir``)
-    before its first order and refuses to start if it raises.
+    The live bot calls this with ``"LIVE"`` (the record's directory as ``base_dir`` and, if it
+    runs an ML filter, that model's ``MLFilter.fingerprint()``) before its first order and
+    refuses to start if it raises.
     """
-    decisions = check_promotion(record, stage, cfg, now_utc_ms, base_dir)
+    decisions = check_promotion(record, stage, cfg, now_utc_ms, base_dir, model_fingerprint)
     if decisions:
         raise AdoptionBlocked(stage, decisions)
 
@@ -817,29 +904,53 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--stage", required=True, type=str.upper, choices=STAGES)
     check.add_argument("--now", default=None, help="ISO-8601 UTC or epoch ms (default: now)")
     check.add_argument("--config", type=Path, default=None, help=config_help)
+    check.add_argument(
+        "--model-fingerprint",
+        default=None,
+        help=(
+            "sha256 (MLFilter.fingerprint()) of the ML model that will run; required when the "
+            "record has a model_fingerprint, and it must match it exactly"
+        ),
+    )
     init = sub.add_parser("init", help="write an empty record for a variant")
     init.add_argument("--variant", required=True, help="strategy variant id, e.g. base")
     init.add_argument("--out", required=True, type=Path, help="record JSON to create")
     init.add_argument("--config", type=Path, default=None, help=config_help)
+    init.add_argument(
+        "--model-fingerprint",
+        default=None,
+        help="sha256 (MLFilter.fingerprint()) of the tested ML model; required for a +ml variant",
+    )
     init.add_argument("--force", action="store_true", help="overwrite an existing record")
     fingerprint = sub.add_parser("fingerprint", help="print a config's canonical JSON + sha256")
     fingerprint.add_argument("--config", type=Path, default=None, help=config_help)
     return parser
 
 
+def _model_arg(value: str | None) -> str | None:
+    """``--model-fingerprint`` with surrounding whitespace removed (blank = not given)."""
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
 def _cmd_check(args: argparse.Namespace, now: int) -> int:
     cfg = load_config(args.config)
     record = load_record(args.record)
-    decisions = check_promotion(record, args.stage, cfg, now, args.record.resolve().parent)
+    model_fp = _model_arg(args.model_fingerprint)
+    decisions = check_promotion(
+        record, args.stage, cfg, now, args.record.resolve().parent, model_fp
+    )
     fp = config_fingerprint(cfg)[:_FP_SHOWN]
+    what = f"config {fp}" if model_fp is None else f"config {fp}, model {model_fp[:_FP_SHOWN]}"
     if not decisions:
         print(
-            f"PASS: variant {record.variant!r} (config {fp}) may be promoted to "
+            f"PASS: variant {record.variant!r} ({what}) may be promoted to "
             f"{args.stage} at {ms_to_iso(now)}."
         )
         return 0
     print(
-        f"BLOCKED: variant {record.variant!r} (config {fp}) may not be promoted to "
+        f"BLOCKED: variant {record.variant!r} ({what}) may not be promoted to "
         f"{args.stage} at {ms_to_iso(now)}; {len(decisions)} blocking reason(s):"
     )
     for d in decisions:
@@ -854,11 +965,27 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if _blank(args.variant):
         print("error: --variant may not be empty", file=sys.stderr)
         return 1
-    record = empty_record(args.variant.strip(), load_config(args.config))
+    variant, model_fp = args.variant.strip(), _model_arg(args.model_fingerprint)
+    if model_fp is not None and not is_sha256_hex(model_fp):
+        print(
+            f"error: --model-fingerprint {model_fp!r} is not a sha256 hex digest "
+            f"({_SHA256_HEX_LEN} hex characters)",
+            file=sys.stderr,
+        )
+        return 1
+    if model_fp is None and is_ml_variant(variant):
+        print(
+            f"error: variant {variant!r} runs an ML filter ({ML_VARIANT_MARKER!r} in its id), so "
+            "--model-fingerprint is required",
+            file=sys.stderr,
+        )
+        return 1
+    record = empty_record(variant, load_config(args.config), model_fp)
     save_record(record, args.out)
+    model = "" if model_fp is None else f", model {model_fp}"
     print(
         f"Wrote an empty adoption record for variant {record.variant!r} (config "
-        f"{record.config_fingerprint}) to {args.out}; next stage: {BACKTEST}."
+        f"{record.config_fingerprint}{model}) to {args.out}; next stage: {BACKTEST}."
     )
     return 0
 

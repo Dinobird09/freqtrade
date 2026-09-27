@@ -33,6 +33,8 @@ from research.trendbot.review_sheet import (
     expected_sl_r,
     flag_code,
     main,
+    planned_net_rr,
+    planned_rr,
     review_row,
     write_review_pack,
 )
@@ -61,7 +63,8 @@ EXPECTED_HEADER = (
     "stop",
     "target",
     "stop_method",
-    "planned_rr",
+    "planned_rr_price",
+    "planned_rr_net",
     "risk_pct",
     "pair_cap_pct",
     "qty",
@@ -98,17 +101,30 @@ def _trade(
     exit_price=None,
     hold_candles=2,
     cfg=CFG,
+    legacy=False,
     **overrides,
 ):
-    """A self-consistent closed trade built exactly like the backtester's exit model."""
-    target = entry + rr * (entry - stop)
-    qty = 10_000.0 * risk_pct / 100.0 / (entry - stop)
+    """A self-consistent closed trade built exactly like the backtester's exit model.
+
+    Default: cost-aware sizing and target (CONTRACT.md v2 A1), written out by hand here, so a
+    clean SL is exactly -1R and a TP exactly +rr R. ``legacy=True`` sizes and targets by PRICE
+    distance only (the pre-A1 model): its risk leaves out fees and slippage.
+    """
+    f = cfg.fee_rate
+    stop_x = stop * (1 - cfg.slippage_pct / 100)
+    if legacy:
+        unit = entry - stop
+        target = entry + rr * (entry - stop)
+    else:
+        unit = (entry - stop_x) + f * entry + f * stop_x  # all-in loss per unit at the stop
+        target = (entry * (1 + f) + rr * unit) / (1 - f)  # a TP nets exactly rr * risk
+    qty = 10_000.0 * risk_pct / 100.0 / unit
+    risk_amount = qty * unit
     entry_ts = signal_ts + cfg.timeframe_ms
     if exit_price is None:
-        exit_price = target if exit_reason == EXIT_TP else stop * (1 - cfg.slippage_pct / 100)
-    fees = cfg.fee_rate * qty * entry + cfg.fee_rate * qty * exit_price
+        exit_price = target if exit_reason == EXIT_TP else stop_x
+    fees = f * qty * entry + f * qty * exit_price
     pnl = qty * (exit_price - entry) - fees
-    risk_amount = qty * (entry - stop)
     trade = Trade(
         trade_id=trade_id,
         pair=pair,
@@ -160,23 +176,41 @@ def _read_csv(path):
         _trade(pair="BNB/USDT", entry=300.0, stop=294.0, risk_pct=0.5, exit_reason=EXIT_SL),
         _trade(pair="BNB/USDT", entry=300.0, stop=294.0, risk_pct=0.5, rr=2.0),
         _trade(risk_pct=0.25, hold_candles=30),
+        _trade(exit_reason=EXIT_SL, stop=99.7),  # 0.3 % stop: cost-aware, still exactly -1R
     ],
 )
 def test_good_trades_have_no_flags(trade):
     assert auto_flags(trade, CFG) == []
 
 
+def test_cost_aware_trades_stop_at_exactly_minus_one_r_and_tp_at_plus_rr():
+    for stop in (99.7, 98.0, 90.0):
+        sl = _trade(exit_reason=EXIT_SL, stop=stop)
+        assert sl.r_multiple == pytest.approx(-1.0, abs=1e-12)
+        assert expected_sl_r(sl, CFG) == pytest.approx(-1.0, abs=1e-12)
+        tp = _trade(exit_reason=EXIT_TP, stop=stop)
+        assert tp.r_multiple == pytest.approx(CFG.reward_risk, abs=1e-12)
+        assert planned_net_rr(tp, CFG) == pytest.approx(CFG.reward_risk, abs=1e-12)
+        assert planned_rr(tp) > CFG.reward_risk  # price RR is above 2 once costs are netted
+
+
 def test_random_good_trades_have_no_flags():
     rng = random.Random(20240101)
     for i in range(500):
         entry = rng.uniform(10.0, 90_000.0)
-        stop = entry * (1 - rng.uniform(0.015, 0.10))  # >= 1.5%: an SL costs < 1.25R
+        stop = entry * (1 - rng.uniform(0.003, 0.10))  # the whole configured stop range
         pair = rng.choice(["BTC/USDT", "ETH/USDT", "BNB/USDT"])
         risk = rng.uniform(0.25, 0.5 if pair == "BNB/USDT" else 1.0)
         reason = rng.choice([EXIT_SL, EXIT_TP])
         rr = rng.choice([2.0, 2.5, 3.0])
-        cfg = CFG.with_changes(reward_risk=rr)
-        t = _trade(i, pair, T0 + i * TF, entry, stop, rr, risk, reason, None, rng.randint(1, 40))
+        cfg = CFG.with_changes(
+            reward_risk=rr,
+            fee_rate=rng.choice([0.0005, 0.001, 0.006]),
+            slippage_pct=rng.choice([0.01, 0.05, 0.2]),
+        )
+        t = _trade(
+            i, pair, T0 + i * TF, entry, stop, rr, risk, reason, None, rng.randint(1, 40), cfg
+        )
         assert auto_flags(t, cfg) == [], (t, auto_flags(t, cfg))
 
 
@@ -184,6 +218,9 @@ def test_random_good_trades_have_no_flags():
     ("code", "trade"),
     [
         (FLAG_RR_BELOW, _trade(rr=1.5)),
+        (FLAG_RR_BELOW, _trade(legacy=True)),  # price RR exactly 2, net of costs only 1.898
+        (FLAG_RR_BELOW, replace(_trade(), target=104.0)),  # price-distance 2:1 target
+        (FLAG_RR_BELOW, replace(_trade(), risk_amount=250.0)),  # net RR < 2 by the risk
         (FLAG_RR_ABOVE, _trade(rr=3.0)),
         (FLAG_RISK_CAP, _trade(risk_pct=1.2)),
         (FLAG_RISK_CAP, _trade(pair="BNB/USDT", entry=300.0, stop=294.0, risk_pct=0.75)),
@@ -193,8 +230,10 @@ def test_random_good_trades_have_no_flags():
         (FLAG_BAD_LEVELS, replace(_trade(), target=99.0)),
         (FLAG_SIZE, replace(_trade(), qty=_trade().qty * 2)),
         (FLAG_SIZE, replace(_trade(), risk_pct=0.0)),
+        (FLAG_SIZE, _trade(legacy=True)),  # risk_amount = qty*(entry-stop) leaves out costs
         (FLAG_LOSS_OUTLIER, _trade(exit_reason=EXIT_SL, exit_price=96.0)),
-        (FLAG_WIN_TOO_LARGE, _with_r(_trade(), 2.6)),
+        (FLAG_LOSS_OUTLIER, _with_r(_trade(exit_reason=EXIT_SL), -1.1)),
+        (FLAG_WIN_TOO_LARGE, _with_r(_trade(), 2.05)),
         (FLAG_ZERO_HOLD, _trade(hold_candles=0)),
         (FLAG_EXIT_BEFORE_ENTRY, _trade(hold_candles=-1)),
         (FLAG_LOOKAHEAD, replace(_trade(), entry_ts=T0)),
@@ -248,12 +287,15 @@ def test_negative_hold_is_not_also_reported_as_zero_hold():
 
 
 def test_r_thresholds_are_strict():
+    # A cost-aware clean stop is exactly -1R, so the band is tight: -1.05R / rr + 0.01R.
     sl = _trade(exit_reason=EXIT_SL, stop=97.0)
-    assert FLAG_LOSS_OUTLIER not in _codes(_with_r(sl, -1.25))
-    assert FLAG_LOSS_OUTLIER in _codes(_with_r(sl, -1.26))
+    assert FLAG_LOSS_OUTLIER not in _codes(sl)
+    assert FLAG_LOSS_OUTLIER not in _codes(_with_r(sl, -1.05))
+    assert FLAG_LOSS_OUTLIER in _codes(_with_r(sl, -1.06))
     tp = _trade()
-    assert FLAG_WIN_TOO_LARGE not in _codes(_with_r(tp, 2.25))
-    assert FLAG_WIN_TOO_LARGE in _codes(_with_r(tp, 2.26))
+    assert FLAG_WIN_TOO_LARGE not in _codes(tp)
+    assert FLAG_WIN_TOO_LARGE not in _codes(_with_r(tp, 2.01))
+    assert FLAG_WIN_TOO_LARGE in _codes(_with_r(tp, 2.02))
 
 
 def test_win_bound_follows_the_configured_reward_risk():
@@ -277,23 +319,56 @@ def test_cap_and_rr_tolerate_float_noise():
         assert auto_flags(_trade(entry=entry, stop=stop), CFG) == []
 
 
-def test_loss_outlier_detail_separates_cost_drag_from_gaps():
-    # Wide stop: a normal stop-out costs ~-1.07R, so -2R is a gap/slippage outlier.
+def _outlier_flag(trade):
+    [flag] = [f for f in auto_flags(trade, CFG) if flag_code(f) == FLAG_LOSS_OUTLIER]
+    return flag
+
+
+def test_loss_outlier_detail_separates_gaps_from_cost_blind_sizing():
+    # Cost-aware trade: a normal stop-out is exactly -1R, so a -1.93R loss is a gap.
     wide = _trade(exit_reason=EXIT_SL, stop=96.0, exit_price=92.0)
-    assert expected_sl_r(wide, CFG) == pytest.approx(-1.060988, abs=1e-6)
-    [flag] = [f for f in auto_flags(wide, CFG) if flag_code(f) == FLAG_LOSS_OUTLIER]
-    assert "normal stop-out would be -1.061R: gap-through" in flag
-    # Tight stop (0.5%): fees + slippage alone make a normal stop-out worse than -1.25R.
-    tight = _trade(exit_reason=EXIT_SL, stop=99.5)
-    assert expected_sl_r(tight, CFG) == pytest.approx(tight.r_multiple, rel=1e-12)
-    assert expected_sl_r(tight, CFG) < -1.25
-    [flag] = [f for f in auto_flags(tight, CFG) if flag_code(f) == FLAG_LOSS_OUTLIER]
-    assert "large versus the stop distance" in flag
+    assert expected_sl_r(wide, CFG) == pytest.approx(-1.0, abs=1e-12)
+    flag = _outlier_flag(wide)
+    assert "normal stop-out would be -1.000R: gap-through or slippage beyond" in flag
+    # A tight cost-aware stop (0.5 %) is still exactly -1R: no false outlier any more.
+    assert _codes(_trade(exit_reason=EXIT_SL, stop=99.5)) == []
+    # Price-only (legacy) sizing on a tight stop: EVERY stop-out costs ~-1.5R, which the
+    # flag attributes to the sizing (and size_mismatch / rr_below_min fire as well).
+    legacy = _trade(exit_reason=EXIT_SL, stop=99.5, legacy=True)
+    assert expected_sl_r(legacy, CFG) == pytest.approx(legacy.r_multiple, rel=1e-12)
+    assert expected_sl_r(legacy, CFG) < -1.05
+    flag = _outlier_flag(legacy)
+    assert "risk_amount leaves out fees and slippage" in flag
     assert "gap-through" not in flag
-    # Tight stop AND a gap well beyond the cost-model stop-out: reported as a gap.
-    gapped = _trade(exit_reason=EXIT_SL, stop=99.5, exit_price=99.0)
-    [flag] = [f for f in auto_flags(gapped, CFG) if flag_code(f) == FLAG_LOSS_OUTLIER]
-    assert "gap-through" in flag
+    assert {FLAG_SIZE, FLAG_RR_BELOW} <= set(_codes(legacy))
+    # Legacy sizing AND a gap well beyond its cost-model stop-out: reported as a gap.
+    gapped = _trade(exit_reason=EXIT_SL, stop=99.5, exit_price=99.0, legacy=True)
+    assert "gap-through" in _outlier_flag(gapped)
+
+
+def test_rr_is_checked_by_price_and_net_of_costs():
+    good = _trade()
+    assert planned_rr(good) == pytest.approx(2.3493003, abs=1e-6)
+    assert planned_net_rr(good, CFG) == pytest.approx(2.0, abs=1e-12)
+    # Price-distance 2:1 target: nets only 1.898R after both fees, so it is below 2:1.
+    legacy = _trade(legacy=True)
+    assert planned_rr(legacy) == pytest.approx(2.0, abs=1e-12)
+    assert planned_net_rr(legacy, CFG) == pytest.approx(1.898, abs=1e-9)
+    [flag] = [f for f in auto_flags(legacy, CFG) if flag_code(f) == FLAG_RR_BELOW]
+    assert "net RR 1.8980 < required 2.00" in flag and "price RR" not in flag
+    # A net RR fine by the recorded risk but a price RR below 2 is still below the minimum.
+    tiny_risk = replace(_trade(rr=1.5), risk_amount=_trade(rr=1.5).risk_amount / 2)
+    assert planned_net_rr(tiny_risk, CFG) == pytest.approx(3.0, abs=1e-9)
+    assert planned_rr(tiny_risk) < 2.0
+    [flag] = [f for f in auto_flags(tiny_risk, CFG) if flag_code(f) == FLAG_RR_BELOW]
+    assert "price RR" in flag and "net RR" not in flag
+    assert FLAG_RR_ABOVE not in _codes(tiny_risk)
+    assert FLAG_SIZE in _codes(tiny_risk)  # the understated risk is caught as well
+    # The net RR depends on the fee: reviewing with the wrong costs is visible.
+    coinbase = CFG.with_changes(fee_rate=0.006, slippage_pct=0.2)
+    cb = _trade(cfg=coinbase)
+    assert auto_flags(cb, coinbase) == []
+    assert {FLAG_RR_ABOVE, FLAG_SIZE} <= set(_codes(cb, CFG))
 
 
 def test_auto_flags_do_not_mutate_the_trade():
@@ -362,21 +437,27 @@ def test_rows_follow_entry_time_not_trade_id(tmp_path):
 
 
 def test_row_values_use_fixed_formatting():
+    # Hand arithmetic (fee 0.1 %/side, slippage 0.05 %, entry 100, stop 98, 1 % of 10,000):
+    #   S_x = 98 * 0.9995 = 97.951;  L_u = 2.049 + 0.1 + 0.097951 = 2.246951
+    #   qty = 100 / 2.246951 = 44.50475333;  target = (100.1 + 2 * 2.246951) / 0.999
+    #       = 104.593902 / 0.999 = 104.698601;  price RR = 4.698601 / 2 = 2.3493
+    #   fees = 0.001 * qty * (100 + target) = 9.1101;  net win = qty * 4.698601 - fees = 200
     t = _trade(entry=100.0, stop=98.0)
     row = review_row(replace(t, ml_prob=0.61234, notes="capped"), CFG, None)
     assert row["entry"] == "100.000000"
     assert row["stop"] == "98.000000"
-    assert row["target"] == "104.000000"
-    assert row["planned_rr"] == "2.0000"
+    assert row["target"] == "104.698601"
+    assert row["planned_rr_price"] == "2.3493"
+    assert row["planned_rr_net"] == "2.0000"
     assert row["risk_pct"] == "1.0000"
     assert row["pair_cap_pct"] == "1.0000"
-    assert row["qty"] == "50.00000000"
-    assert row["notional"] == "5000.0000"
+    assert row["qty"] == "44.50475333"
+    assert row["notional"] == "4450.4753"
     assert row["risk_amount"] == "100.0000"
     assert row["exit_reason"] == "TP"
-    assert row["fees"] == "10.2000"
-    assert row["pnl"] == "189.8000"
-    assert row["r_multiple"] == "1.8980"
+    assert row["fees"] == "9.1101"
+    assert row["pnl"] == "200.0000"
+    assert row["r_multiple"] == "2.0000"
     assert row["hold_h"] == "8.00"
     assert row["signal_time_utc"] == "2024-01-01T00:00:00Z"
     assert row["entry_time_utc"] == "2024-01-01T04:00:00Z"
@@ -391,6 +472,9 @@ def test_row_values_use_fixed_formatting():
     assert bnb["pair_cap_pct"] == "0.5000"
     unknown = review_row(_trade(pair="DOGE/USDT"), CFG, None)
     assert unknown["pair_cap_pct"] == ""
+    no_risk = review_row(replace(_trade(), risk_amount=0.0), CFG, None)
+    assert no_risk["planned_rr_net"] == ""  # undefined without a positive planned risk
+    assert no_risk["planned_rr_price"] == "2.3493"
 
 
 def test_open_trade_row_has_empty_exit_cells(tmp_path):
@@ -446,6 +530,8 @@ def test_md_has_every_trade_flags_and_signoff(tmp_path):
     md = paths["md"].read_text(encoding="utf-8")
     assert md.startswith("# Review\n")
     assert "must inspect EVERY row" in md
+    assert "- Costs: fee 0.1000% per side, slippage 0.0500% on market fills" in md
+    assert "| RR price | RR net |" in md
     for t in trades:
         assert re.search(rf"^\| {t.trade_id} \| (TRAIN|TEST) \| ", md, re.MULTILINE), t.trade_id
     # Trade 4 (END) and 5 (gapped SL) are flagged; 1-3 are clean.
@@ -550,6 +636,37 @@ def test_cli_builds_pack_from_journal(tmp_path, capsys):
     assert [r["window"] for r in rows] == ["TRAIN", "TRAIN", "TRAIN", "TEST", "TEST"]
     md = (out / MD_NAME).read_text(encoding="utf-8")
     assert md.startswith("# Trade review: trades.csv\n")
+
+
+def test_cli_uses_the_costs_the_trades_were_generated_with(tmp_path, capsys):
+    coinbase = CFG.with_changes(fee_rate=0.006, slippage_pct=0.2)
+    trades = [
+        _trade(1, cfg=coinbase),
+        _trade(2, signal_ts=T0 + 5 * TF, exit_reason=EXIT_SL, stop=97.0, cfg=coinbase),
+    ]
+    journal = tmp_path / "trades.csv"
+    write_journal(trades, journal)
+    # Reviewed with the default (Binance) costs every trade is flagged ...
+    assert main(["--journal", str(journal), "--out-dir", str(tmp_path / "a")]) == 0
+    assert "2 trades (2 flagged)" in capsys.readouterr().out
+    # ... and with the costs they were generated with, none is.
+    args = ["--journal", str(journal), "--out-dir", str(tmp_path / "b")]
+    assert main([*args, "--fee-rate", "0.006", "--slippage-pct", "0.2"]) == 0
+    assert "2 trades (0 flagged)" in capsys.readouterr().out
+    md = (tmp_path / "b" / MD_NAME).read_text(encoding="utf-8")
+    assert "- Costs: fee 0.6000% per side, slippage 0.2000%" in md
+
+
+@pytest.mark.parametrize(
+    "flag", [["--fee-rate", "0"], ["--slippage-pct", "0"], ["--fee-rate", "0.0001"]]
+)
+def test_cli_rejects_zero_or_unrealistic_costs(tmp_path, flag):
+    journal = tmp_path / "trades.csv"
+    write_journal(_sample_trades(), journal)
+    with pytest.raises(SystemExit) as exc:
+        main(["--journal", str(journal), "--out-dir", str(tmp_path / "o"), *flag])
+    assert exc.value.code == 2
+    assert not (tmp_path / "o").exists()
 
 
 def test_cli_rejects_a_loosened_reward_risk(tmp_path):

@@ -281,3 +281,132 @@ def test_from_journal_reproduces_live_state(tmp_path):
         assert decisions(known, ts) == expected
     for pair in PAIRS:
         assert replay.streak(pair) == live.streak(pair)
+
+
+# ---------------------------------------------------------------------------- v2 A2 exit timing
+TF = StrategyConfig().timeframe_ms  # 4h: a backtest exit_ts is the OPEN of the exit candle
+
+
+def three_sl_candles(pair: str = "BTC/USDT") -> tuple[list[Trade], int]:
+    """Three stop-losses recorded backtest-style (exit_ts = exit candle open) + the last open."""
+    opens = [T0, T0 + TF, T0 + 2 * TF]
+    return [closed(i, pair, ts) for i, ts in enumerate(opens, 1)], opens[-1]
+
+
+def test_backtest_convention_bench_lasts_24h_of_real_time_from_the_candle_close():
+    trades, last_open = three_sl_candles()
+    candle_close = last_open + TF  # the stop-loss is certain only here
+    cb = CircuitBreakers(StrategyConfig(), exit_time_uncertainty_ms=TF)
+    assert cb.exit_time_uncertainty_ms == TF
+    messages = feed(cb, trades)
+    assert len(messages) == 1 and ms_to_iso(candle_close + BENCH_MS) in messages[0]
+    bench = cb.active_bench("BTC/USDT", candle_close)
+    assert bench is not None
+    assert (bench.start_ts, bench.until_ts) == (candle_close, candle_close + BENCH_MS)
+    # the decision at the exit candle's OPEN cannot know the stop-loss yet (no look-ahead)
+    assert cb.can_enter("BTC/USDT", last_open, EQUITY).allowed
+    denied = cb.can_enter("BTC/USDT", candle_close, EQUITY)
+    assert not denied.allowed and one_sentence(denied.reason)
+    assert f"the stop-loss recorded at {ms_to_iso(last_open)} can have filled" in denied.reason
+    assert not cb.can_enter("BTC/USDT", candle_close + BENCH_MS - 1, EQUITY).allowed
+    assert cb.can_enter("BTC/USDT", candle_close + BENCH_MS, EQUITY).allowed
+    # wherever inside the exit candle the stop really filled, >= 24h of real time is benched
+    for fill in (last_open, last_open + HOUR_MS, candle_close - 1):
+        assert bench.until_ts - fill >= BENCH_MS
+        assert all(bench.covers(ts) for ts in range(candle_close, fill + BENCH_MS, HOUR_MS))
+    # on the 4h decision grid: six denied closes (t+4h .. t+24h), allowed again at t+28h
+    grid = [candle_close + k * TF for k in range(8)]
+    allowed = [cb.can_enter("BTC/USDT", ts, EQUITY).allowed for ts in grid]
+    assert allowed == [False] * 6 + [True] * 2
+
+
+def test_live_default_on_a_backtest_journal_would_bench_only_20h_from_the_candle_close():
+    # Why A2 exists: without the offset, a backtest bench starts at the exit candle OPEN.
+    trades, last_open = three_sl_candles()
+    cb = CircuitBreakers(StrategyConfig())
+    feed(cb, trades)
+    bench = cb.active_bench("BTC/USDT", last_open)
+    assert bench is not None and bench.until_ts - (last_open + TF) == BENCH_MS - TF
+    assert not cb.can_enter("BTC/USDT", last_open, EQUITY).allowed  # look-ahead into the candle
+
+
+def test_backtest_convention_loss_window_counts_from_the_candle_close():
+    cb = CircuitBreakers(StrategyConfig(), TF)
+    feed(cb, [closed(1, "BTC/USDT", T0, EXIT_END, pnl=-500.0)])
+    certain = T0 + TF
+    assert cb.window_pnl(T0) == (0.0, ())
+    assert cb.can_enter("ETH/USDT", T0, EQUITY).allowed
+    assert cb.can_enter("ETH/USDT", certain - 1, EQUITY).allowed
+    halted = cb.can_enter("ETH/USDT", certain, EQUITY)
+    assert not halted.allowed and one_sentence(halted.reason)
+    assert "recorded time + 4h" in halted.reason and "#1" in halted.reason
+    assert cb.window_pnl(certain) == (-500.0, (1,))
+    assert not cb.can_enter("BNB/USDT", certain + WINDOW_MS - 1, EQUITY).allowed
+    assert cb.can_enter("BNB/USDT", certain + WINDOW_MS, EQUITY).allowed
+    assert cb.halt_lifts_at(certain, EQUITY) == certain + WINDOW_MS
+
+
+def test_default_uncertainty_is_zero_and_unchanged_for_live_journals():
+    for fn in (CircuitBreakers, CircuitBreakers.from_journal):
+        param = inspect.signature(fn).parameters["exit_time_uncertainty_ms"]
+        assert param.default == 0
+    trades = scenario()
+    cfg = StrategyConfig()
+    default, explicit = CircuitBreakers.from_journal(trades, cfg), CircuitBreakers(cfg, 0)
+    feed(explicit, sorted(trades, key=lambda t: (t.exit_ts, t.trade_id)))
+    assert default.exit_time_uncertainty_ms == 0
+    for ts in probe_times(trades):
+        assert decisions(default, ts) == decisions(explicit, ts)  # identical reasons too
+        assert all("can have filled" not in d.reason for d in decisions(default, ts))
+        assert all("recorded time +" not in d.reason for d in decisions(default, ts))
+
+
+def test_uncertainty_shifts_every_decision_by_exactly_the_offset():
+    trades = scenario()
+    cfg = StrategyConfig()
+    live = CircuitBreakers.from_journal(trades, cfg)
+    backtest = CircuitBreakers.from_journal(trades, cfg, exit_time_uncertainty_ms=TF)
+    probes = probe_times(trades)
+    blocked = 0
+    for ts in probes:
+        expected = [d.allowed for d in decisions(live, ts)]
+        assert [d.allowed for d in decisions(backtest, ts + TF)] == expected
+        assert backtest.window_pnl(ts + TF) == live.window_pnl(ts)
+        blocked += expected.count(False)
+    assert blocked > 0  # the scenario really exercises both breakers
+    for pair in PAIRS:
+        assert backtest.streak(pair) == live.streak(pair)
+
+
+def test_from_journal_with_uncertainty_reproduces_the_incremental_state(tmp_path):
+    trades = scenario()
+    cfg = StrategyConfig()
+    incremental = CircuitBreakers(cfg, TF)
+    log: list[tuple[int, list]] = []
+    i = 0
+    for ts in probe_times(trades):  # a trade is fed once it is CERTAIN (t_e <= ts)
+        while i < len(trades) and trades[i].exit_ts + TF <= ts:
+            incremental.on_trade_closed(trades[i])
+            i += 1
+        log.append((ts, decisions(incremental, ts)))
+    path = tmp_path / "backtest_trades.csv"
+    write_journal(trades, path)
+    replay = CircuitBreakers.from_journal(read_journal(path), cfg, TF)
+    for ts, expected in log:
+        assert decisions(replay, ts) == expected
+
+
+@pytest.mark.parametrize("bad", [-1, True, 1.5, "4h", None])
+def test_invalid_uncertainty_is_rejected(bad):
+    with pytest.raises(ValueError, match="exit_time_uncertainty_ms"):
+        CircuitBreakers(StrategyConfig(), bad)
+    with pytest.raises(ValueError, match="exit_time_uncertainty_ms"):
+        CircuitBreakers.from_journal([], StrategyConfig(), bad)
+
+
+def test_effective_exit_ts_helper():
+    t = closed(1, "BTC/USDT", T0)
+    assert circuit_breakers.effective_exit_ts(t) == T0
+    assert circuit_breakers.effective_exit_ts(t, TF) == T0 + TF
+    t.exit_ts = None
+    assert circuit_breakers.effective_exit_ts(t, TF) is None

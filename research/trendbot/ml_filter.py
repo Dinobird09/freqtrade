@@ -12,10 +12,17 @@ Newton/IRLS in pure Python. There is NO hyper-parameter search and NO threshold 
   ``p* = -avg_loss_r / (avg_win_r - avg_loss_r)``, i.e. where expectancy crosses zero.
 
 The layer can only REMOVE trades that already passed every mandatory rule.
+
+A fitted filter has an identity, :meth:`MLFilter.fingerprint` (CONTRACT.md v2 A3): the
+sha256 of a canonical JSON of its features, TRAIN means/stds, intercept, coefficients,
+threshold and l2 (floats as ``repr`` strings). The ML variant's adoption record pins it, so
+refitting the model, which changes the fingerprint, restarts the adoption path.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import statistics
 from collections.abc import Callable, Mapping, Sequence
@@ -283,6 +290,11 @@ def _check_sample(n: int, wins: int, skipped: int, min_samples: int, min_per_cla
         )
 
 
+def _float_text(value: float) -> str:
+    """``repr`` of the value as a Python float (exact, shortest round-trip form)."""
+    return repr(float(value))
+
+
 def _standardiser(rows: list[list[float]]) -> tuple[tuple[float, ...], tuple[float, ...]]:
     cols = list(zip(*rows, strict=True))
     means = tuple(statistics.fmean(c) for c in cols)
@@ -401,12 +413,41 @@ class MLFilter:
         _, weights = self.model.coefficients()
         return list(zip(FEATURES, weights, strict=True))
 
+    def canonical_json(self) -> str:
+        """The exact text :meth:`fingerprint` hashes (CONTRACT.md v2 A3).
+
+        Keys ``features, means, stds, intercept, coefficients, threshold, l2`` (sorted,
+        compact separators). Every float is written as its ``repr`` STRING, the shortest text
+        that round-trips to the same IEEE-754 double, so the digest pins the model bit for bit
+        and does not depend on how a JSON library formats numbers.
+        """
+        intercept, weights = self.model.coefficients()
+        data = {
+            "features": list(FEATURES),
+            "means": [_float_text(v) for v in self.means],
+            "stds": [_float_text(v) for v in self.stds],
+            "intercept": _float_text(intercept),
+            "coefficients": [_float_text(w) for w in weights],
+            "threshold": _float_text(self.threshold),
+            "l2": _float_text(self.l2),
+        }
+        return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+    def fingerprint(self) -> str:
+        """sha256 hex digest of :meth:`canonical_json`: the identity of this fitted model.
+
+        Refitting (new TRAIN data, a different ``l2``, anything that moves one coefficient
+        by one ulp) gives a different fingerprint, so an adoption record carrying it
+        (``adoption.AdoptionRecord.model_fingerprint``) only ever vouches for this exact model.
+        """
+        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
     def describe(self) -> str:
         """One-sentence description of the fitted filter for reports."""
         return (
             f"Logistic filter (l2={self.l2:g}) fitted on {self.train_n} TRAIN candidates "
-            f"(base win rate {self.train_base_rate:.1%}) keeps signals whose predicted win "
-            f"probability exceeds the break-even {self.threshold:.3f}."
+            f"(TRAIN base win rate {self.train_base_rate:.1%}, context only) keeps signals whose "
+            f"predicted win probability exceeds the break-even {self.threshold:.3f}."
         )
 
 

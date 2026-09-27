@@ -10,6 +10,11 @@ Time model (candle ``T`` = the candle that OPENS at ``T``)::
            fed to the R9 breakers (``on_trade_closed(trade, equity=equity_after)``).
            A position whose pair has no later candle before ``end_ts`` is force-closed
            (EXIT_END) at the close of that last candle. Exits are NEVER gated.
+           ``Trade.exit_ts`` is T, the OPEN of the exit candle; the fill happens somewhere in
+           ``[T, T + tf)``. The breakers and the expectancy guard therefore run with
+           ``exit_time_uncertainty_ms = cfg.timeframe_ms`` (CONTRACT.md v2 A2): an exit counts
+           from ``T + tf`` on, and a bench lasts ``[T + tf, T + tf + bench_hours)``, i.e. at
+           least ``bench_hours`` of real time wherever inside the candle the stop filled.
         2. ENTRY decisions on signal candle T for every pair, sorted: decided at T + tf
            (the signal close) from data up to T only, filled at the next candle's open
            * (1 + slippage). A position opened here is visible to the pairs after it.
@@ -19,15 +24,20 @@ Execution model (shared with :func:`enumerate_candidates` through :func:`simulat
       entry: ``X_capital``, "no fill candle"). A fill candle that opens at or below the stop
       is skipped (``R8_structure_stop``, "gapped through stop"); the stop-distance bounds
       are re-checked against the actual fill.
-    - ``target = entry + reward_risk * (entry - stop)``.
+    - Cost-aware risk and target (CONTRACT.md v2 A1, computed by ``Gatekeeper.plan_fill``),
+      with fill ``E``, stop ``S``, ``f = fee_rate``, ``s = slippage_pct / 100``:
+      ``L_u = (E - S*(1-s)) + f*E + f*S*(1-s)`` (all-in loss per unit at the stop),
+      ``qty = equity * risk_pct / 100 / L_u``, ``risk_amount = qty * L_u`` and
+      ``target = (E*(1+f) + reward_risk*L_u) / (1-f)``.
     - Per candle ``j >= fill candle``: open <= stop -> SL at open * (1 - slip) (gap-through);
       low <= stop -> SL at stop * (1 - slip) (also when the same candle reaches the target:
       the stop is conservatively assumed to fill first); high >= target -> TP at target
       (resting limit order, no slippage).
     - Forced close (EXIT_END) is a market sell: close * (1 - slip).
     - Fees: ``fee_rate`` of the notional on BOTH legs. ``pnl`` is net of fees and slippage;
-      ``r_multiple = pnl / risk_amount`` with ``risk_amount = qty * (entry - stop)`` the
-      PLANNED risk.
+      ``r_multiple = pnl / risk_amount`` with ``risk_amount`` the PLANNED all-in loss. So a
+      clean stop fill is exactly -1R, a take-profit exactly +reward_risk R, a forced close
+      lies strictly between, and only a gap through the stop can lose more than 1R.
     - Size: ``sizing.size_for_pair`` on current REALIZED equity (starting capital plus
       closed pnl); the notional never exceeds the free cash (equity minus the cost of the
       other open positions), shrinking the quantity (so risk only ever decreases).
@@ -178,7 +188,8 @@ class _Simulation:
         variant: str,
     ) -> None:
         self.cfg = cfg
-        self.gk = Gatekeeper(cfg, events)
+        # A2: exit_ts is the exit candle OPEN, so every exit counts from the candle close.
+        self.gk = Gatekeeper(cfg, events, exit_time_uncertainty_ms=cfg.timeframe_ms)
         self.entry_filter = entry_filter
         self.variant = variant
         self.slip = cfg.slippage_pct / 100.0

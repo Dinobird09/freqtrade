@@ -246,3 +246,104 @@ def test_cli_errors(tmp_path: Path, capsys):
         main(["--journal", str(path), "--equity", "0"])
     with pytest.raises(SystemExit):
         main(["--journal", str(path), "--equity", "1", "--now", "yesterday"])
+
+
+# ---------------------------------------------------------------------------- v2 A2 exit timing
+TF = StrategyConfig().timeframe_ms  # backtest journals: exit_ts is the exit candle OPEN
+
+
+def test_audit_backtest_journal_benches_24h_from_the_candle_close():
+    trades = three_sl_btc()  # third stop-loss recorded at candle open T0 + 12h
+    last_open = T0 + 12 * HOUR_MS
+    close = last_open + TF
+    cfg = StrategyConfig()
+    # at the exit candle's open (and until it closes) the third stop-loss is not certain yet
+    assert audit(trades, cfg, last_open, EQUITY, exit_time_uncertainty_ms=TF) == []
+    assert audit(trades, cfg, close - 1, EQUITY, TF) == []
+    (a,) = audit(trades, cfg, close, EQUITY, TF)
+    until = ms_to_iso(close + 24 * HOUR_MS)
+    assert (a.rule, a.scope, a.action) == (
+        "R9_circuit_breaker",
+        "BTC/USDT",
+        f"no entries until {until}",
+    )
+    assert a.evidence_trade_ids == (1, 2, 3)
+    assert_one_sentence(a.explanation)
+    assert f"from {ms_to_iso(close)}" in a.explanation
+    assert f"recorded at {ms_to_iso(last_open)} can have filled" in a.explanation
+    assert len(audit(trades, cfg, close + 24 * HOUR_MS - 1, EQUITY, TF)) == 1
+    assert audit(trades, cfg, close + 24 * HOUR_MS, EQUITY, TF) == []
+    # the live default (real fill times) is unchanged: bench from the recorded exit_ts
+    (live,) = audit(trades, cfg, last_open, EQUITY)
+    assert live.action == f"no entries until {ms_to_iso(last_open + 24 * HOUR_MS)}"
+    assert "can have filled" not in live.explanation
+
+
+def test_audit_backtest_journal_halt_counts_losses_once_certain():
+    trades = [
+        trade(1, "BTC/USDT", T0, EXIT_END, pnl=-180.0),
+        trade(2, "ETH/USDT", T0 + DAY_MS, EXIT_END, pnl=-90.0),
+        trade(3, "BNB/USDT", T0 + 2 * DAY_MS, EXIT_SL, pnl=-60.0),
+    ]
+    at_open = T0 + 2 * DAY_MS
+    assert len(audit(trades, StrategyConfig(), at_open, EQUITY)) == 1  # live convention
+    assert audit(trades, StrategyConfig(), at_open, EQUITY, TF) == []  # #3 not certain yet
+    (a,) = audit(trades, StrategyConfig(), at_open + TF, EQUITY, TF)
+    assert (a.scope, a.evidence_trade_ids) == ("ALL", (1, 2, 3))
+    assert_one_sentence(a.explanation)
+    assert "exit_ts + 4h" in a.explanation
+    assert f"lifts at {ms_to_iso(T0 + TF + 7 * DAY_MS)}" in a.explanation
+
+
+def test_guard_backtest_journal_uses_only_certain_exits():
+    losers = spaced_history("ETH/USDT", [-0.5] * 20)
+    last_exit = losers[-1].exit_ts
+    assert len(audit(losers, GUARD_ON, last_exit, EQUITY)) == 1
+    assert audit(losers, GUARD_ON, last_exit, EQUITY, TF) == []  # only 19 certain by then
+    (a,) = audit(losers, GUARD_ON, last_exit + TF, EQUITY, TF)
+    assert a.rule == "L_expectancy_guard" and a.evidence_trade_ids == tuple(range(1, 21))
+    # risk_multiplier: the same t_e <= decision_ts rule when a decision time is given
+    assert risk_multiplier(losers, "ETH/USDT", GUARD_ON, TF, decision_ts=last_exit) == 1.0
+    assert risk_multiplier(losers, "ETH/USDT", GUARD_ON, TF, decision_ts=last_exit + TF) == 0.5
+    assert risk_multiplier(losers, "ETH/USDT", GUARD_ON, 0, decision_ts=last_exit) == 0.5
+    assert risk_multiplier(losers, "ETH/USDT", GUARD_ON, 0, decision_ts=last_exit - 1) == 1.0
+    # without a decision time the caller pre-filters, exactly as before (default unchanged)
+    assert risk_multiplier(losers, "ETH/USDT", GUARD_ON) == 0.5
+    assert risk_multiplier(losers, "ETH/USDT", GUARD_ON, TF) == 0.5
+
+
+@pytest.mark.parametrize("bad", [-1, True, 2.5])
+def test_invalid_uncertainty_is_rejected(bad):
+    with pytest.raises(ValueError, match="exit_time_uncertainty_ms"):
+        audit([], StrategyConfig(), T0, EQUITY, bad)
+    with pytest.raises(ValueError, match="exit_time_uncertainty_ms"):
+        risk_multiplier([], "BTC/USDT", GUARD_ON, bad)
+
+
+def test_cli_backtest_journal_flag(tmp_path: Path, capsys):
+    path = tmp_path / "trades.csv"
+    write_journal(three_sl_btc(), path)
+    last_open = T0 + 12 * HOUR_MS
+    argv = ["--journal", str(path), "--equity", "10000", "--now", ms_to_iso(last_open)]
+    assert main(argv) == 0  # live journal: the recorded exit time is the fill time
+    out = capsys.readouterr().out
+    assert "| R9_circuit_breaker | BTC/USDT | no entries until" in out
+    assert "live journal" in out
+    assert main([*argv, "--backtest-journal"]) == 0  # exit candle still open: not certain
+    out = capsys.readouterr().out
+    assert "No active adaptations." in out and "backtest journal" in out and "+ 4h" in out
+    argv[-1] = ms_to_iso(last_open + TF)
+    assert main([*argv, "--backtest-journal"]) == 0
+    out = capsys.readouterr().out
+    until = ms_to_iso(last_open + TF + 24 * HOUR_MS)
+    assert f"| R9_circuit_breaker | BTC/USDT | no entries until {until} |" in out
+
+
+def test_cli_help_explains_the_backtest_convention(capsys):
+    with pytest.raises(SystemExit) as info:
+        main(["--help"])
+    assert info.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "--backtest-journal" in text
+    assert "exit_ts is the OPEN of the exit candle" in text
+    assert "candle CLOSE" in text and "(4h)" in text and "live journal" in text

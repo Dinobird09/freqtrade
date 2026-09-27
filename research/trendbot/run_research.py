@@ -4,13 +4,21 @@ Usage (from the repo root)::
 
     # real candles (downloaded on a networked machine with fetch_data + ccxt)
     python -m research.trendbot.run_research --data-dir research/data \
-        [--events events.csv] [--pairs BTC/USDT ETH/USDT BNB/USDT] --out-dir research/results/real
+        [--events events.csv] [--pairs BTC/USDT ETH/USDT BNB/USDT] --out-dir research/results/real \
+        [--fee-rate 0.001] [--slippage-pct 0.05] [--exchange-id binance]
     # synthetic world with KNOWN ground truth (verification of the methodology only)
     python -m research.trendbot.run_research --synthetic planted --seed 1 [--years 6] \
         --out-dir research/results/synthetic_planted_s1
     # calibration: label frequencies over seeds 1..N of a synthetic world
     python -m research.trendbot.run_research --synthetic null --calibrate-seeds 20 \
         --out-dir research/results/calibration_null [--workers 4]
+
+Costs (CONTRACT.md v2 A1/A4): ``--fee-rate`` (fraction of notional per side, default 0.001 =
+Binance spot taker), ``--slippage-pct`` (percent on market fills, default 0.05) and
+``--exchange-id`` (default ``binance``; ``EXCHANGE:<id>`` news events apply to every pair) are
+validated by ``StrategyConfig`` (which refuses unrealistically low costs) and printed in the
+report. Coinbase Advanced Trade taker fees at low volume tiers are several times Binance's:
+pass the real tier.
 
 What one run does (every step on the same chronological 70/30 split):
 
@@ -19,18 +27,23 @@ What one run does (every step on the same chronological 70/30 split):
    regime-OFF variant, one variant selected on TRAIN t-stat before any TEST backtest ran;
 3. ML layer (``ml_filter``): a logistic filter on the baseline rules, fitted on purged TRAIN
    candidates only and applied unchanged to TEST (``UNTESTED`` if it cannot be fitted);
-4. ``invariants.check_invariants`` on every backtest; ``journal_rules.audit`` at the end of
-   TEST; a journal per variant and window; review packs for the baseline and the selected
-   variant; an adoption record per adoptable candidate (stage reached: WALK_FORWARD).
+4. ``invariants.check_invariants`` on every backtest; ``journal_rules.audit`` of the TRAIN
+   journal at the split and of the TEST journal at the end of TEST (backtest convention:
+   ``exit_time_uncertainty_ms = cfg.timeframe_ms``); TRAIN and TEST journals plus a human
+   review pack for each of the three pre-registered candidates; an adoption record per
+   adoptable candidate (stage reached: WALK_FORWARD), the ML one carrying the fitted model's
+   ``MLFilter.fingerprint()``, each with the config overrides JSON its check needs.
 
 The verdict only considers the three PRE-REGISTERED candidates (baseline, TRAIN-selected
 variant, ML layer). Picking any other grid variant because of its TEST numbers would be
 selection on TEST, so their TEST labels are context only.
 
 ``REPORT.md`` sections, in order: (1) no win rate is promised or targeted, (2) data
-provenance, (3) baseline TRAIN | TEST, (4) discovery TRAIN | TEST, (5) ML filter, (6) verdict,
-(7) decision counts per rule, (8) invariant audit, (9) journal rules at the end of TEST,
-(10) journals and review packs, (11) adoption path, (12) risk disclaimer.
+provenance and costs, (3) baseline TRAIN | TEST, (4) discovery TRAIN | TEST, (5) ML filter,
+(6) verdict, (7) decision counts per rule, (8) invariant audit, (9) journal rules at the end of
+TRAIN and of TEST, (10) journals and review packs, (11) adoption path, (12) risk disclaimer.
+Every table header names its TRAIN and TEST columns (or a TRAIN/TEST window column), and win
+rate only ever appears labelled "context only".
 
 Exit code 0, or 1 if any backtest violated an invariant (the report must be clean), 2 on a
 usage or data error.
@@ -40,35 +53,41 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
+import re
+import statistics
 import sys
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 from .adoption import (
+    BACKTEST,
     HUMAN_REVIEW,
     STAGES,
     WALK_FORWARD,
     BacktestStage,
     WalkForwardStage,
     check_promotion,
+    config_fingerprint,
     empty_record,
+    load_config,
     save_record,
 )
 from .backtester import BacktestResult
-from .config import RULE_IDS, StrategyConfig
-from .data import gap_report, load_dataset, timeframe_to_ms
+from .config import RULE_IDS, ConfigError, StrategyConfig
+from .data import gap_report, load_dataset
 from .invariants import check_invariants
 from .journal import iso_to_ms, ms_to_iso, write_journal
-from .journal_rules import audit, render_markdown
+from .journal_rules import Adaptation, audit
 from .metrics import LABELS, Summary
-from .ml_filter import FEATURES, make_factory
-from .models import Candle, NewsEvent, Trade
+from .ml_filter import FEATURES, MLFilter, make_factory
+from .models import HOUR_MS, Candle, NewsEvent, Trade
 from .news import load_events
 from .review_sheet import write_review_pack
 from .strategy_discovery import DiscoveryResult, discover
@@ -102,7 +121,7 @@ SECTION_TITLES = (
     "6. Verdict",
     "7. Why signals were rejected (decision counts per rule)",
     "8. Invariant audit of every backtest",
-    "9. Journal rules at the end of TEST",
+    "9. Journal rules at the end of TRAIN and at the end of TEST",
     "10. Journals and human review packs",
     "11. Adoption path and current stage",
     "12. Risk disclaimer",
@@ -145,7 +164,8 @@ WIN_RATE_STATEMENT = (
     "evidence of curve-fitting or look-ahead, not of skill. The target metric is POSITIVE "
     "EXPECTANCY (average R per trade, net of fees and slippage) that survives a 70/30 "
     "chronological walk-forward with controlled drawdown, with every trade planned at "
-    "reward:risk >= 2:1. Win rate appears below only as context."
+    "reward:risk >= 2:1. Win rate appears below only as context and is labelled 'context "
+    "only' wherever it is shown."
 )
 
 DISCLAIMER = (
@@ -153,6 +173,22 @@ DISCLAIMER = (
     "trade. Backtests and synthetic worlds are simplified models; past or simulated results "
     "do not predict future results. Crypto trading can result in the total loss of the "
     "capital used."
+)
+
+# ---------------------------------------------------------------------------- costs
+DEFAULT_CFG = StrategyConfig()
+# CLI sanity ceilings on top of StrategyConfig's floors: a larger value is almost surely a
+# percent typed where a fraction was expected (--fee-rate 0.6 meaning 0.6%).
+MAX_FEE_RATE = 0.02
+MAX_SLIPPAGE_PCT = 5.0
+_EXCHANGE_ID_RE = re.compile(r"[a-z][a-z0-9_]*")
+COST_FLAGS = ("fee_rate", "slippage_pct", "exchange_id")  # the StrategyConfig fields they set
+
+COINBASE_FEE_NOTE = (
+    "Coinbase Advanced Trade taker fees at low volume tiers are several times Binance's, so "
+    "a Coinbase run must pass the account's real tier with `--fee-rate` (a fraction of "
+    "notional per side: 0.006 = 0.6%) and `--exchange-id coinbase`; the default costs would "
+    "understate them."
 )
 
 
@@ -209,6 +245,23 @@ def _gap_text(candles: Sequence[Candle], tf_ms: int) -> str:
     return f"{len(gaps)}: {shown}{more}"
 
 
+def candle_table(data: Mapping[str, Sequence[Candle]], split: int, tf_ms: int) -> list[str]:
+    """Per-pair candle counts on each side of the split, date range and gaps."""
+    lines = [
+        "| pair | candles | TRAIN candles (before the split) | TEST candles (from the split) "
+        "| first candle (UTC) | last candle (UTC) | gaps |",
+        "|---|---:|---:|---:|---|---|---|",
+    ]
+    for pair, candles in data.items():
+        n_train = sum(1 for c in candles if c.ts < split)
+        lines.append(
+            f"| {pair} | {len(candles)} | {n_train} | {len(candles) - n_train} | "
+            f"{ms_to_iso(candles[0].ts)} | {ms_to_iso(candles[-1].ts)} | "
+            f"{_gap_text(candles, tf_ms)} |"
+        )
+    return lines
+
+
 def load_files(
     data_dir: str | Path,
     pairs: Sequence[str] = PAIRS,
@@ -217,21 +270,12 @@ def load_files(
 ) -> Dataset:
     """Real candle files (``data.load_dataset``) plus the optional news calendar CSV."""
     data = load_dataset(data_dir, pairs, timeframe)
-    tf_ms = timeframe_to_ms(timeframe)
     events = load_events(events_path) if events_path else []
     lines = [
         f"- Source: candle CSV files in `{data_dir}` ({timeframe}), loaded with "
-        "`data.load_dataset` (strict validation: sorted, no duplicates, sane OHLC).",
-        "",
-        "| pair | candles | first candle (UTC) | last candle (UTC) | gaps |",
-        "|---|---:|---|---|---|",
+        "`data.load_dataset` (strict validation: sorted, no duplicates, sane OHLC). "
+        "Per-pair coverage and gaps are in the table below.",
     ]
-    for pair, candles in data.items():
-        lines.append(
-            f"| {pair} | {len(candles)} | {ms_to_iso(candles[0].ts)} | "
-            f"{ms_to_iso(candles[-1].ts)} | {_gap_text(candles, tf_ms)} |"
-        )
-    lines.append("")
     if events:
         lines.append(
             f"- News calendar loaded: yes, `{events_path}` ({len(events)} events: "
@@ -393,16 +437,66 @@ def section_win_rate() -> list[str]:
     return [*_section(1), WIN_RATE_STATEMENT]
 
 
+def _fee_cost_r(trades: Sequence[Trade]) -> tuple[float, float] | None:
+    """(mean fees per trade in R, median stop distance in % of entry) of closed trades."""
+    closed = [t for t in trades if t.is_closed and t.risk_amount > 0 and t.entry_price > 0]
+    if not closed:
+        return None
+    fees_r = statistics.fmean(t.fees / t.risk_amount for t in closed)
+    stop_pct = statistics.median((t.entry_price - t.stop) / t.entry_price * 100 for t in closed)
+    return fees_r, stop_pct
+
+
+def cost_lines(cfg: StrategyConfig, trades: Sequence[Trade] = ()) -> list[str]:
+    """The cost assumptions of a run (CONTRACT.md v2 A1/A4), for the provenance section."""
+    default = " (the default: Binance spot taker, no discounts)" if _default_fee(cfg) else ""
+    lines = [
+        f"- **Costs used in every backtest:** fee {cfg.fee_rate:.3%} of notional per side"
+        f"{default} (`--fee-rate {cfg.fee_rate:g}`), charged on the entry AND on the exit; "
+        f"slippage {cfg.slippage_pct:g}% (`--slippage-pct {cfg.slippage_pct:g}`) against the "
+        "trade on market fills (entries and stop exits; take-profit limit exits get none); "
+        f"exchange `{cfg.exchange_id}` (`--exchange-id`; `EXCHANGE:{cfg.exchange_id}` news "
+        f"events block every pair). Starting capital {cfg.starting_capital:,.0f} per window.",
+        "- Cost-aware sizing and targets (CONTRACT.md v2 A1): the planned risk is the ALL-IN "
+        "loss at the stop (the stop fill after slippage plus both fees), so a clean stop is "
+        f"exactly -1R and the target is placed so that a take-profit nets exactly "
+        f"+{cfg.reward_risk:g}R after fees; the target's price distance is therefore more than "
+        f"{cfg.reward_risk:g}x the stop distance. Only a gap through the stop loses more than 1R.",
+        f"- {COINBASE_FEE_NOTE}",
+    ]
+    if cfg.exchange_id != DEFAULT_CFG.exchange_id and _default_fee(cfg):
+        lines.append(
+            f"- **WARNING: exchange `{cfg.exchange_id}` was run with the Binance default fee "
+            f"{cfg.fee_rate:.3%} per side.** Unless that is the account's real tier, every "
+            "number in this report is optimistic."
+        )
+    measured = _fee_cost_r(trades)
+    if measured is not None:
+        fees_r, stop_pct = measured
+        lines.append(
+            f"- Measured on the baseline's TRAIN and TEST trades: fees alone cost "
+            f"{fees_r:.2f}R per trade on average (median stop distance {stop_pct:.2f}% of the "
+            "entry price), so the expectancy below is only as good as the fee rate above."
+        )
+    return lines
+
+
+def _default_fee(cfg: StrategyConfig) -> bool:
+    return cfg.fee_rate == DEFAULT_CFG.fee_rate
+
+
 def section_provenance(ds: Dataset, research: Research, data_end: int) -> list[str]:
+    base = research.base
     lines = [*_section(2), *ds.provenance]
     lines += [
         f"- Walk-forward split: {ms_to_iso(research.split)} = 70% of the common time range of "
         f"all pairs (TRAIN = signal candles before it, TEST = at or after it, up to "
         f"{ms_to_iso(data_end)}). TEST starts with fresh equity and fresh circuit breakers; "
         "indicators warm up on earlier candles only.",
-        f"- Costs: fee {research.cfg.fee_rate:.2%} per side, slippage "
-        f"{research.cfg.slippage_pct:g}% on market fills; starting capital "
-        f"{research.cfg.starting_capital:,.0f} per window.",
+        "",
+        *candle_table(ds.data, research.split, research.cfg.timeframe_ms),
+        "",
+        *cost_lines(research.cfg, [*base.train.trades, *base.test.trades]),
     ]
     return lines
 
@@ -487,8 +581,14 @@ def _selected_lines(disc: DiscoveryResult) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- section 5
-def _ml_model_lines(r: WalkForwardResult) -> list[str]:
+def fitted_model(r: WalkForwardResult) -> MLFilter | None:
+    """The fitted ``MLFilter`` behind a walk-forward's entry filter, if there is one."""
     ml = getattr(r.entry_filter, "ml", None)
+    return ml if isinstance(ml, MLFilter) else None
+
+
+def _ml_model_lines(r: WalkForwardResult) -> list[str]:
+    ml = fitted_model(r)
     if ml is None:
         return ["The fitted filter exposes no model details."]
     lines = [
@@ -502,8 +602,12 @@ def _ml_model_lines(r: WalkForwardResult) -> list[str]:
         f"{_sr(ml.avg_win_r, 2)}R and avg loss {_sr(ml.avg_loss_r, 2)}R: "
         f"p* = {ml.threshold:.3f} (no threshold search).",
         f"- L2 penalty {ml.l2:g} (fixed, not tuned); intercept {_sr(ml.model.intercept)}.",
+        f"- Model fingerprint (sha256 of features, TRAIN means/stds, intercept, coefficients, "
+        f"threshold and l2): `{ml.fingerprint()}`. It is pinned in the ML adoption record "
+        "(section 11).",
         "",
-        "| feature | standardised coefficient (log-odds per TRAIN s.d.) |",
+        "| feature | standardised coefficient, fitted on TRAIN only and applied unchanged to "
+        "TEST (log-odds per TRAIN s.d.) |",
         "|---|---:|",
     ]
     lines += [f"| `{name}` | {_sr(w)} |" for name, w in ml.explain()]
@@ -645,39 +749,96 @@ def _renumbered_test(r: WalkForwardResult) -> list[Trade]:
     return [replace(t, trade_id=t.trade_id + offset) for t in r.test.trades]
 
 
-def section_journal_rules(research: Research, data_end: int) -> list[str]:
+AUDIT_HEADER = (
+    "| window (TRAIN journal at the split, TEST journal at the end) | rule | scope | action "
+    "| explanation | evidence (journal trade ids) |"
+)
+
+
+def journal_audits(
+    r: WalkForwardResult, data_end: int
+) -> list[tuple[str, int, float, list[Adaptation]]]:
+    """``(window, audit time, equity, adaptations)`` for the TRAIN and the TEST journal.
+
+    Backtest journals record the OPEN of the exit candle, so the audit counts every exit
+    from ``exit_ts + cfg.timeframe_ms`` (CONTRACT.md v2 A2), exactly like the backtester's
+    circuit breakers.
+    """
+    cfg = r.cfg or DEFAULT_CFG
+    tf = cfg.timeframe_ms
+    train_eq, test_eq = r.train.final_equity, r.test.final_equity
+    return [
+        ("TRAIN", r.split_ts, train_eq, audit(r.train.trades, cfg, r.split_ts, train_eq, tf)),
+        ("TEST", data_end, test_eq, audit(_renumbered_test(r), cfg, data_end, test_eq, tf)),
+    ]
+
+
+def _audit_rows(window: str, at: int, equity: float, acts: Sequence[Adaptation]) -> list[str]:
+    where = f"{window} at {ms_to_iso(at)} (equity {equity:,.2f})"
+    if not acts:
+        return [f"| {where} | - | - | none | No active adaptations. | - |"]
+    rows = []
+    for a in acts:
+        evidence = ", ".join(f"#{i}" for i in a.evidence_trade_ids) or "-"
+        cells = (where, a.rule, a.scope, a.action, a.explanation, evidence)
+        rows.append("| " + " | ".join(_cell(c) for c in cells) + " |")
+    return rows
+
+
+def section_journal_rules(research: Research, data_end: int, out_dir: Path) -> list[str]:
+    tf_h = research.cfg.timeframe_ms / HOUR_MS
     lines = [
         *_section(9),
-        f"`journal_rules.audit` over each TEST journal at {ms_to_iso(data_end)} (the end of "
-        "TEST) with the TEST final equity: every adaptation the live bot would be applying "
-        "right now because of past trades, with the journal rows that caused it.",
+        "`journal_rules.audit` over each pre-registered candidate's TRAIN journal at the split "
+        f"and its TEST journal at {ms_to_iso(data_end)} (the end of TEST), each with that "
+        "window's final equity: every adaptation the live bot would be applying at that moment "
+        "because of past trades, with the journal rows that caused it. Backtest journals record "
+        f"the OPEN of the exit candle, so each exit counts from exit_ts + {tf_h:g}h, when the "
+        "exit is certain (`exit_time_uncertainty_ms = cfg.timeframe_ms`, CONTRACT.md v2 A2); a "
+        "bench therefore lasts at least 24h of real time. A live journal records real fill "
+        "times and uses 0.",
         "",
     ]
     for name, r in research.candidates():
         if not r.ran:
             lines += [f"**{name}:** not run ({r.layer} could not be fitted).", ""]
             continue
-        acts = audit(_renumbered_test(r), r.cfg, data_end, r.test.final_equity)
-        lines += [
-            f"**{name}** (TEST final equity {r.test.final_equity:,.2f}):",
-            "",
-            render_markdown(acts),
-            "",
-        ]
+        lines += [f"**{name}:**", "", AUDIT_HEADER, "|---|---|---|---|---|---|"]
+        for window, at, equity, acts in journal_audits(r, data_end):
+            lines += _audit_rows(window, at, equity, acts)
+        lines.append("")
+    base_test = _journal_paths(out_dir, BASE)[1].as_posix()
+    lines.append(
+        f"Reproduce the baseline TEST row with `python -m research.trendbot.journal_rules "
+        f"--journal {base_test} --equity {research.base.test.final_equity:.2f} "
+        f"--now {ms_to_iso(data_end)} --backtest-journal`."
+    )
     return lines
 
 
 # ---------------------------------------------------------------------------- outputs
+def _safe(variant: str) -> str:
+    """File-name form of a variant id (``base+ml`` -> ``base_plus_ml``)."""
+    return variant.replace("+", "_plus_").replace("/", "_")
+
+
 def _journal_paths(out_dir: Path, variant: str) -> tuple[Path, Path]:
-    safe = variant.replace("+", "_plus_").replace("/", "_")
+    safe = _safe(variant)
     return out_dir / "journals" / f"{safe}_train.csv", out_dir / "journals" / f"{safe}_test.csv"
+
+
+def output_targets(research: Research) -> list[tuple[str, WalkForwardResult]]:
+    """The pre-registered candidates that ran: the only variants with journals and packs.
+
+    These are exactly the variants whose TRAIN and TEST columns the report shows in full
+    (sections 3, 5 and 7); the other grid variants are one context row each in section 4.
+    """
+    return [(name, r) for name, r in research.candidates() if r.ran]
 
 
 def write_journals(research: Research, out_dir: Path) -> dict[str, tuple[Path, Path]]:
     out: dict[str, tuple[Path, Path]] = {}
-    for r in research.all_results():
-        if not r.ran:
-            continue
+    for _name, r in output_targets(research):
         train_path, test_path = _journal_paths(out_dir, r.variant)
         train_path.parent.mkdir(parents=True, exist_ok=True)
         write_journal(r.train.trades, train_path)
@@ -686,23 +847,26 @@ def write_journals(research: Research, out_dir: Path) -> dict[str, tuple[Path, P
     return out
 
 
-def _review_targets(research: Research) -> list[tuple[str, str, WalkForwardResult]]:
-    targets = [("review_base", f"Trade review: baseline `{BASE}`", research.base)]
-    sel = research.discovery.selected()
-    if sel is not None:
-        targets.append(
-            (f"review_selected_{sel.variant}", f"Trade review: selected `{sel.variant}`", sel)
-        )
-    return targets
+def _review_folder(research: Research, r: WalkForwardResult) -> str:
+    if r is research.base:
+        return "review_base"
+    if r is research.ml:
+        return f"review_{_safe(r.variant)}"
+    return f"review_selected_{_safe(r.variant)}"
 
 
 def write_reviews(research: Research, out_dir: Path) -> dict[str, dict[str, Path]]:
     out: dict[str, dict[str, Path]] = {}
-    for folder, title, r in _review_targets(research):
+    for name, r in output_targets(research):
         trades = [*r.train.trades, *_renumbered_test(r)]
         decisions = Counter(r.train.decisions) + Counter(r.test.decisions)
         out[r.variant] = write_review_pack(
-            trades, out_dir / folder, title, r.cfg, split_ts=r.split_ts, decision_counts=decisions
+            trades,
+            out_dir / _review_folder(research, r),
+            f"Trade review: {name}",
+            r.cfg or DEFAULT_CFG,
+            split_ts=r.split_ts,
+            decision_counts=decisions,
         )
     return out
 
@@ -719,9 +883,12 @@ def section_links(
 ) -> list[str]:
     lines = [
         *_section(10),
-        "Trade journals (`journal.write_journal`, one CSV per variant and window). TEST trade "
-        "ids are offset past the TRAIN ids, so ids are unique across a variant's two journals "
-        "and its review pack.",
+        "Trade journals (`journal.write_journal`, one CSV per window) for the three "
+        "pre-registered candidates, the variants whose TRAIN and TEST columns this report "
+        "shows in full. The other discovery variants appear only as one context row each in "
+        "section 4, so no journal is kept for them (the same command regenerates them). TEST "
+        "trade ids are offset past the TRAIN ids, so ids are unique across a variant's two "
+        "journals and its review pack.",
         "",
         "| variant | TRAIN journal | TEST journal |",
         "|---|---|---|",
@@ -743,24 +910,69 @@ class AdoptionStatus:
     variant: str
     path: Path
     blocking: list[str]  # one "[rule] reason" per blocking decision (empty = allowed)
+    result: WalkForwardResult | None = None
+    config_path: Path | None = None  # overrides JSON for `adoption check --config`
+    model_path: Path | None = None  # canonical model JSON (its sha256 is the fingerprint)
+    model_fingerprint: str | None = None
+
+
+def config_overrides(cfg: StrategyConfig) -> dict[str, object]:
+    """JSON overrides (``adoption.load_config`` format) that rebuild ``cfg`` from defaults."""
+    out: dict[str, object] = {}
+    for f in fields(StrategyConfig):
+        value, default = getattr(cfg, f.name), getattr(DEFAULT_CFG, f.name)
+        if f.name == "pair_risk":
+            if dict(value) != dict(default):
+                out[f.name] = {
+                    b: {"max_risk_pct": pr.max_risk_pct, "stop_buffer_pct": pr.stop_buffer_pct}
+                    for b, pr in value.items()
+                }
+        elif value != default:
+            out[f.name] = list(value) if isinstance(value, tuple) else value
+    return out
 
 
 def _adoption_targets(research: Research) -> list[WalkForwardResult]:
+    """Baseline, TRAIN-selected variant and (if it was fitted) the ML layer."""
     targets = [research.base]
     sel = research.discovery.selected()
     if sel is not None and sel.variant != BASE:
         targets.append(sel)
+    if research.ml.ran and fitted_model(research.ml) is not None:
+        targets.append(research.ml)
     return targets
+
+
+def _write_config(cfg: StrategyConfig, out_dir: Path, variant: str) -> Path | None:
+    overrides = config_overrides(cfg)
+    if not overrides:
+        return None
+    path = out_dir / f"config_{_safe(variant)}.json"
+    path.write_text(json.dumps(overrides, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def _write_model(ml: MLFilter, out_dir: Path, variant: str) -> Path:
+    """The canonical model JSON, byte for byte what the fingerprint hashes (no newline)."""
+    path = out_dir / f"model_{_safe(variant)}.json"
+    path.write_text(ml.canonical_json(), encoding="utf-8")
+    return path
 
 
 def write_adoption(research: Research, out_dir: Path, now_ms: int) -> list[AdoptionStatus]:
     """Record BACKTEST + WALK_FORWARD for each adoptable candidate, then check HUMAN_REVIEW.
 
+    The ML record carries the fitted model's fingerprint (CONTRACT.md v2 A3). Each check
+    uses the config rebuilt from the written overrides file, exactly as the CLI would, so a
+    wrong overrides file shows up as an ``ADOPT_fingerprint`` block in the report.
     ``out_dir / REPORT_NAME`` must already exist (it is the evidence file the check audits).
     """
     out: list[AdoptionStatus] = []
     for r in _adoption_targets(research):
-        rec = empty_record(r.variant, r.cfg)
+        cfg = r.cfg or DEFAULT_CFG
+        ml = fitted_model(r)
+        model_fp = ml.fingerprint() if ml is not None else None
+        rec = empty_record(r.variant, cfg, model_fp)
         rec = replace(
             rec,
             backtest=BacktestStage(report_path=REPORT_NAME, completed_utc=ms_to_iso(now_ms)),
@@ -774,11 +986,92 @@ def write_adoption(research: Research, out_dir: Path, now_ms: int) -> list[Adopt
                 report_path=REPORT_NAME,
             ),
         )
-        path = out_dir / f"adoption_{r.variant}.json"
+        path = out_dir / f"adoption_{_safe(r.variant)}.json"
         save_record(rec, path)
-        decisions = check_promotion(rec, HUMAN_REVIEW, r.cfg, now_ms, base_dir=out_dir)
-        out.append(AdoptionStatus(r.variant, path, [f"[{d.rule}] {d.reason}" for d in decisions]))
+        config_path = _write_config(cfg, out_dir, r.variant)
+        model_path = _write_model(ml, out_dir, r.variant) if ml is not None else None
+        decisions = check_promotion(
+            rec, HUMAN_REVIEW, load_config(config_path), now_ms, out_dir, model_fp
+        )
+        blocking = [f"[{d.rule}] {d.reason}" for d in decisions]
+        out.append(AdoptionStatus(r.variant, path, blocking, r, config_path, model_path, model_fp))
     return out
+
+
+def check_command(st: AdoptionStatus, out_dir: Path, stage: str = HUMAN_REVIEW) -> str:
+    """The exact ``adoption check`` command line for a record written by this run."""
+    parts = [
+        "python -m research.trendbot.adoption check",
+        f"--record {(out_dir / _rel(st.path, out_dir)).as_posix()}",
+        f"--stage {stage}",
+    ]
+    if st.config_path is not None:
+        parts.append(f"--config {(out_dir / _rel(st.config_path, out_dir)).as_posix()}")
+    if st.model_fingerprint is not None:
+        parts.append(f"--model-fingerprint {st.model_fingerprint}")
+    return " ".join(parts)
+
+
+def _adoption_table(statuses: Sequence[AdoptionStatus]) -> list[str]:
+    lines = [
+        "| variant | walk-forward label (TRAIN + TEST) | TRAIN n | TEST n | TEST avg R | "
+        "config sha256 (first 16) | ML model sha256 (first 16) | promotion to HUMAN_REVIEW |",
+        "|---|---|---:|---:|---:|---|---|---|",
+    ]
+    for st in statuses:
+        r = st.result
+        if r is None:
+            continue
+        cfg_fp = config_fingerprint(r.cfg or DEFAULT_CFG)[:16]
+        model = st.model_fingerprint[:16] if st.model_fingerprint else "none (no ML layer)"
+        verdict = "BLOCKED" if st.blocking else "allowed"
+        lines.append(
+            f"| `{st.variant}` | {r.label} | {r.train_summary.n} | {r.test_summary.n} | "
+            f"{_sr(r.test_summary.avg_r)} | `{cfg_fp}` | `{model}` | {verdict} |"
+        )
+    return lines
+
+
+def _status_lines(statuses: Sequence[AdoptionStatus], out_dir: Path) -> list[str]:
+    lines: list[str] = []
+    for st in statuses:
+        rel = _rel(st.path, out_dir)
+        files = [f"record [{rel}]({rel})"]
+        for extra in (st.config_path, st.model_path):
+            if extra is not None:
+                x = _rel(extra, out_dir)
+                files.append(f"[{x}]({x})")
+        head = f"- `{st.variant}`: {', '.join(files)}; promotion to {HUMAN_REVIEW} is "
+        if st.blocking:
+            lines.append(head + "BLOCKED: " + " ".join(st.blocking))
+        else:
+            lines.append(
+                head + "allowed: a named person must now review every trade in its review "
+                "pack, then fill `human_review` in the record before any testnet run."
+            )
+        lines.append(f"  Check: `{check_command(st, out_dir)}`")
+    return lines
+
+
+def _ml_adoption_lines(statuses: Sequence[AdoptionStatus], out_dir: Path) -> list[str]:
+    ml_status = next((st for st in statuses if st.variant == ML_VARIANT), None)
+    if ml_status is None or ml_status.model_path is None:
+        return [
+            f"The ML layer `{ML_VARIANT}` could not be fitted, so there is no model to "
+            "fingerprint and no adoption record for it."
+        ]
+    model = _rel(ml_status.model_path, out_dir)
+    return [
+        f"The ML layer `{ML_VARIANT}` is adopted as a (config, model) pair: its record pins "
+        "the config fingerprint AND the fitted model's fingerprint "
+        f"`{ml_status.model_fingerprint}` (`MLFilter.fingerprint()`, the sha256 of "
+        f"[{model}]({model})). **Refitting the model (new TRAIN data, a later split, a "
+        "different l2) changes the fingerprint, so a refitted model is a NEW candidate and "
+        f"restarts the adoption path at {BACKTEST}.** `adoption check` blocks "
+        "(`ADOPT_fingerprint`) a model whose fingerprint differs from the recorded one, and "
+        "any `+ml` record without one; the live bot must pass the fingerprint of the model it "
+        "actually runs.",
+    ]
 
 
 def section_adoption(
@@ -786,8 +1079,9 @@ def section_adoption(
 ) -> list[str]:
     lines = [
         *_section(11),
-        "The only path to real money (enforced by `adoption.py`; no step can be skipped and "
-        "the promoted config must match the tested config's sha256 fingerprint):",
+        "The only path to real money (enforced by `adoption.py`; no step can be skipped, the "
+        "promoted config must match the tested config's sha256 fingerprint, and an ML layer's "
+        "model must match the tested model's fingerprint):",
         "",
         "backtest -> walk-forward (ROBUST + drawdown check) -> human review of EVERY trade -> "
         ">= 2 weeks on Binance testnet with zero rule violations -> live.",
@@ -803,28 +1097,14 @@ def section_adoption(
             "real candles from the backtest stage.**",
             "",
         ]
-    for st in statuses:
-        rel = _rel(st.path, out_dir)
-        if st.blocking:
-            lines.append(
-                f"- `{st.variant}`: record [{rel}]({rel}); promotion to {HUMAN_REVIEW} is "
-                f"BLOCKED: " + " ".join(st.blocking)
-            )
-        else:
-            lines.append(
-                f"- `{st.variant}`: record [{rel}]({rel}); promotion to {HUMAN_REVIEW} is "
-                "allowed: a named person must now review every trade in its review pack, then "
-                "fill `human_review` in the record before any testnet run."
-            )
-    lines += [
-        "",
-        f"The ML layer `{ML_VARIANT}` has no adoption record: its fitted coefficients are not "
-        "part of `StrategyConfig`, so the config fingerprint cannot pin them. The regime-OFF "
-        "variant is test-only and can never be adopted.",
-        "",
-        "Check a record with `python -m research.trendbot.adoption check --record "
-        f"{out_dir.as_posix()}/adoption_{BASE}.json --stage {HUMAN_REVIEW}`.",
-    ]
+    lines += [*_adoption_table(statuses), "", *_status_lines(statuses, out_dir), ""]
+    lines += [*_ml_adoption_lines(statuses, out_dir), ""]
+    lines.append(
+        "A `config_<variant>.json` file (the `StrategyConfig` overrides versus the defaults, "
+        "e.g. costs or discovery parameters) is written whenever the tested config is not the "
+        "default one; the check needs it as `--config`. The regime-OFF variant is test-only "
+        "and can never be adopted."
+    )
     return lines
 
 
@@ -859,7 +1139,7 @@ def render_report(
         section_verdict(research),
         section_decisions(research),
         section_invariants(research),
-        section_journal_rules(research, data_end),
+        section_journal_rules(research, data_end, out_dir),
         section_links(research, out_dir, journals, reviews),
         adoption,
         section_disclaimer(),
@@ -883,21 +1163,43 @@ def write_outputs(ds: Dataset, research: Research, out_dir: Path, now_ms: int) -
 CAL_FIELDS = (
     "seed",
     "base_label",
+    "base_train_n",
     "base_train_avg_r",
-    "base_test_avg_r",
     "base_test_n",
+    "base_test_avg_r",
+    "base_test_ci90_low",
     "base_dd_ok",
     "selected",
     "selected_label",
+    "selected_train_avg_r",
     "selected_test_avg_r",
     "selected_test_n",
     "ml_label",
+    "ml_train_avg_r_in_sample",
     "ml_test_avg_r",
     "ml_test_n",
     "ml_fit_error",
+    "ml_hour_sin",
+    "ml_hour_cos",
+    "ml_top_feature",
+    "ml_fingerprint",
     "verdict_robust",
     "violations",
 )
+HOUR_TERMS = ("hour_sin", "hour_cos")
+
+
+def _ml_cal_fields(m: WalkForwardResult) -> dict[str, object]:
+    ml = fitted_model(m) if m.ran else None
+    if ml is None:
+        return {k: "" for k in ("ml_hour_sin", "ml_hour_cos", "ml_top_feature", "ml_fingerprint")}
+    coefs = dict(ml.explain())
+    return {
+        "ml_hour_sin": round(coefs["hour_sin"], 4),
+        "ml_hour_cos": round(coefs["hour_cos"], 4),
+        "ml_top_feature": max(coefs, key=lambda k: abs(coefs[k])),
+        "ml_fingerprint": ml.fingerprint(),
+    }
 
 
 def _cal_row(seed: int, research: Research) -> dict[str, object]:
@@ -905,32 +1207,53 @@ def _cal_row(seed: int, research: Research) -> dict[str, object]:
     return {
         "seed": seed,
         "base_label": b.label,
+        "base_train_n": b.train_summary.n,
         "base_train_avg_r": round(b.train_summary.avg_r, 4),
-        "base_test_avg_r": round(b.test_summary.avg_r, 4),
         "base_test_n": b.test_summary.n,
+        "base_test_avg_r": round(b.test_summary.avg_r, 4),
+        "base_test_ci90_low": round(b.test_summary.ci90_low, 4),
         "base_dd_ok": b.dd_ok,
         "selected": s.variant if s else "",
         "selected_label": s.label if s else "NONE",
+        "selected_train_avg_r": round(s.train_summary.avg_r, 4) if s else "",
         "selected_test_avg_r": round(s.test_summary.avg_r, 4) if s else "",
         "selected_test_n": s.test_summary.n if s else "",
         "ml_label": m.label,
+        "ml_train_avg_r_in_sample": round(m.train_summary.avg_r, 4) if m.ran else "",
         "ml_test_avg_r": round(m.test_summary.avg_r, 4) if m.ran else "",
         "ml_test_n": m.test_summary.n if m.ran else "",
         "ml_fit_error": m.fit_error or "",
+        **_ml_cal_fields(m),
         "verdict_robust": bool(research.robust()),
         "violations": research.n_violations(),
     }
 
 
-def calibrate_one(job: tuple[str, int, float]) -> dict[str, object]:
+CalJob = tuple[str, int, float, tuple[tuple[str, object], ...]]
+
+
+def cost_overrides(cfg: StrategyConfig | None) -> tuple[tuple[str, object], ...]:
+    """The cost fields of ``cfg`` that differ from the defaults (picklable, for workers)."""
+    if cfg is None:
+        return ()
+    return tuple(
+        (k, getattr(cfg, k)) for k in COST_FLAGS if getattr(cfg, k) != getattr(DEFAULT_CFG, k)
+    )
+
+
+def calibrate_one(job: CalJob) -> dict[str, object]:
     """One calibration seed (top-level so a process pool can pickle it)."""
-    world, seed, years = job
+    world, seed, years, overrides = job
+    cfg = DEFAULT_CFG.with_changes(**dict(overrides))
     ds = load_synthetic(world, seed, years)
-    return _cal_row(seed, run_pipeline(ds.data, ds.events))
+    return _cal_row(seed, run_pipeline(ds.data, ds.events, cfg))
 
 
-def calibrate(world: str, n_seeds: int, years: float, workers: int) -> list[dict[str, object]]:
-    jobs = [(world, seed, years) for seed in range(1, n_seeds + 1)]
+def calibrate(
+    world: str, n_seeds: int, years: float, workers: int, cfg: StrategyConfig | None = None
+) -> list[dict[str, object]]:
+    overrides = cost_overrides(cfg)
+    jobs: list[CalJob] = [(world, seed, years, overrides) for seed in range(1, n_seeds + 1)]
     if workers <= 1:
         return [calibrate_one(j) for j in jobs]
     with ProcessPoolExecutor(max_workers=workers) as pool:
@@ -966,41 +1289,83 @@ _ROBUST_MEANING = {
 }
 
 
+def _count(rows: Sequence[Mapping[str, object]], key: str, *values: str) -> int:
+    return sum(1 for r in rows if r[key] in values)
+
+
+def _ml_hour_line(rows: Sequence[Mapping[str, object]]) -> str | None:
+    fitted = [r for r in rows if r["ml_top_feature"] != ""]
+    if not fitted:
+        return None
+    top_hour = _count(fitted, "ml_top_feature", *HOUR_TERMS)
+    mags = [
+        math.hypot(float(r["ml_hour_sin"]), float(r["ml_hour_cos"]))  # type: ignore[arg-type]
+        for r in fitted
+    ]
+    return (
+        f"- ML coefficients (standardised, fitted on TRAIN only): the largest-magnitude "
+        f"coefficient was an hour term (hour_sin/hour_cos) in {top_hour}/{len(fitted)} fitted "
+        f"seeds; mean hour-term magnitude sqrt(hour_sin^2 + hour_cos^2) = "
+        f"{statistics.fmean(mags):.3f} log-odds per TRAIN s.d."
+    )
+
+
 def _world_findings(world: str, rows: Sequence[Mapping[str, object]]) -> list[str]:
     n = len(rows)
     robust = sum(1 for r in rows if r["verdict_robust"])
-    base_robust = sum(1 for r in rows if r["base_label"] == "ROBUST")
     meaning = _ROBUST_MEANING.get(world, "")
     lines = [
-        f"- Verdict ROBUST (any pre-registered candidate){meaning}: {_rate(robust, n)}.",
-        f"- Baseline labelled ROBUST{meaning}: {_rate(base_robust, n)}.",
+        f"- Verdict ROBUST (any of the 3 pre-registered candidates){meaning}: {_rate(robust, n)}.",
+        f"- Baseline labelled ROBUST{meaning}: {_rate(_count(rows, 'base_label', 'ROBUST'), n)}.",
     ]
     for key, name in (("selected_label", "Discovery-selected"), ("ml_label", "ML layer")):
-        k = sum(1 for r in rows if r[key] == "ROBUST")
-        lines.append(f"- {name} labelled ROBUST{meaning}: {_rate(k, n)}.")
+        lines.append(f"- {name} labelled ROBUST{meaning}: {_rate(_count(rows, key, 'ROBUST'), n)}.")
+    lines.append(
+        f"- Baseline mean avg R: TRAIN {_mean([r['base_train_avg_r'] for r in rows])} vs TEST "
+        f"{_mean([r['base_test_avg_r'] for r in rows])}."
+    )
     if world == "decay":
-        caught = sum(1 for r in rows if r["base_label"] in ("TRAIN-ONLY", "UNTESTED"))
-        lines.append(f"- Baseline labelled TRAIN-ONLY or UNTESTED: {_rate(caught, n)}.")
+        t_only = _count(rows, "base_label", "TRAIN-ONLY")
+        untested = _count(rows, "base_label", "UNTESTED")
+        lines += [
+            f"- Baseline labelled TRAIN-ONLY: {_rate(t_only, n)}; UNTESTED: {_rate(untested, n)}.",
+            f"- Baseline labelled TRAIN-ONLY or UNTESTED (the decay is caught or at least not "
+            f"passed): {_rate(t_only + untested, n)}.",
+        ]
     both = [r for r in rows if r["ml_test_avg_r"] != ""]
-    helped = sum(1 for r in both if float(r["ml_test_avg_r"]) > float(r["base_test_avg_r"]))
-    unfit = n - len(both)
-    if unfit:
+    helped = sum(1 for r in both if float(r["ml_test_avg_r"]) > float(r["base_test_avg_r"]))  # type: ignore[arg-type]
+    if n - len(both):
         lines.append(
             f"- ML layer NOT fitted (InsufficientData, labelled UNTESTED, no fall-back) in "
-            f"{unfit}/{n} seeds."
+            f"{n - len(both)}/{n} seeds."
         )
     lines.append(
         f"- ML layer fitted in {len(both)}/{n} seeds; its TEST avg R beat the baseline's in "
         f"{helped}/{len(both)} of those (mean TEST avg R: base "
         f"{_mean([r['base_test_avg_r'] for r in both])}, ML "
-        f"{_mean([r['ml_test_avg_r'] for r in both])})."
+        f"{_mean([r['ml_test_avg_r'] for r in both])}; mean TEST n: base "
+        f"{_mean_n([r['base_test_n'] for r in both])}, ML "
+        f"{_mean_n([r['ml_test_n'] for r in both])})."
     )
+    hour = _ml_hour_line(rows)
+    if hour is not None:
+        lines.append(hour)
     viol = sum(int(r["violations"]) for r in rows)  # type: ignore[call-overload]
     lines.append(f"- Invariant violations over all backtests of all seeds: {viol}.")
     return lines
 
 
-def render_calibration(world: str, years: float, rows: Sequence[Mapping[str, object]]) -> str:
+def _mean_n(values: Sequence[object]) -> str:
+    nums = [float(v) for v in values if v != ""]  # type: ignore[arg-type]
+    return f"{statistics.fmean(nums):.1f}" if nums else "n/a"
+
+
+def render_calibration(
+    world: str,
+    years: float,
+    rows: Sequence[Mapping[str, object]],
+    cfg: StrategyConfig | None = None,
+) -> str:
     truth, prediction = WORLD_TRUTH[world]
     n = len(rows)
     lines = [
@@ -1011,18 +1376,20 @@ def render_calibration(world: str, years: float, rows: Sequence[Mapping[str, obj
         f"Each seed is a full run of the pipeline ({years:g} years of 4H candles, 70/30 "
         "walk-forward): baseline, discovery (K = 13 variants, selected on TRAIN) and the ML "
         "layer. **Synthetic results are verification of the methodology, not evidence about "
-        "real markets.**",
+        "real markets.** Each label below combines that candidate's TRAIN and TEST windows "
+        "(`metrics.label`); the verdict takes up to three looks at TEST per seed.",
         "",
         f"- Ground truth: {truth}",
         f"- What the ground truth predicts: {prediction}",
+        *cost_lines(cfg or DEFAULT_CFG),
         "",
         "## Label frequencies",
         "",
-        "| label | baseline | discovery-selected | ML layer |",
+        "| walk-forward label (TRAIN + TEST) | baseline | discovery-selected | ML layer |",
         "|---|---:|---:|---:|",
     ]
     for lab in (*LABELS, "NONE"):
-        counts = [sum(1 for r in rows if r[k] == lab) for k in _CAL_LABEL_KEYS]
+        counts = [_count(rows, k, lab) for k in _CAL_LABEL_KEYS]
         if lab == "NONE" and not any(counts):
             continue
         lines.append(f"| {lab} | " + " | ".join(f"{c}/{n}" for c in counts) + " |")
@@ -1035,31 +1402,40 @@ def render_calibration(world: str, years: float, rows: Sequence[Mapping[str, obj
 _CAL_LABEL_KEYS = ("base_label", "selected_label", "ml_label")
 
 
+def _num(value: object, digits: int = 3) -> str:
+    return _sr(float(value), digits) if value != "" else "n/a"  # type: ignore[arg-type]
+
+
 def _per_seed_lines(rows: Sequence[Mapping[str, object]]) -> list[str]:
     lines = [
-        "## Per seed (TRAIN | TEST avg R side by side for the baseline)",
+        "## Per seed (TRAIN and TEST side by side)",
         "",
-        "| seed | base TRAIN avg R | base TEST avg R | base TEST n | base label | selected | "
-        "selected TEST avg R | selected label | ML TEST avg R | ML TEST n | ML label | verdict "
-        "ROBUST | violations |",
-        "|---:|---:|---:|---:|---|---|---:|---|---:|---:|---|---|---:|",
+        "| seed | base TRAIN n | base TRAIN avg R | base TEST n | base TEST avg R | base TEST "
+        "90% CI low | base label | selected | selected TRAIN avg R | selected TEST avg R | "
+        "selected label | ML TRAIN avg R (in-sample) | ML TEST avg R | ML TEST n | ML label | "
+        "verdict ROBUST | violations |",
+        "|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---|---:|---:|---:|---|---|---:|",
     ]
     for r in rows:
-        sel_r = r["selected_test_avg_r"]
-        ml_r = r["ml_test_avg_r"]
+        ml_n = r["ml_test_n"] if r["ml_test_avg_r"] != "" else "n/a"
         lines.append(
-            f"| {r['seed']} | {_sr(float(r['base_train_avg_r']))} | "  # type: ignore[arg-type]
-            f"{_sr(float(r['base_test_avg_r']))} | {r['base_test_n']} | {r['base_label']} | "  # type: ignore[arg-type]
-            f"`{r['selected'] or '-'}` | {_sr(float(sel_r)) if sel_r != '' else 'n/a'} | "  # type: ignore[arg-type]
-            f"{r['selected_label']} | {_sr(float(ml_r)) if ml_r != '' else 'n/a'} | "  # type: ignore[arg-type]
-            f"{r['ml_test_n'] if ml_r != '' else 'n/a'} | {r['ml_label']} | "
+            f"| {r['seed']} | {r['base_train_n']} | {_num(r['base_train_avg_r'])} | "
+            f"{r['base_test_n']} | {_num(r['base_test_avg_r'])} | "
+            f"{_num(r['base_test_ci90_low'])} | {r['base_label']} | `{r['selected'] or '-'}` | "
+            f"{_num(r['selected_train_avg_r'])} | {_num(r['selected_test_avg_r'])} | "
+            f"{r['selected_label']} | {_num(r['ml_train_avg_r_in_sample'])} | "
+            f"{_num(r['ml_test_avg_r'])} | {ml_n} | {r['ml_label']} | "
             f"{'yes' if r['verdict_robust'] else 'no'} | {r['violations']} |"
         )
     return lines
 
 
 def write_calibration(
-    world: str, years: float, rows: Sequence[Mapping[str, object]], out_dir: Path
+    world: str,
+    years: float,
+    rows: Sequence[Mapping[str, object]],
+    out_dir: Path,
+    cfg: StrategyConfig | None = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / CALIBRATION_CSV).open("w", newline="", encoding="utf-8") as fh:
@@ -1067,7 +1443,7 @@ def write_calibration(
         writer.writeheader()
         writer.writerows(rows)
     path = out_dir / CALIBRATION_NAME
-    path.write_text(render_calibration(world, years, rows), encoding="utf-8")
+    path.write_text(render_calibration(world, years, rows, cfg), encoding="utf-8")
     return path
 
 
@@ -1093,10 +1469,69 @@ def _parser() -> argparse.ArgumentParser:
         "--workers", type=int, default=min(4, os.cpu_count() or 1), help="calibration processes"
     )
     p.add_argument("--now", default=None, help="ISO-8601 time stamped on the adoption records")
+    p.add_argument(
+        "--fee-rate",
+        type=float,
+        default=None,
+        help=(
+            f"fee per side as a FRACTION of notional (default {DEFAULT_CFG.fee_rate:g} = "
+            f"{DEFAULT_CFG.fee_rate:.2%}, Binance spot taker; at least 0.0005). Coinbase "
+            "Advanced Trade taker fees at low tiers are several times Binance's: pass the real "
+            "tier, e.g. 0.006 for 0.6%%"
+        ),
+    )
+    p.add_argument(
+        "--slippage-pct",
+        type=float,
+        default=None,
+        help=(
+            f"adverse slippage on market fills in PERCENT (default {DEFAULT_CFG.slippage_pct:g}; "
+            "at least 0.01)"
+        ),
+    )
+    p.add_argument(
+        "--exchange-id",
+        default=None,
+        help=(
+            f"ccxt id of the exchange traded (default {DEFAULT_CFG.exchange_id}); news events "
+            "scoped EXCHANGE:<id> block every pair"
+        ),
+    )
     return p
 
 
-def _check_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def config_from_args(args: argparse.Namespace) -> StrategyConfig:
+    """``StrategyConfig`` with the cost flags applied, validated; raises ``ConfigError``.
+
+    ``StrategyConfig`` enforces the realistic-cost floors; this adds the checks it cannot
+    make: finite numbers, and ceilings that catch a percent typed as a fraction.
+    """
+    changes: dict[str, object] = {}
+    if args.fee_rate is not None:
+        if not (math.isfinite(args.fee_rate) and args.fee_rate <= MAX_FEE_RATE):
+            raise ConfigError(
+                f"--fee-rate {args.fee_rate!r} is not a plausible fraction of notional per side "
+                f"(at most {MAX_FEE_RATE:g}; 0.006 means 0.6%)"
+            )
+        changes["fee_rate"] = args.fee_rate
+    if args.slippage_pct is not None:
+        if not (math.isfinite(args.slippage_pct) and args.slippage_pct <= MAX_SLIPPAGE_PCT):
+            raise ConfigError(
+                f"--slippage-pct {args.slippage_pct!r} is not a plausible percent "
+                f"(at most {MAX_SLIPPAGE_PCT:g})"
+            )
+        changes["slippage_pct"] = args.slippage_pct
+    if args.exchange_id is not None:
+        exchange = args.exchange_id.strip().lower()
+        if not _EXCHANGE_ID_RE.fullmatch(exchange):
+            raise ConfigError(
+                f"--exchange-id {args.exchange_id!r} is not a ccxt exchange id (e.g. binance)"
+            )
+        changes["exchange_id"] = exchange
+    return DEFAULT_CFG.with_changes(**changes)
+
+
+def _check_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> StrategyConfig:
     if args.synthetic and args.events:
         p.error("--events is only used with --data-dir (synthetic worlds bring their own)")
     if args.calibrate_seeds is not None and not args.synthetic:
@@ -1105,6 +1540,11 @@ def _check_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         p.error("--calibrate-seeds must be >= 1")
     if args.timeframe != "4h":
         p.error("the mandate is a 4H strategy: --timeframe must be 4h")
+    try:
+        return config_from_args(args)
+    except ConfigError as exc:
+        p.error(str(exc))
+        raise  # unreachable: p.error exits
 
 
 def _now_ms(text: str | None) -> int:
@@ -1113,7 +1553,15 @@ def _now_ms(text: str | None) -> int:
     return iso_to_ms(text)
 
 
+def cost_summary(cfg: StrategyConfig) -> str:
+    return (
+        f"costs: fee {cfg.fee_rate:.3%} per side, slippage {cfg.slippage_pct:g}% on market "
+        f"fills, exchange {cfg.exchange_id}"
+    )
+
+
 def _print_summary(research: Research, report: Path) -> None:
+    print(cost_summary(research.cfg))
     for name, r in research.candidates():
         s = r.test_summary
         print(f"{name}: {r.label} (TEST n={s.n}, avg {s.avg_r:+.3f}R)")
@@ -1125,11 +1573,12 @@ def _print_summary(research: Research, report: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    _check_args(parser, args)
+    cfg = _check_args(parser, args)
     out_dir = Path(args.out_dir)
     if args.calibrate_seeds is not None:
-        rows = calibrate(args.synthetic, args.calibrate_seeds, args.years, args.workers)
-        path = write_calibration(args.synthetic, args.years, rows, out_dir)
+        rows = calibrate(args.synthetic, args.calibrate_seeds, args.years, args.workers, cfg)
+        path = write_calibration(args.synthetic, args.years, rows, out_dir, cfg)
+        print(cost_summary(cfg))
         print(f"calibration of {args.synthetic} over {len(rows)} seeds -> {path}")
         return 1 if any(int(r["violations"]) for r in rows) else 0  # type: ignore[call-overload]
     try:
@@ -1141,7 +1590,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    research = run_pipeline(ds.data, ds.events)
+    research = run_pipeline(ds.data, ds.events, cfg)
     report = write_outputs(ds, research, out_dir, now_ms)
     _print_summary(research, report)
     return 1 if research.n_violations() else 0

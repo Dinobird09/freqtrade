@@ -7,6 +7,10 @@ confirmed pivot-low stop ~2.5 % below its close; it becomes a full R1-R4 signal 
 :meth:`Scenario.spike` gives it a volume spike (R3). Outcomes are then forced with wicks
 and gaps on LATER candles, which never change the indicators (closes only) or the stop of
 an earlier signal (``find_stop`` reads candles up to the signal only).
+
+Levels follow CONTRACT.md v2 A1 and are computed here from the formulas, independently of
+``sizing.py``: :meth:`Scenario.unit_loss` is the all-in loss per unit at the stop and
+:meth:`Scenario.target` the take-profit whose net win is ``reward_risk`` times it.
 """
 
 from __future__ import annotations
@@ -65,9 +69,14 @@ class Scenario:
     def entry(self, i: int, cfg: StrategyConfig) -> float:
         return self.candles[i + 1].open * (1 + cfg.slippage_pct / 100)
 
+    def unit_loss(self, i: int, cfg: StrategyConfig) -> float:
+        """A1 ``L_u = (E - S_x) + f*E + f*S_x`` with ``S_x = stop * (1 - slippage)``."""
+        return unit_loss(self.entry(i, cfg), self.stop(i, cfg), cfg)
+
     def target(self, i: int, cfg: StrategyConfig) -> float:
-        e = self.entry(i, cfg)
-        return e + cfg.reward_risk * (e - self.stop(i, cfg))
+        """A1 ``T = (E*(1+f) + reward_risk*L_u) / (1-f)``."""
+        e, f = self.entry(i, cfg), cfg.fee_rate
+        return (e * (1 + f) + cfg.reward_risk * self.unit_loss(i, cfg)) / (1 - f)
 
     # ------------------------------------------------------------------ outcomes
     def low(self, j: int, price: float) -> Scenario:
@@ -93,6 +102,23 @@ class Scenario:
 
     def take_profit(self, i: int, cfg: StrategyConfig, j: int | None = None) -> Scenario:
         return self.high(i + 2 if j is None else j, self.target(i, cfg) * 1.01)
+
+
+def unit_loss(entry: float, stop: float, cfg: StrategyConfig) -> float:
+    """A1 all-in loss per unit at the stop (price loss to ``stop*(1-s)`` plus both fees)."""
+    stop_x = stop * (1 - cfg.slippage_pct / 100)
+    return (entry - stop_x) + cfg.fee_rate * entry + cfg.fee_rate * stop_x
+
+
+def bench_scenario(cfg: StrategyConfig) -> Scenario:
+    """BNB: three stop-losses, the third one on its FILL candle ``slot(2) + 1``, then signals at
+    ``slot(3)`` and ``slot(4)``. ``slot(3)`` is decided exactly 24h after the third SL's exit
+    candle OPEN (so a bench counted from the recorded exit_ts would just have lifted) but only
+    20h after that candle's CLOSE: under A2 it must be benched. ``slot(4)`` (44h) trades."""
+    bnb = Scenario("BNB/USDT", start=10.0)
+    for k in range(3):
+        bnb.spike(slot(k)).stop_out(slot(k), cfg, j=slot(k) + (1 if k == 2 else 2))
+    return bnb.spike(slot(3), slot(4))
 
 
 def news(i: int, offset_h: float, scope: str = "ALL", kind: str = "macro", impact: str = "high"):

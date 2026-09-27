@@ -4,18 +4,26 @@ Exits are never paused: this class deliberately has no exit-related API, so no b
 ever block, delay or veto a stop-loss, take-profit or forced close. A trade that closes while
 its pair is benched or while all entries are halted is still processed and recorded.
 
+Timing (CONTRACT.md v2 A2). Every rule below is measured from the EFFECTIVE exit time
+``t_e = exit_ts + exit_time_uncertainty_ms``: the latest moment at which the exit is certain
+to have happened. A live bot journals the real fill time and passes 0 (the default). A
+backtest journal records ``exit_ts`` as the OPEN of the exit candle while the fill happens
+somewhere in ``[exit_ts, exit_ts + timeframe)``, so the backtester and the gatekeeper pass
+``cfg.timeframe_ms``. With that convention a bench always lasts at least ``bench_hours`` of
+real time after the fill, and no decision can see a loss before it is certain.
+
 Two breakers (``Decision.rule == "R9_circuit_breaker"``):
 - Consecutive stop-losses, per pair: the streak grows by one on every ``EXIT_SL`` and resets
   to 0 on any other exit reason. When it reaches ``cfg.consecutive_sl_limit`` the pair is
-  benched for ``ts`` in ``[exit_ts, exit_ts + bench_hours)`` and the streak resets to 0.
+  benched for ``ts`` in ``[t_e, t_e + bench_hours)`` and the streak resets to 0.
   Other pairs are unaffected.
 - Trailing realized loss, all pairs: entries are denied everywhere while the pnl sum of trades
-  with ``exit_ts`` in ``(ts - loss_window_days, ts]`` is below
+  with ``t_e`` in ``(ts - loss_window_days, ts]`` is below
   ``-weekly_loss_limit_pct / 100 * equity``. It lifts by itself once the losses age out.
 
-A decision at ``ts`` depends only on trades with ``exit_ts <= ts`` (no look-ahead), whatever
+A decision at ``ts`` depends only on trades with ``t_e <= ts`` (no look-ahead), whatever
 order queries arrive in, so ``from_journal`` reproduces the live state exactly. Closed trades
-are kept as parallel lists sorted by ``exit_ts``; each ``can_enter`` costs two bisections plus a
+are kept as parallel lists sorted by ``t_e``; each ``can_enter`` costs two bisections plus a
 sum over the (small) trailing window.
 """
 
@@ -34,8 +42,28 @@ from .models import DAY_MS, EXIT_SL, HOUR_MS, Decision, Trade
 RULE_ID = "R9_circuit_breaker"
 
 
+def validate_uncertainty_ms(value: object) -> int:
+    """Return ``value`` if it is a valid ``exit_time_uncertainty_ms`` (int >= 0), else raise."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"exit_time_uncertainty_ms must be a non-negative integer of ms (got {value!r})"
+        )
+    return value
+
+
+def effective_exit_ts(trade: Trade, exit_time_uncertainty_ms: int = 0) -> int | None:
+    """``t_e = exit_ts + exit_time_uncertainty_ms`` (None for an open trade)."""
+    if trade.exit_ts is None:
+        return None
+    return trade.exit_ts + validate_uncertainty_ms(exit_time_uncertainty_ms)
+
+
 def _ids(trade_ids: Iterable[int]) -> str:
     return ", ".join(f"#{i}" for i in trade_ids)
+
+
+def _hours(ms: int) -> str:
+    return f"{ms / HOUR_MS:g}h"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,18 +71,25 @@ class Bench:
     """A pair benched by the consecutive stop-loss breaker for ``start_ts <= ts < until_ts``."""
 
     pair: str
-    start_ts: int  # exit_ts of the stop-loss that completed the streak (inclusive)
+    start_ts: int  # effective exit time t_e of the stop-loss that completed the streak
     until_ts: int  # start_ts + bench_hours (exclusive)
     trade_ids: tuple[int, ...]  # the consecutive stop-loss trades that caused the bench
+    recorded_exit_ts: int | None = None  # that stop-loss's journal exit_ts (None = start_ts)
 
     def covers(self, ts: int) -> bool:
         return self.start_ts <= ts < self.until_ts
 
     def sentence(self, limit: int, bench_hours: float) -> str:
+        start = f"from {ms_to_iso(self.start_ts)}"
+        recorded = self.recorded_exit_ts
+        if recorded is not None and recorded != self.start_ts:
+            start += (
+                f", the latest time the stop-loss recorded at {ms_to_iso(recorded)} can have filled"
+            )
         return (
             f"{self.pair} takes no new entries until {ms_to_iso(self.until_ts)} because trades "
             f"{_ids(self.trade_ids)} were {len(self.trade_ids)} consecutive stop-losses "
-            f"(limit {limit}, bench {bench_hours:g}h from {ms_to_iso(self.start_ts)})."
+            f"(limit {limit}, bench {bench_hours:g}h {start})."
         )
 
 
@@ -62,6 +97,9 @@ class CircuitBreakers:
     """Rule R9 state machine; feed every closed trade, ask before every entry.
 
     Exits are never paused: there is no method that can block or delay an exit.
+    ``exit_time_uncertainty_ms`` shifts every recorded exit to ``t_e = exit_ts + it``
+    (0 for live journals with real fill times, ``cfg.timeframe_ms`` for backtest journals,
+    whose ``exit_ts`` is the exit candle's OPEN).
     """
 
     __slots__ = (
@@ -72,18 +110,25 @@ class CircuitBreakers:
         "_closed_pnl",
         "_closed_ts",
         "_streaks",
+        "_uncertainty_ms",
         "_window_ms",
     )
 
-    def __init__(self, cfg: StrategyConfig) -> None:
+    def __init__(self, cfg: StrategyConfig, exit_time_uncertainty_ms: int = 0) -> None:
         self._cfg = cfg
+        self._uncertainty_ms = validate_uncertainty_ms(exit_time_uncertainty_ms)
         self._bench_ms = round(cfg.bench_hours * HOUR_MS)
         self._window_ms = round(cfg.loss_window_days * DAY_MS)
         self._streaks: dict[str, list[int]] = {}  # pair -> trade ids of the current SL streak
         self._benches: dict[str, list[Bench]] = {}  # pair -> benches in start order
-        self._closed_ts: list[int] = []  # sorted exit_ts of every closed trade
+        self._closed_ts: list[int] = []  # sorted effective exit times t_e of closed trades
         self._closed_pnl: list[float] = []
         self._closed_ids: list[int] = []
+
+    @property
+    def exit_time_uncertainty_ms(self) -> int:
+        """Offset added to every recorded ``exit_ts`` (read-only; set at construction)."""
+        return self._uncertainty_ms
 
     # ------------------------------------------------------------------ updates
     def on_trade_closed(self, trade: Trade, equity: float | None = None) -> list[str]:
@@ -94,7 +139,7 @@ class CircuitBreakers:
         """
         if trade.exit_ts is None or trade.pnl is None:
             raise ValueError(f"trade #{trade.trade_id} is not closed (exit_ts and pnl required)")
-        ts = trade.exit_ts
+        ts = trade.exit_ts + self._uncertainty_ms  # effective exit time t_e
         halted_before = equity is not None and self._window_sum(ts) < self.halt_threshold(equity)
         idx = bisect_right(self._closed_ts, ts)
         self._closed_ts.insert(idx, ts)
@@ -122,15 +167,21 @@ class CircuitBreakers:
         streak.append(trade.trade_id)
         if len(streak) < self._cfg.consecutive_sl_limit:
             return None
-        bench = Bench(trade.pair, ts, ts + self._bench_ms, tuple(streak))
+        bench = Bench(trade.pair, ts, ts + self._bench_ms, tuple(streak), trade.exit_ts)
         self._benches.setdefault(trade.pair, []).append(bench)
         streak.clear()
         return bench
 
     @classmethod
-    def from_journal(cls, trades: Iterable[Trade], cfg: StrategyConfig) -> CircuitBreakers:
-        """Rebuild state by replaying the closed trades in ``(exit_ts, trade_id)`` order."""
-        breakers = cls(cfg)
+    def from_journal(
+        cls, trades: Iterable[Trade], cfg: StrategyConfig, exit_time_uncertainty_ms: int = 0
+    ) -> CircuitBreakers:
+        """Rebuild state by replaying the closed trades in ``(exit_ts, trade_id)`` order.
+
+        Pass ``cfg.timeframe_ms`` as ``exit_time_uncertainty_ms`` for a BACKTEST journal
+        (exit_ts = exit candle open) and 0 for a live journal (exit_ts = real fill time).
+        """
+        breakers = cls(cfg, exit_time_uncertainty_ms)
         closed = [t for t in trades if t.exit_ts is not None]
         closed.sort(key=lambda t: (t.exit_ts, t.trade_id))
         for t in closed:
@@ -177,7 +228,7 @@ class CircuitBreakers:
         return -self._cfg.weekly_loss_limit_pct / 100 * equity
 
     def window_pnl(self, ts: int) -> tuple[float, tuple[int, ...]]:
-        """(pnl sum, trade ids in exit order) of trades with exit_ts in (ts - window, ts]."""
+        """(pnl sum, trade ids in t_e order) of trades with ``t_e`` in (ts - window, ts]."""
         lo, hi = self._window_bounds(ts)
         return math.fsum(self._closed_pnl[lo:hi]), tuple(self._closed_ids[lo:hi])
 
@@ -189,7 +240,7 @@ class CircuitBreakers:
             return None
         for i in range(lo, hi):
             if i + 1 < hi and self._closed_ts[i + 1] == self._closed_ts[i]:
-                continue  # trades sharing an exit_ts age out together
+                continue  # trades sharing a t_e age out together
             if math.fsum(self._closed_pnl[i + 1 : hi]) >= threshold:
                 return self._closed_ts[i] + self._window_ms
         return None
@@ -206,9 +257,14 @@ class CircuitBreakers:
 
     def _halt_sentence(self, ts: int, equity: float, pnl: float) -> str:
         lo, hi = self._window_bounds(ts)
+        shifted = ""
+        if self._uncertainty_ms:
+            shifted = (
+                f" (each exit counted from its recorded time + {_hours(self._uncertainty_ms)})"
+            )
         return (
-            f"All entries are halted because trades {_ids(self._closed_ids[lo:hi])} closed in the "
-            f"{self._cfg.loss_window_days:g} days to {ms_to_iso(ts)} realized {pnl:.2f}, below "
-            f"the -{self._cfg.weekly_loss_limit_pct:g}% limit of {self.halt_threshold(equity):.2f} "
-            f"on equity {equity:.2f}."
+            f"All entries are halted because trades {_ids(self._closed_ids[lo:hi])} closed"
+            f"{shifted} in the {self._cfg.loss_window_days:g} days to {ms_to_iso(ts)} realized "
+            f"{pnl:.2f}, below the -{self._cfg.weekly_loss_limit_pct:g}% limit of "
+            f"{self.halt_threshold(equity):.2f} on equity {equity:.2f}."
         )

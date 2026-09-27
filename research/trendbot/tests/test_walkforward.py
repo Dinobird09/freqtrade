@@ -174,6 +174,8 @@ def test_ml_fit_is_invariant_to_test_period_candles(world, perturbed) -> None:
     ma, mb = a.entry_filter.ml, b.entry_filter.ml
     assert ma.model.coefficients() == mb.model.coefficients()
     assert (ma.threshold, ma.means, ma.stds) == (mb.threshold, mb.means, mb.stds)
+    # the adoption identity of the model (CONTRACT v2 A3) depends on TRAIN only
+    assert ma.fingerprint() == mb.fingerprint()
     assert a.n_train_candidates == b.n_train_candidates
     assert a.train_summary == b.train_summary
     assert a.test_summary != b.test_summary

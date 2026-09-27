@@ -16,11 +16,18 @@ Decision pipeline of :meth:`Gatekeeper.evaluate` (first failure wins; ``rule`` i
     4. R6     CorrelationGuard.check(pair, requested = the pair's R7 cap, open_risk)
     5. R8     structure.find_stop(candles, i, pair, cfg)
     6. L_ml_filter          entry_filter(pair, rows[i], check), only if a filter is given
-    7. L_expectancy_guard   journal_rules.risk_multiplier(...) over the trades CLOSED BEFORE
-                            decision_ts (``exit_ts < decision_ts``: a trade's ``exit_ts`` is
-                            the OPEN of its exit candle, so ``exit_ts == decision_ts`` would be
-                            an exit that happens after the decision)
+    7. L_expectancy_guard   journal_rules.risk_multiplier(..., exit_time_uncertainty_ms,
+                            decision_ts): only trades whose exit is CERTAIN at the decision,
+                            ``exit_ts + exit_time_uncertainty_ms <= decision_ts``
     R7  risk_pct = min(pair cap, R6 allowed) * guard multiplier   (can only ever shrink)
+
+Exit timing (CONTRACT.md v2 A2): R9 and the guard measure every exit from ``t_e = exit_ts +
+exit_time_uncertainty_ms``, the latest moment the exit can have filled. The gatekeeper owns ONE
+such offset and hands the same value to its ``CircuitBreakers`` and to
+``journal_rules.risk_multiplier``. The default is ``cfg.timeframe_ms``: backtest trades record
+``exit_ts`` as the OPEN of the exit candle while the fill happens somewhere inside it, so a
+bench then lasts at least ``bench_hours`` of real time after the fill. A live bot that journals
+real fill times passes ``exit_time_uncertainty_ms=0`` (or breakers built with 0).
 
 Timing (no look-ahead): the signal candle is ``candles[i]``; everything it tells us is known
 at its CLOSE, ``decision_ts = candles[i].ts + cfg.timeframe_ms``, which is also the OPEN of
@@ -30,18 +37,28 @@ prove that truncating the lists after ``i`` never changes the decision).
 Execution step :meth:`Gatekeeper.plan_fill` (after the order is filled or, in the
 backtest, at ``candles[i+1].open * (1 + slippage)``): refuses a fill that gapped through
 the stop (R8 "gapped through stop"), re-checks the stop-distance bounds against the ACTUAL
-fill (R8), sets ``target = fill + reward_risk * (fill - stop)`` and sizes the position with
-``sizing.size_for_pair`` on current realized equity (R7, size derived from the stop
-distance). The notional is additionally capped by the FREE cash (equity minus the cost of
-the other open positions): the quantity only ever shrinks, so the risk only ever decreases.
-If less than ``MIN_NOTIONAL`` of quote currency can be bought the entry is skipped
-(``X_capital``).
+fill (R8), then applies the cost-aware arithmetic of CONTRACT.md v2 A1 with fill ``E``, stop
+``S``, ``f = fee_rate``, ``s = slippage_pct / 100``::
+
+    L_u    = (E - S*(1-s)) + f*E + f*S*(1-s)        all-in loss per unit at the stop
+    qty    = equity * risk_pct / 100 / L_u          (sizing.size_for_pair; R7)
+    risk   = qty * L_u                              planned ALL-IN loss (risk_amount)
+    target = (E*(1+f) + reward_risk*L_u) / (1-f)    (sizing.cost_aware_target)
+
+so a stop filled at ``S*(1-s)`` loses exactly 1R after both fees and a take-profit wins exactly
+``reward_risk`` R after both fees: the 2:1 minimum holds NET of costs, and the price ratio
+``(target - E) / (E - S)`` is above ``reward_risk``. The notional is additionally capped by
+the FREE cash (equity minus the cost of the other open positions): the quantity only ever
+shrinks and ``risk_amount`` is recomputed as ``qty * L_u``, so the risk only ever decreases
+(the target is per unit and does not change). If less than ``MIN_NOTIONAL`` of quote
+currency can be bought the entry is skipped (``X_capital``).
 
 How the live bot uses it (one call per pair, pairs in sorted order, on every CLOSED 4H
 candle)::
 
     gk = Gatekeeper(cfg, events=load_events("events.csv"),
-                    breakers=CircuitBreakers.from_journal(read_journal(path), cfg))
+                    breakers=CircuitBreakers.from_journal(read_journal(path), cfg, 0))
+    # (live journals hold real fill times: offset 0; the guard then uses 0 as well)
     # when the exchange reports an exit (SL/TP): record it in the journal, then
     gk.on_trade_closed(trade, equity=equity_after_close)       # exits are never gated
     # at each 4H close (decision_ts == the close time of candles[-1]):
@@ -50,8 +67,9 @@ candle)::
     dec = gk.evaluate(pair, candles, rows, len(candles) - 1, open_risk, equity,
                       journal_closed_trades, entry_filter)
     if dec.allowed:
-        market buy; then plan = gk.plan_fill(pair, dec, market_price, fill_price, equity,
-                                             free_cash)
+        size the order with the EXPECTED fill (last price * (1 + slippage)), market buy;
+        then plan = gk.plan_fill(pair, dec, market_price, fill_price, equity, free_cash)
+        (the target and size are recomputed from the ACTUAL fill)
         if plan.ok: place stop at plan.stop and a limit take-profit at plan.target, record
                     open_risk[pair] = dec.risk_pct (the R6 budget reserved by this trade)
         else: flatten immediately (the fill violated R8 / capital limits)
@@ -68,7 +86,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from .circuit_breakers import CircuitBreakers
+from .circuit_breakers import CircuitBreakers, validate_uncertainty_ms
 from .config import StrategyConfig
 from .correlation import CorrelationGuard
 from .journal_rules import risk_multiplier
@@ -84,7 +102,7 @@ from .models import (
 )
 from .news import NewsCalendar
 from .signals import GATE_RULE_IDS, check_entry
-from .sizing import max_risk_pct, size_for_pair
+from .sizing import cost_aware_target, loss_per_unit, max_risk_pct, size_for_pair
 from .structure import find_stop
 
 
@@ -138,17 +156,37 @@ def _px(x: float) -> str:
 
 
 class Gatekeeper:
-    """Holds the stateful rule objects (news calendar, breakers, correlation guard)."""
+    """Holds the stateful rule objects (news calendar, breakers, correlation guard).
+
+    ``exit_time_uncertainty_ms`` (A2) is shared by the R9 breakers and the expectancy guard.
+    ``None`` (default) means: take it from ``breakers`` if given, else ``cfg.timeframe_ms``
+    (the backtest convention). Passing both with different offsets is an error, so the two
+    R9-style rules can never measure exits from different times.
+    """
 
     def __init__(
         self,
         cfg: StrategyConfig,
         events: Iterable[NewsEvent] = (),
         breakers: CircuitBreakers | None = None,
+        exit_time_uncertainty_ms: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.news = NewsCalendar(events, cfg)
-        self.breakers = breakers if breakers is not None else CircuitBreakers(cfg)
+        if exit_time_uncertainty_ms is None:
+            exit_time_uncertainty_ms = (
+                breakers.exit_time_uncertainty_ms if breakers is not None else cfg.timeframe_ms
+            )
+        self.exit_time_uncertainty_ms = validate_uncertainty_ms(exit_time_uncertainty_ms)
+        if breakers is None:
+            breakers = CircuitBreakers(cfg, exit_time_uncertainty_ms=self.exit_time_uncertainty_ms)
+        elif breakers.exit_time_uncertainty_ms != self.exit_time_uncertainty_ms:
+            raise ValueError(
+                f"breakers use exit_time_uncertainty_ms={breakers.exit_time_uncertainty_ms} but "
+                f"the gatekeeper was given {self.exit_time_uncertainty_ms}: R9 and the "
+                "expectancy guard must measure exits from the same time"
+            )
+        self.breakers = breakers
         self.correlation = CorrelationGuard(cfg)
 
     # ------------------------------------------------------------------ state
@@ -222,11 +260,15 @@ class Gatekeeper:
     def guard_multiplier(
         self, pair: str, decision_ts: int, closed_trades: Sequence[Trade]
     ) -> float:
-        """L_expectancy_guard multiplier from trades closed strictly before ``decision_ts``."""
-        if not self.cfg.expectancy_guard:
-            return 1.0
-        known = [t for t in closed_trades if t.exit_ts is not None and t.exit_ts < decision_ts]
-        return risk_multiplier(known, pair, self.cfg)
+        """L_expectancy_guard multiplier from the trades whose exit is certain at the decision
+        (``exit_ts + exit_time_uncertainty_ms <= decision_ts``, the same offset as R9)."""
+        return risk_multiplier(
+            closed_trades,
+            pair,
+            self.cfg,
+            exit_time_uncertainty_ms=self.exit_time_uncertainty_ms,
+            decision_ts=decision_ts,
+        )
 
     # ------------------------------------------------------------------ execution
     def plan_fill(
@@ -238,11 +280,13 @@ class Gatekeeper:
         equity: float,
         free_cash: float,
     ) -> FillPlan:
-        """Turn an allowed decision and an actual fill into stop, target and size.
+        """Turn an allowed decision and an actual fill into stop, target and size (A1).
 
         ``market_price`` is the price the order met (backtest: the fill candle's open) and
         ``fill_price`` the executed price incl. slippage. Refuses (R8) a fill at or below the
-        stop and a stop distance outside the configured bounds measured from the fill.
+        stop and a stop distance outside the configured bounds measured from the fill. The
+        size makes a stop fill at ``stop * (1 - slippage)`` lose exactly ``risk_amount`` after
+        both fees; the target makes a take-profit win exactly ``reward_risk * risk_amount``.
         """
         if not decision.allowed or decision.stop_plan is None:
             raise ValueError("plan_fill needs an allowed EntryDecision with a stop plan")
@@ -264,7 +308,7 @@ class Gatekeeper:
                 f"outside [{cfg.min_stop_distance_pct:g}%, {cfg.max_stop_distance_pct:g}%]",
             )
         sizing = size_for_pair(pair, equity, fill_price, stop, decision.risk_pct, cfg)
-        sizing = _cap_to_free_cash(sizing, fill_price, equity, free_cash, cfg.fee_rate)
+        sizing = _cap_to_free_cash(sizing, fill_price, stop, equity, free_cash, cfg)
         if sizing is None or sizing.notional < MIN_NOTIONAL:
             return FillPlan(
                 False,
@@ -272,11 +316,12 @@ class Gatekeeper:
                 f"{pair}: free cash {max(free_cash, 0.0):.2f} buys less than the "
                 f"{MIN_NOTIONAL:g} minimum order",
             )
-        target = fill_price + cfg.reward_risk * (fill_price - stop)
+        target = cost_aware_target(fill_price, stop, cfg)
+        price_rr = (target - fill_price) / (fill_price - stop)
         reason = (
             f"{pair} filled at {_px(fill_price)}: stop {_px(stop)} ({dist:.2f}%), target "
-            f"{_px(target)} ({cfg.reward_risk:g}R), qty {sizing.qty:.8g}, risk "
-            f"{sizing.risk_pct:.4g}%"
+            f"{_px(target)} ({cfg.reward_risk:g}R net of fees and slippage, {price_rr:.3f}:1 in "
+            f"price), qty {sizing.qty:.8g}, all-in risk {sizing.risk_pct:.4g}%"
             + (f" (capped by {sizing.capped_by})" if sizing.capped_by else "")
         )
         return FillPlan(True, R7, reason, fill_price, stop, target, sizing)
@@ -335,19 +380,28 @@ class Gatekeeper:
 
 
 def _cap_to_free_cash(
-    sizing: SizingResult, entry: float, equity: float, free_cash: float, fee_rate: float
+    sizing: SizingResult,
+    entry: float,
+    stop: float,
+    equity: float,
+    free_cash: float,
+    cfg: StrategyConfig,
 ) -> SizingResult | None:
-    """Shrink ``sizing`` so notional plus entry fee fits in ``free_cash`` (None if nothing fits)."""
+    """Shrink ``sizing`` so notional plus entry fee fits in ``free_cash`` (None if nothing fits).
+
+    The all-in risk is recomputed as ``qty * L_u`` (A1), so it can only go down.
+    """
+    fee_rate = cfg.fee_rate
     if sizing.notional * (1 + fee_rate) <= free_cash:
         return sizing
     if free_cash <= 0:
         return None
-    qty = free_cash / (entry * (1 + fee_rate))
+    qty = min(sizing.qty, free_cash / (entry * (1 + fee_rate)))
     while qty > 0 and qty * entry * (1 + fee_rate) > free_cash:
         qty = math.nextafter(qty, 0.0)
     if qty <= 0:
         return None
-    risk_amount = qty * sizing.stop_distance
+    risk_amount = qty * loss_per_unit(entry, stop, cfg)
     return SizingResult(
         qty=qty,
         risk_amount=risk_amount,

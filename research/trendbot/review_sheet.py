@@ -4,9 +4,10 @@ Adoption step 3 requires a human to review the ACTUAL trades, not just summary s
 :func:`write_review_pack` writes two files into ``out_dir``:
 
 - ``trades_review.csv``: one row per trade in entry order (``entry_ts``, then ``trade_id``)
-  with the numbers a reviewer needs to check a trade by hand (planned RR, the pair's risk
-  cap, notional, hold time), the trade's features, the machine sanity flags, and EMPTY
-  ``reviewer_ok`` (Y/N) and ``reviewer_note`` columns for the reviewer's verdict.
+  with the numbers a reviewer needs to check a trade by hand (planned RR by price AND net
+  of costs, the pair's risk cap, notional, hold time), the trade's features, the machine
+  sanity flags, and EMPTY ``reviewer_ok`` (Y/N) and ``reviewer_note`` columns for the
+  reviewer's verdict.
 - ``trades_review.md``: header and counts, the statement that EVERY row must be inspected,
   a per-window summary (TRAIN | TEST side by side when a walk-forward split is given), the
   table of all trades, the flagged trades, the rule-denial counts and a sign-off block.
@@ -14,6 +15,19 @@ Adoption step 3 requires a human to review the ACTUAL trades, not just summary s
 :func:`auto_flags` are sanity checks that HELP the reviewer; they never replace the review.
 An unflagged trade is not an approved trade. Each flag is ``"<code>: <detail>"`` where
 ``<code>`` is one of :data:`FLAG_CODES`.
+
+Cost-aware risk (CONTRACT.md v2 A1): ``risk_amount = qty * L_u`` with the all-in loss per
+unit ``L_u = (entry - S_x) + fee*entry + fee*S_x`` and ``S_x = stop * (1 - slippage)``, and
+the target nets exactly ``reward_risk`` times that risk. The sheet therefore reports two
+planned reward:risk numbers:
+
+- ``planned_rr_price = (target - entry) / (entry - stop)`` (chart distances), and
+- ``planned_rr_net = (qty*(target - entry) - fee*qty*(entry + target)) / risk_amount``
+  (what a TP actually earns in R after both fees).
+
+A trade is flagged if EITHER is below ``cfg.reward_risk`` (the 2:1 minimum holds net of
+costs). A clean stop-out is exactly -1R, so losses worse than -1.05R (gap-through or
+slippage beyond the cost model) and wins above ``reward_risk + 0.01`` R are flagged.
 
 Window labels: with ``split_ts`` a trade is ``TRAIN`` if ``signal_ts < split_ts`` and
 ``TEST`` otherwise (entries are windowed by their signal candle, like the backtester);
@@ -36,6 +50,7 @@ from pathlib import Path
 from .config import RULE_IDS, ConfigError, StrategyConfig
 from .journal import FEATURE_PREFIX, iso_to_ms, ms_to_iso, read_journal
 from .models import EXIT_END, EXIT_SL, EXIT_TP, HOUR_MS, Trade
+from .sizing import loss_per_unit, stop_fill_price
 
 
 CSV_NAME = "trades_review.csv"
@@ -61,7 +76,8 @@ HEAD_COLUMNS: tuple[str, ...] = (
     "stop",
     "target",
     "stop_method",
-    "planned_rr",
+    "planned_rr_price",
+    "planned_rr_net",
     "risk_pct",
     "pair_cap_pct",
     "qty",
@@ -78,11 +94,12 @@ TAIL_COLUMNS: tuple[str, ...] = ("ml_prob", "notes", "auto_flags", "reviewer_ok"
 REVIEWER_COLUMNS = ("reviewer_ok", "reviewer_note")
 FLAG_SEPARATOR = "; "
 
-# Outcome thresholds (in R). Under the exit model an SL loses about 1R plus costs and a TP
-# wins reward_risk R minus costs, so anything outside these bands needs a human look.
-LOSS_OUTLIER_R = -1.25
-WIN_SLACK_R = 0.25
-GAP_SLACK_R = 0.25  # a loss this far beyond a normal cost-model stop-out is a gap/slippage
+# Outcome thresholds (in R). With cost-aware sizing (A1) a clean SL fill at
+# stop*(1-slippage) is exactly -1R and a TP is exactly +reward_risk R, so anything outside
+# these narrow bands needs a human look.
+LOSS_OUTLIER_R = -1.05  # worse than this: gap-through or slippage beyond the cost model
+WIN_SLACK_R = 0.01  # a win above reward_risk + this is impossible under the exit model
+GAP_SLACK_R = 0.05  # a loss this far beyond a normal cost-model stop-out is a gap/slippage
 _REL_TOL = 1e-6
 _ABS_TOL = 1e-9
 
@@ -175,11 +192,31 @@ def flag_code(flag: str) -> str:
 
 
 def planned_rr(trade: Trade) -> float | None:
-    """(target - entry) / (entry - stop), or ``None`` if the stop is not below the entry."""
+    """PRICE reward:risk ``(target - entry) / (entry - stop)``, or ``None`` if the stop is not
+    below the entry."""
     risk = trade.entry_price - trade.stop
     if not (math.isfinite(risk) and risk > 0):
         return None
     return (trade.target - trade.entry_price) / risk
+
+
+def planned_net_rr(trade: Trade, cfg: StrategyConfig) -> float | None:
+    """NET reward:risk of a TP fill at the target (A1), in R of the planned all-in risk:
+    ``(qty*(target - entry) - fee*qty*(entry + target)) / risk_amount``.
+
+    ``None`` if ``qty`` or ``risk_amount`` is not positive or a value is not finite.
+    """
+    qty, risk_amount = trade.qty, trade.risk_amount
+    if not (math.isfinite(qty) and qty > 0 and math.isfinite(risk_amount) and risk_amount > 0):
+        return None
+    entry, target = trade.entry_price, trade.target
+    net = qty * (target - entry) - cfg.fee_rate * qty * (entry + target)
+    return net / risk_amount if math.isfinite(net) else None
+
+
+def planned_risk_amount(trade: Trade, cfg: StrategyConfig) -> float:
+    """The all-in risk the trade's qty implies under A1: ``qty * L_u`` (see module doc)."""
+    return trade.qty * loss_per_unit(trade.entry_price, trade.stop, cfg)
 
 
 def hold_hours(trade: Trade) -> float | None:
@@ -191,11 +228,12 @@ def hold_hours(trade: Trade) -> float | None:
 
 def expected_sl_r(trade: Trade, cfg: StrategyConfig) -> float | None:
     """R of a NORMAL stop-out under the cost model: fill at ``stop * (1 - slippage)``, fees
-    ``fee_rate`` on both sides. Tight stops make this worse than -1R (costs vs distance).
+    ``fee_rate`` on both sides. Exactly -1R for a cost-aware sized trade (A1); worse than
+    -1R only if ``risk_amount`` left the costs out (legacy price-only sizing).
     ``None`` if the trade has no positive planned risk."""
     if not (trade.risk_amount > 0 and trade.qty > 0):
         return None
-    fill = trade.stop * (1 - cfg.slippage_pct / 100.0)
+    fill = stop_fill_price(trade.stop, cfg)
     fees = cfg.fee_rate * trade.qty * (trade.entry_price + fill)
     return (trade.qty * (fill - trade.entry_price) - fees) / trade.risk_amount
 
@@ -230,8 +268,11 @@ def _non_finite_flags(trade: Trade) -> list[str]:
     return [f"{FLAG_NON_FINITE}: non-finite {', '.join(bad)}"] if bad else []
 
 
+def _below(rr: float | None, required: float) -> bool:
+    return rr is not None and rr < required and not _close(rr, required)
+
+
 def _level_flags(trade: Trade, cfg: StrategyConfig) -> list[str]:
-    flags: list[str] = []
     entry, stop, target = trade.entry_price, trade.stop, trade.target
     problems = []
     if stop >= entry:
@@ -239,24 +280,42 @@ def _level_flags(trade: Trade, cfg: StrategyConfig) -> list[str]:
     if target <= entry:
         problems.append(f"target {_num(target, 6)} <= entry {_num(entry, 6)}")
     if problems:
-        flags.append(f"{FLAG_BAD_LEVELS}: {' and '.join(problems)} (not a valid long)")
-    rr = planned_rr(trade)
-    if rr is not None and not _close(rr, cfg.reward_risk):
-        if rr < cfg.reward_risk:
-            flags.append(
-                f"{FLAG_RR_BELOW}: planned RR {_num(rr, 4)} < required {_num(cfg.reward_risk, 2)}"
-            )
-        else:
-            flags.append(
-                f"{FLAG_RR_ABOVE}: planned RR {_num(rr, 4)} != configured "
-                f"{_num(cfg.reward_risk, 2)} (target not derived from this config)"
-            )
-    if stop < entry and not _close(trade.risk_amount, trade.qty * (entry - stop)):
-        flags.append(
-            f"{FLAG_SIZE}: risk_amount {_num(trade.risk_amount, 4)} != qty*(entry-stop) "
-            f"{_num(trade.qty * (entry - stop), 4)} (size not derived from the stop distance)"
-        )
-    return flags
+        return [f"{FLAG_BAD_LEVELS}: {' and '.join(problems)} (not a valid long)"]
+    return []
+
+
+def _rr_flags(trade: Trade, cfg: StrategyConfig) -> list[str]:
+    """2:1 minimum by price AND net of costs; a net RR above the config is a wrong config."""
+    required = cfg.reward_risk
+    price_rr, net_rr = planned_rr(trade), planned_net_rr(trade, cfg)
+    below = [
+        f"{name} RR {_num(rr, 4)}"
+        for name, rr in (("net", net_rr), ("price", price_rr))
+        if _below(rr, required)
+    ]
+    if below:
+        return [
+            f"{FLAG_RR_BELOW}: planned {' and '.join(below)} < required {_num(required, 2)} "
+            "(the minimum must hold net of fees and slippage)"
+        ]
+    if net_rr is not None and net_rr > required and not _close(net_rr, required):
+        return [
+            f"{FLAG_RR_ABOVE}: planned net RR {_num(net_rr, 4)} != configured "
+            f"{_num(required, 2)} (target not derived from this config and its costs)"
+        ]
+    return []
+
+
+def _size_flags(trade: Trade, cfg: StrategyConfig) -> list[str]:
+    if not trade.stop < trade.entry_price:
+        return []
+    want = planned_risk_amount(trade, cfg)
+    if _close(trade.risk_amount, want):
+        return []
+    return [
+        f"{FLAG_SIZE}: risk_amount {_num(trade.risk_amount, 4)} != qty*all-in loss per unit "
+        f"{_num(want, 4)} (size not derived from the stop distance and costs)"
+    ]
 
 
 def _risk_flags(trade: Trade, cfg: StrategyConfig) -> list[str]:
@@ -307,18 +366,21 @@ def _missing_exit_flags(trade: Trade) -> list[str]:
 
 
 def _loss_outlier_flag(trade: Trade, cfg: StrategyConfig, r: float) -> str:
-    """Name the likely cause: a gap/slippage outlier, or costs that are large versus a tight
-    stop (then EVERY stop-out of that trade is worse than -1.25R, i.e. realised risk exceeds
-    the planned risk)."""
+    """Name the likely cause: a gap-through or slippage beyond the cost model (a cost-aware
+    stop-out is exactly -1R), or a ``risk_amount`` that left the costs out (then EVERY
+    stop-out of that trade is worse than -1.05R, i.e. realised risk exceeds planned risk)."""
     expected = expected_sl_r(trade, cfg)
     head = f"{FLAG_LOSS_OUTLIER}: loss {_signed(r)}R worse than {_signed(LOSS_OUTLIER_R, 2)}R"
     if expected is None:
-        return f"{head} (gap-through or slippage outlier)"
+        return f"{head} (gap-through or slippage beyond the cost model)"
     if r < expected - GAP_SLACK_R or expected >= LOSS_OUTLIER_R:
-        return f"{head} (a normal stop-out would be {_signed(expected)}R: gap-through or slippage)"
+        return (
+            f"{head} (a normal stop-out would be {_signed(expected)}R: gap-through or slippage "
+            "beyond the cost model)"
+        )
     return (
-        f"{head} (a normal stop-out already costs {_signed(expected)}R: fees and slippage are "
-        "large versus the stop distance)"
+        f"{head} (a normal stop-out already costs {_signed(expected)}R: risk_amount leaves out "
+        "fees and slippage, so the size was not cost-aware)"
     )
 
 
@@ -376,16 +438,19 @@ def auto_flags(trade: Trade, cfg: StrategyConfig) -> list[str]:
 
     They HELP the human reviewer and never replace the review. ``cfg`` must be the config
     the trades were generated with (the RR checks use ``cfg.reward_risk``). Checks, in order:
-    non-finite numbers; stop >= entry or target <= entry; planned RR below (or, a sign the
-    wrong config was passed, above) ``cfg.reward_risk``; ``risk_amount`` not equal to
-    ``qty * (entry - stop)``; unknown pair; ``risk_pct`` above the pair cap; entry before the
-    signal candle closed (look-ahead); exit before entry; zero hold time (exit in the fill
-    candle); missing or incomplete exit; window-end forced exit (``END``); loss worse than
-    -1.25R; win above ``reward_risk + 0.25`` R; ``r_multiple != pnl / risk_amount``; SL/TP
-    outcomes the exit model cannot produce. Returns ``[]`` for a clean trade.
+    non-finite numbers; stop >= entry or target <= entry; planned net OR price RR below
+    ``cfg.reward_risk`` (or, a sign the wrong config or costs were passed, net RR above it);
+    ``risk_amount`` not equal to ``qty * L_u`` (cost-aware size, A1); unknown pair;
+    ``risk_pct`` above the pair cap; entry before the signal candle closed (look-ahead); exit
+    before entry; zero hold time (exit in the fill candle); missing or incomplete exit;
+    window-end forced exit (``END``); loss worse than -1.05R; win above
+    ``reward_risk + 0.01`` R; ``r_multiple != pnl / risk_amount``; SL/TP outcomes the exit
+    model cannot produce. Returns ``[]`` for a clean trade.
     """
     flags = _non_finite_flags(trade)
     flags += _level_flags(trade, cfg)
+    flags += _rr_flags(trade, cfg)
+    flags += _size_flags(trade, cfg)
     flags += _risk_flags(trade, cfg)
     flags += _time_flags(trade, cfg)
     flags += _missing_exit_flags(trade)
@@ -426,7 +491,8 @@ def review_row(
         "stop": _num(trade.stop, 6),
         "target": _num(trade.target, 6),
         "stop_method": trade.stop_method,
-        "planned_rr": _num(planned_rr(trade), 4),
+        "planned_rr_price": _num(planned_rr(trade), 4),
+        "planned_rr_net": _num(planned_net_rr(trade, cfg), 4),
         "risk_pct": _num(trade.risk_pct, 4),
         "pair_cap_pct": _num(pair_cap_pct(trade.pair, cfg), 4),
         "qty": _num(trade.qty, 8),
@@ -470,7 +536,8 @@ _MD_TRADE_COLUMNS = (
     ("stop", "stop"),
     ("target", "target"),
     ("stop method", "stop_method"),
-    ("RR", "planned_rr"),
+    ("RR price", "planned_rr_price"),
+    ("RR net", "planned_rr_net"),
     ("risk %", "risk_pct"),
     ("cap %", "pair_cap_pct"),
     ("exit", "exit_price"),
@@ -522,7 +589,15 @@ def _header_lines(
             "TEST = at or after it)"
         )
     lines.append(
-        f"- Config: `{cfg.variant_id()}`, reward:risk {_num(cfg.reward_risk, 2)}, risk caps {caps}"
+        f"- Config: `{cfg.variant_id()}`, reward:risk {_num(cfg.reward_risk, 2)} (net of costs), "
+        f"risk caps {caps}"
+    )
+    lines.append(
+        f"- Costs: fee {_num(cfg.fee_rate * 100, 4)}% per side, slippage "
+        f"{_num(cfg.slippage_pct, 4)}% on market fills (entry and stop), exchange "
+        f"`{_md_cell(cfg.exchange_id)}`. Risk is the ALL-IN loss at the stop, so a clean "
+        "stop-out is -1R and a TP is +reward:risk R; `RR price` is the chart-distance ratio, "
+        "`RR net` what a TP earns after both fees."
     )
     if cfg.is_test_only:
         lines.append(
@@ -704,11 +779,30 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="reward:risk the trades were generated with (default: the config default)",
     )
+    parser.add_argument(
+        "--fee-rate",
+        type=float,
+        default=None,
+        help="fee per side (fraction) the trades were generated with (default: config default)",
+    )
+    parser.add_argument(
+        "--slippage-pct",
+        type=float,
+        default=None,
+        help="slippage in percent the trades were generated with (default: config default)",
+    )
     args = parser.parse_args(argv)
+    changes = {
+        name: value
+        for name, value in (
+            ("reward_risk", args.reward_risk),
+            ("fee_rate", args.fee_rate),
+            ("slippage_pct", args.slippage_pct),
+        )
+        if value is not None
+    }
     try:
-        cfg = StrategyConfig()
-        if args.reward_risk is not None:
-            cfg = cfg.with_changes(reward_risk=args.reward_risk)
+        cfg = StrategyConfig().with_changes(**changes)
     except ConfigError as exc:
         parser.error(str(exc))
     try:
