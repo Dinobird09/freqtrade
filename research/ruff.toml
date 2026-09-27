@@ -1,0 +1,12 @@
+# Research package lint config: inherit the repo-wide ruff settings, then relax the
+# rules that do not apply to offline research code (seeded PRNGs, pytest asserts).
+extend = "../pyproject.toml"
+
+[lint.per-file-ignores]
+"trendbot/**.py" = [
+  "S311",  # seeded random.Random is used for reproducible synthetic data / bootstrap, not crypto
+]
+"trendbot/tests/**.py" = [
+  "S101",  # allow assert in tests
+  "S311",
+]
