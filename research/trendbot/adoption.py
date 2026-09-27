@@ -4,59 +4,115 @@ The ONLY way from research to live trading is, strictly in this order::
 
     BACKTEST -> WALK_FORWARD -> HUMAN_REVIEW -> TESTNET (>= 14 days, Binance testnet) -> LIVE
 
-A good backtest number never shortcuts the path. Promotion to a stage is allowed only when
-every EARLIER stage is complete and consistent, and the config being promoted is exactly the
-config that was tested (sha256 :func:`config_fingerprint`). :func:`check_promotion` returns
-the blocking :class:`~.models.Decision` list (empty = allowed); a live bot must call
-:func:`require_stage` with ``"LIVE"`` at startup and refuse to trade if it raises.
+A good backtest number never shortcuts the path. :func:`check_promotion` returns every
+blocking :class:`~.models.Decision` for promoting a record to a target stage (empty list =
+allowed): every EARLIER stage must be complete and consistent with its evidence files, and
+the config being promoted must be exactly the config that was tested (sha256
+:func:`config_fingerprint`). A live bot must call :func:`require_stage` with ``"LIVE"`` at
+startup and refuse to trade if it raises.
 
-What "complete" means (every item is a separate blocking reason, rule ``ADOPT_<stage>``):
+Evidence binding (CONTRACT.md v3 C3). Relative paths in the record are resolved against
+``base_dir`` (the CLI passes the record file's directory; ``None`` means the current working
+directory, so the files are ALWAYS checked); absolute paths are used as they are. A
+"hash-bound" file must be recorded with its ``*_sha256`` field, exist, and have exactly that
+sha256 (:func:`sha256_file`; ``python -m research.trendbot.adoption hash FILE`` prints it).
 
-- BACKTEST: ``report_path`` set; ``completed_utc`` a valid time not after the check time.
-- WALK_FORWARD: ``label`` exactly ``"ROBUST"`` (TRAIN-ONLY, UNTESTED and NO-EDGE all block);
-  ``dd_ok`` exactly ``true``; ``split_utc`` valid; ``train_n``/``test_n`` positive;
-  ``test_avg_r`` > 0 (expectancy, never win rate); ``report_path`` set.
-- HUMAN_REVIEW: a named ``reviewer``; ``date_utc`` valid, not before the backtest completed;
-  ``trades_reviewed == trades_total > 0`` and ``trades_total == train_n + test_n`` (EVERY
-  walk-forward trade was looked at); ``approved`` exactly ``true``.
-- TESTNET: ``exchange == "binance-testnet"``; ``end_utc - start_utc >= 14 days``;
-  ``end_utc`` not after the check time; ``start_utc`` not before the review sign-off (the
-  testnet run is of the APPROVED variant); ``trades >= 1`` (otherwise the order, stop and
-  exit handling was never exercised); ``rule_violations`` recorded as exactly 0;
-  ``journal_path`` set.
-- LIVE (checked only when promoting to LIVE): the config is not an explicit test-only
-  variant (R4 regime filter off never trades live); ``live.enabled_utc``, if already
-  recorded, is not before the testnet run ended.
-- Always: ``variant`` named (``ADOPT_record``) and ``config_fingerprint`` equal to
-  ``config_fingerprint(cfg)`` (``ADOPT_fingerprint``).
-- Always, ML model (``ADOPT_fingerprint``, CONTRACT.md v2 A3): if the record has a
-  ``model_fingerprint`` (a sha256 hex digest, ``MLFilter.fingerprint()``) the caller must supply
-  the fingerprint of the model it is promoting and the two must be equal; a variant whose id
-  contains ``"+ml"`` must have a recorded ``model_fingerprint``; and a model fingerprint may
-  not be supplied for a record that has none (that model was never tested under the record).
+What IS verified, by target stage (each item is a separate blocking reason, rule id in
+brackets; a stage with nothing recorded yields one "no recorded result" reason instead):
 
-Evidence files. With ``base_dir`` (the CLI always passes the record file's directory) the
-referenced files must exist; relative paths are resolved against ``base_dir``. The testnet
-journal (``journal.write_journal`` format) is then cross-checked against the record: its
-trade count must equal ``testnet.trades``, every entry must lie inside the testnet window,
-every trade must carry the record's ``variant``, and no trade may carry a mandatory-rule
-flag from ``review_sheet.auto_flags`` (:data:`RULE_VIOLATION_FLAGS`), so a hand-typed
-``rule_violations: 0`` cannot hide a violation the journal shows. (A live bot must round
-quantities DOWN and take-profit prices UP to the exchange tick so R7 and the 2:1 minimum
-hold after rounding.)
+- Always: ``variant`` named [ADOPT_record]; ``config_fingerprint`` equals
+  ``config_fingerprint(cfg)`` [ADOPT_fingerprint]; ML model (CONTRACT.md v2 A3,
+  [ADOPT_fingerprint]): a recorded ``model_fingerprint`` (``MLFilter.fingerprint()``) must be
+  a sha256 hex digest equal to the one the caller supplies, a variant whose id contains
+  ``"+ml"`` must have one, and none may be supplied for a record without one.
+- Target WALK_FORWARD or later (the BACKTEST stage is checked):
+  [ADOPT_backtest] ``report_path`` hash-bound by ``report_sha256``; ``completed_utc`` a
+  valid time not after the check time. [ADOPT_provenance] every ``data_files`` entry
+  (``{path: sha256}``) and the ``events_file`` (``{path, sha256}``, if recorded) is
+  hash-bound.
+- Target HUMAN_REVIEW or later (the WALK_FORWARD stage is checked): [ADOPT_provenance]
+  ``provenance`` exactly ``"real"`` (``"synthetic:<world>:<seed>"`` and a missing value are
+  blocked) and at least one data file hash recorded. [ADOPT_walk_forward] ``label`` exactly
+  ``"ROBUST"``; ``dd_ok`` exactly true; ``split_utc`` valid; ``train_n``/``test_n``
+  positive and, for ROBUST, both >= 30 whatever ``min_train``/``min_test`` say;
+  ``test_avg_r`` > 0 (expectancy, never win rate); ``train_avg_r`` recorded;
+  ``min_train``/``min_test`` positive integers; ``label_params`` a JSON object;
+  ``report_path`` exists; both journals hash-bound
+  (``train_journal_path``/``_sha256``, ``test_journal_path``/``_sha256``) and re-parsed with
+  ``journal.read_journal``: closed trades only, unique trade ids, every trade of the
+  record's variant, TRAIN signals before ``split_utc`` and TEST signals at or after it.
+  Then ``metrics.summarize`` (starting equity ``cfg.starting_capital``), ``metrics.label``
+  (recorded ``min_train``/``min_test``) and ``metrics.dd_check`` are recomputed from the
+  journals (:func:`recompute_walk_forward`; each ``label_params`` entry is passed to every
+  one of those three functions that declares a parameter of that name, an entry none
+  declares blocks, and ``max_dd_pct`` defaults to and may not exceed 20). The typed
+  ``label``, ``train_n``, ``test_n``, ``train_avg_r``, ``test_avg_r`` (absolute 1e-9) and
+  ``dd_ok`` must equal the recomputed values.
+- Target TESTNET or later (the HUMAN_REVIEW stage is checked): [ADOPT_human_review] a named
+  ``reviewer``; ``date_utc`` valid and not before the backtest completed;
+  ``trades_reviewed == trades_total == train_n + test_n``; ``approved`` exactly true;
+  ``review_path`` (the pack's ``trades_review.csv``) hash-bound by ``review_sha256`` and
+  parsed with ``review_sheet.load_review``; its row count equals ``train_n + test_n``; its
+  ``(window, trade_id)`` key set equals the TRAIN journal's ``TRAIN`` keys plus the TEST
+  journal's ``TEST`` keys, and each row's pair and signal time equal its journal trade's;
+  every ``reviewer_ok`` is ``Y`` or ``N`` (a blank blocks). Any ``N`` blocks, and the
+  documented policy is: the variant is revised and restarts the adoption path at BACKTEST
+  under a new record (a changed config has a new fingerprint), so a record with a rejected
+  trade never passes HUMAN_REVIEW.
+- Target LIVE (the TESTNET stage is checked): [ADOPT_testnet] ``exchange ==
+  "binance-testnet"``; ``end_utc - start_utc >= 14 days``; ``end_utc`` not after the check
+  time; ``start_utc`` not before the review sign-off; ``trades >= 1``; ``rule_violations``
+  exactly 0; ``journal_path`` exists and is re-parsed: its trade count equals
+  ``testnet.trades``, every entry lies inside the window, every trade is of the record's
+  variant, no trade carries a per-trade mandatory-rule flag of ``review_sheet.auto_flags``
+  (:data:`RULE_VIOLATION_FLAGS`), and ``invariants.cross_trade_violations`` over the journal
+  with exit offset 0 (real fill times; 7-day halt on ``cfg.starting_capital``) finds
+  nothing: R6 (no pyramiding, BNB never stacks, no concurrent full-size cluster risk, the
+  shared budget respected) and R9 (no entry inside a 3-SL bench, every bench >= 24h, no
+  entry during a 7-day loss halt). R5 is checked the same way only if ``testnet.events_path``
+  is recorded (hash-bound by ``events_sha256``, read with ``news.load_events``); otherwise a
+  blocking reason and :func:`unverified_notes` state that R5 is not journal-verifiable.
+  [ADOPT_live] the config is not an explicit test-only variant (R4 regime filter off never
+  trades live); ``live.enabled_utc``, if recorded, is not before the testnet run ended.
 
-Record file (JSON, written by :func:`save_record`, every value ``null`` until filled in;
-times are ISO-8601 UTC strings such as ``"2024-03-12T12:30:00Z"``)::
+What is NOT verified (:func:`unverified_notes` lists the items relevant to a target; the
+CLI prints them under PASS and BLOCKED):
+
+- That the journals were produced by running the backtester on the hash-bound data files:
+  the hashes bind the files to the record, they do not prove how the files were made
+  (re-run ``run_research`` / ``python -m research.trendbot.invariants`` on the data to check).
+- The mark-to-market part of the drawdown rule (CONTRACT.md v3 C5) needs the candles:
+  ``dd_ok`` is recomputed only with ``metrics.dd_check`` on the closed-trade TEST summary.
+- ``walk_forward.report_path`` and ``testnet.journal_path`` carry no hash: the report is
+  only required to exist, and the testnet journal is re-audited on every check instead.
+- That the reviewer actually inspected each trade: the pack only proves every row got an
+  explicit ``Y``.
+- Per-candle rules of testnet trades (R1-R4 gates, R8 structure stops, fill prices) and,
+  without ``testnet.events_path``, R5: they need the candles or the news calendar.
+- That the testnet account really was a testnet (only the typed ``exchange`` is checked),
+  and hand-typed times beyond their format, order and not lying in the future.
+
+A live bot must also round quantities DOWN and take-profit prices UP to the exchange tick
+so R7 and the 2:1 minimum hold after rounding (not checkable from a record).
+
+Record file (JSON, written by :func:`save_record`; every value ``null`` until filled in;
+keys added by CONTRACT.md v2 A3 / v3 C3 are optional when loading, so older records still
+load, but the stages above require them; times are ISO-8601 UTC strings such as
+``"2024-03-12T12:30:00Z"``; sha256 values are 64 hex characters)::
 
     {"variant": "base", "config_fingerprint": "<sha256 hex>",
-     "model_fingerprint": "<sha256 hex>" or null (optional key; absent means null),
-     "backtest": {"report_path", "completed_utc"},
+     "model_fingerprint": "<sha256 hex>" or null,
+     "provenance": "real" or "synthetic:<world>:<seed>",
+     "data_files": {"<path>": "<sha256>", ...}, "events_file": {"path", "sha256"} or null,
+     "backtest": {"report_path", "completed_utc", "report_sha256"},
      "walk_forward": {"label", "dd_ok", "split_utc", "train_n", "test_n", "test_avg_r",
-                      "report_path"},
+                      "report_path", "train_journal_path", "train_journal_sha256",
+                      "test_journal_path", "test_journal_sha256", "min_train", "min_test",
+                      "train_avg_r", "label_params": {...}},
      "human_review": {"reviewer", "date_utc", "trades_reviewed", "trades_total", "approved",
-                      "notes"},
+                      "notes", "review_path", "review_sha256"},
      "testnet": {"exchange", "start_utc", "end_utc", "trades", "rule_violations",
-                 "journal_path", "notes"},
+                 "journal_path", "notes", "events_path", "events_sha256"},
      "live": {"enabled_utc"}}
 
 CLI::
@@ -66,10 +122,11 @@ CLI::
     python -m research.trendbot.adoption check --record rec.json --stage LIVE [--now ISO]
         [--config c.json] [--model-fingerprint HEX]
     python -m research.trendbot.adoption fingerprint [--config c.json]
+    python -m research.trendbot.adoption hash FILE [FILE ...]
 
 ``--config`` is a JSON object of ``StrategyConfig`` field overrides (validated: a loosening
 of a mandatory rule is refused); without it the default config is used. ``check`` prints
-``PASS`` or every blocking reason and exits 0 / 1.
+``PASS`` or every blocking reason, then what the check could not verify, and exits 0 / 1.
 """
 
 from __future__ import annotations
@@ -77,21 +134,26 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import inspect
 import json
 import math
 import string
 import sys
 import time
 import typing
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
 
+from . import metrics
 from .config import RULE_IDS, ConfigError, PairRisk, StrategyConfig
+from .invariants import cross_trade_violations
 from .journal import iso_to_ms, ms_to_iso, read_journal
-from .metrics import LABELS
-from .models import DAY_MS, Decision, Trade
+from .metrics import LABELS, Summary
+from .models import DAY_MS, Decision, NewsEvent, Trade
+from .news import load_events
 from .review_sheet import (
     FLAG_BAD_LEVELS,
     FLAG_LOOKAHEAD,
@@ -100,8 +162,14 @@ from .review_sheet import (
     FLAG_RISK_CAP,
     FLAG_RR_BELOW,
     FLAG_SIZE,
+    REVIEW_OK_NO,
+    REVIEW_OK_YES,
+    WINDOW_TEST,
+    WINDOW_TRAIN,
+    ReviewRow,
     auto_flags,
     flag_code,
+    load_review,
 )
 
 
@@ -115,6 +183,11 @@ STAGES: tuple[str, ...] = (BACKTEST, WALK_FORWARD, HUMAN_REVIEW, TESTNET, LIVE)
 REQUIRED_WF_LABEL = "ROBUST"
 TESTNET_EXCHANGE = "binance-testnet"
 TESTNET_MIN_DAYS = 14
+PROVENANCE_REAL = "real"
+SYNTHETIC_PROVENANCE_PREFIX = "synthetic:"  # "synthetic:<world>:<seed>"
+ROBUST_MIN_N = 30  # C3: ROBUST needs >= 30 trades in EACH window, whatever min_* say
+DD_CAP_PCT = 20.0  # C5: the TEST drawdown limit is never above 20 %
+AVG_R_TOL = 1e-9  # absolute tolerance of typed vs recomputed avg R
 
 ADOPT_RECORD = "ADOPT_record"
 ADOPT_FINGERPRINT = "ADOPT_fingerprint"
@@ -123,6 +196,7 @@ ADOPT_WALK_FORWARD = "ADOPT_walk_forward"
 ADOPT_HUMAN_REVIEW = "ADOPT_human_review"
 ADOPT_TESTNET = "ADOPT_testnet"
 ADOPT_LIVE = "ADOPT_live"
+ADOPT_PROVENANCE = "ADOPT_provenance"
 
 # Rule ids of this module. The single source of truth is config.RULE_IDS (which holds every
 # Decision.rule id of the package); this is the ADOPT_* slice of it, so the two cannot drift.
@@ -137,6 +211,7 @@ ADOPTION_RULE_IDS: Mapping[str, str] = MappingProxyType(
             ADOPT_HUMAN_REVIEW,
             ADOPT_TESTNET,
             ADOPT_LIVE,
+            ADOPT_PROVENANCE,
         )
     }
 )
@@ -167,15 +242,27 @@ RULE_VIOLATION_FLAGS = frozenset(
     }
 )
 
+REVIEW_REJECTION_POLICY = (
+    "the variant must be revised and restart the adoption path at BACKTEST under a new "
+    "record (a changed config has a new fingerprint), so this record can never pass "
+    "HUMAN_REVIEW"
+)
+R5_NOT_VERIFIABLE = (
+    "R5 (news blackout) was not checked because testnet.events_path is not recorded, and R5 "
+    "is not journal-verifiable without the news calendar the bot traded under"
+)
+
 _LABEL_WHY = {
     "TRAIN-ONLY": "the edge did not hold out of sample, a sign of curve-fitting",
     "UNTESTED": "too few trades, or a test expectancy not distinguishable from zero",
     "NO-EDGE": "the train window showed no positive expectancy to validate",
 }
 _MAX_IDS_SHOWN = 5
+_MAX_VIOLATIONS_SHOWN = 5
 _FP_SHOWN = 16
 ML_VARIANT_MARKER = "+ml"  # a variant id containing this (any case) runs an ML entry filter
 _SHA256_HEX_LEN = 64
+_HASH_CHUNK = 1 << 20
 
 
 # ---------------------------------------------------------------------------- fingerprint
@@ -203,6 +290,15 @@ def canonical_config_json(cfg: StrategyConfig) -> str:
 def config_fingerprint(cfg: StrategyConfig) -> str:
     """sha256 hex digest of :func:`canonical_config_json` (``pair_risk`` included)."""
     return hashlib.sha256(canonical_config_json(cfg).encode("utf-8")).hexdigest()
+
+
+def sha256_file(path: str | Path) -> str:
+    """sha256 hex digest of a file's bytes (the value every ``*_sha256`` field records)."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(_HASH_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def is_sha256_hex(value: object) -> bool:
@@ -288,9 +384,18 @@ def load_config(path: str | Path | None) -> StrategyConfig:
 
 # ---------------------------------------------------------------------------- record
 @dataclass(frozen=True, slots=True)
+class FileRef:
+    """A hash-bound evidence file: ``path`` (relative to the record's directory) + sha256."""
+
+    path: str | None = None
+    sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class BacktestStage:
     report_path: str | None = None
     completed_utc: str | None = None
+    report_sha256: str | None = None  # C3: binds the report file to the record
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +407,17 @@ class WalkForwardStage:
     test_n: int | None = None
     test_avg_r: float | None = None  # out-of-sample expectancy (R per trade)
     report_path: str | None = None
+    # C3 evidence: the journals the typed numbers above are recomputed from.
+    train_journal_path: str | None = None
+    train_journal_sha256: str | None = None
+    test_journal_path: str | None = None
+    test_journal_sha256: str | None = None
+    min_train: int | None = None  # metrics.label min_train used for the label
+    min_test: int | None = None  # metrics.label min_test used for the label
+    train_avg_r: float | None = None  # in-sample expectancy (R per trade)
+    # Extra keyword arguments of metrics.summarize / label / dd_check (C4 label parameters,
+    # C5 max_dd_pct); {} means their defaults. See recompute_walk_forward.
+    label_params: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +428,8 @@ class HumanReviewStage:
     trades_total: int | None = None
     approved: bool | None = None
     notes: str | None = None
+    review_path: str | None = None  # the filled-in trades_review.csv of the review pack
+    review_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +443,8 @@ class TestnetStage:
     rule_violations: int | None = None
     journal_path: str | None = None
     notes: str | None = None
+    events_path: str | None = None  # news calendar of the testnet run (enables the R5 audit)
+    events_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +458,9 @@ class AdoptionRecord:
     config_fingerprint: str
     # sha256 of the ML model that was tested (MLFilter.fingerprint()), None if no ML layer.
     model_fingerprint: str | None = None
+    provenance: str | None = None  # "real" or "synthetic:<world>:<seed>" (C3)
+    data_files: dict[str, str] | None = None  # candle file path -> sha256 (C3)
+    events_file: FileRef | None = None  # news calendar the backtest used, or None
     backtest: BacktestStage = field(default_factory=BacktestStage)
     walk_forward: WalkForwardStage = field(default_factory=WalkForwardStage)
     human_review: HumanReviewStage = field(default_factory=HumanReviewStage)
@@ -364,6 +487,7 @@ STAGE_SECTIONS: Mapping[str, str] = MappingProxyType(
     }
 )
 _KIND_NAMES = {str: "a string", int: "an integer", float: "a number", bool: "true/false"}
+_HEAD_KEYS = ("variant", "config_fingerprint", "model_fingerprint", "provenance")
 
 
 def empty_record(
@@ -378,14 +502,34 @@ def empty_record(
     return AdoptionRecord(variant, fp, model_fingerprint)
 
 
-def _kind(hint: object) -> type:
+def _kind(hint: object) -> object:
     args = [a for a in typing.get_args(hint) if a is not type(None)]
-    return args[0] if args else hint  # type: ignore[return-value]
+    return args[0] if args else hint
 
 
-def _typed(value: object, kind: type, where: str) -> object:
+def _json_scalar(value: object) -> bool:
+    if value is None or isinstance(value, (bool, str)):
+        return True
+    return isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def _json_object(value: object, value_kind: object, where: str) -> dict[str, object]:
+    """A flat JSON object: string values (``value_kind`` str) or JSON scalars (object)."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be a JSON object or null (got {value!r})")
+    for key, item in value.items():
+        ok = isinstance(item, str) if value_kind is str else _json_scalar(item)
+        if not ok:
+            need = "a string" if value_kind is str else "a string, finite number, bool or null"
+            raise ValueError(f"{where}.{key} must be {need} (got {item!r})")
+    return dict(value)
+
+
+def _typed(value: object, kind: object, where: str) -> object:
     if value is None:
         return None
+    if typing.get_origin(kind) is dict:
+        return _json_object(value, typing.get_args(kind)[1], where)
     if kind is bool:
         ok = isinstance(value, bool)
     elif kind is int:
@@ -395,9 +539,9 @@ def _typed(value: object, kind: type, where: str) -> object:
         ok = ok and math.isfinite(value)  # type: ignore[arg-type]
         value = float(value) if ok else value  # type: ignore[arg-type]
     else:
-        ok = isinstance(value, kind)
+        ok = isinstance(value, kind)  # type: ignore[arg-type]
     if not ok:
-        raise ValueError(f"{where} must be {_KIND_NAMES[kind]} or null (got {value!r})")
+        raise ValueError(f"{where} must be {_KIND_NAMES[kind]} or null (got {value!r})")  # type: ignore[index]
     return value
 
 
@@ -427,7 +571,7 @@ def record_from_dict(data: object, where: str = "record") -> AdoptionRecord:
     """Strictly validated record: unknown keys and wrong JSON types raise ``ValueError``."""
     if not isinstance(data, dict):
         raise ValueError(f"{where} must be a JSON object")
-    known = ("variant", "config_fingerprint", "model_fingerprint", *_SECTIONS)
+    known = (*_HEAD_KEYS, "data_files", "events_file", *_SECTIONS)
     unknown = sorted(set(data) - set(known))
     if unknown:
         raise ValueError(f"{where}: unknown keys {unknown} (expected {list(known)})")
@@ -436,12 +580,14 @@ def record_from_dict(data: object, where: str = "record") -> AdoptionRecord:
         if not isinstance(data.get(key), str):
             raise ValueError(f"{where}.{key} must be a string (got {data.get(key)!r})")
         head[key] = data[key]
-    # Optional (CONTRACT.md v2 A3): records written before it have no such key.
-    head["model_fingerprint"] = _typed(
-        data.get("model_fingerprint"), str, f"{where}.model_fingerprint"
-    )
+    # Optional keys (v2 A3, v3 C3): records written before them simply lack the key.
+    for key in ("model_fingerprint", "provenance"):
+        head[key] = _typed(data.get(key), str, f"{where}.{key}")
+    head["data_files"] = _typed(data.get("data_files"), dict[str, str], f"{where}.data_files")
+    raw_events = data.get("events_file")
+    events = None if raw_events is None else _section(FileRef, raw_events, f"{where}.events_file")
     stages = {k: _section(cls, data.get(k), f"{where}.{k}") for k, cls in _SECTIONS.items()}
-    return AdoptionRecord(**head, **stages)  # type: ignore[arg-type]
+    return AdoptionRecord(**head, events_file=events, **stages)  # type: ignore[arg-type]
 
 
 def load_record(path: str | Path) -> AdoptionRecord:
@@ -463,14 +609,107 @@ def save_record(record: AdoptionRecord, path: str | Path) -> None:
     p.write_text(json.dumps(asdict(record), indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------- recompute
+@dataclass(frozen=True)
+class WalkForwardVerdict:
+    """The walk-forward numbers recomputed from the TRAIN and TEST journals."""
+
+    label: str
+    label_reason: str
+    train: Summary
+    test: Summary
+    dd_ok: bool
+    dd_reason: str
+
+
+_VERDICT_FUNCTIONS = ("summarize", "label", "dd_check")
+# Arguments that come from the journals, the typed fields and the config, never label_params.
+_FIXED_ARGUMENTS = frozenset(
+    {"trades", "starting_equity", "train", "test", "min_train", "min_test"}
+)
+_KEYWORD_KINDS = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+
+
+def _keyword_names(fn: Callable[..., object]) -> frozenset[str]:
+    params = inspect.signature(fn).parameters.values()
+    return frozenset(p.name for p in params if p.kind in _KEYWORD_KINDS)
+
+
+def route_label_params(label_params: Mapping[str, object]) -> dict[str, dict[str, object]]:
+    """Split ``walk_forward.label_params`` into keyword arguments per metrics function.
+
+    Each entry goes to every one of ``metrics.summarize``, ``metrics.label`` and
+    ``metrics.dd_check`` whose signature declares a parameter of that name. Raises
+    ``ValueError`` for an entry no function declares, for the fixed arguments (journals,
+    ``starting_equity``, ``min_train``/``min_test``), and for a ``max_dd_pct`` outside
+    ``(0, 20]`` (it defaults to 20, the C5 cap).
+    """
+    routed: dict[str, dict[str, object]] = {name: {} for name in _VERDICT_FUNCTIONS}
+    accepted = {name: _keyword_names(getattr(metrics, name)) for name in _VERDICT_FUNCTIONS}
+    for key, value in label_params.items():
+        if key in _FIXED_ARGUMENTS:
+            raise ValueError(
+                f"walk_forward.label_params may not set {key!r}, which comes from the journals, "
+                "the typed fields or the config"
+            )
+        targets = [name for name in _VERDICT_FUNCTIONS if key in accepted[name]]
+        if not targets:
+            raise ValueError(
+                f"walk_forward.label_params key {key!r} is not a parameter of "
+                "metrics.summarize, metrics.label or metrics.dd_check"
+            )
+        for name in targets:
+            routed[name][key] = value
+    if "max_dd_pct" in accepted["dd_check"]:
+        limit = routed["dd_check"].setdefault("max_dd_pct", DD_CAP_PCT)
+        number = isinstance(limit, (int, float)) and not isinstance(limit, bool)
+        if not (number and 0 < limit <= DD_CAP_PCT):  # type: ignore[operator]
+            raise ValueError(
+                f"walk_forward.label_params max_dd_pct {limit!r} must be in (0, {DD_CAP_PCT:g}] "
+                f"because the TEST drawdown limit is never above {DD_CAP_PCT:g}% (CONTRACT v3 C5)"
+            )
+    return routed
+
+
+def recompute_walk_forward(
+    train_trades: Sequence[Trade],
+    test_trades: Sequence[Trade],
+    cfg: StrategyConfig,
+    min_train: int,
+    min_test: int,
+    label_params: Mapping[str, object],
+) -> WalkForwardVerdict:
+    """Recompute the walk-forward verdict from the journals, exactly as the check does.
+
+    ``metrics.summarize(trades, cfg.starting_capital, ...)`` per window, then
+    ``metrics.label(train, test, min_train=, min_test=, ...)`` and
+    ``metrics.dd_check(test, ...)``, the extra keyword arguments routed from
+    ``label_params`` by :func:`route_label_params`. A record writer can call this to fill
+    the typed fields. Raises ``ValueError`` / ``TypeError`` if the parameters do not apply.
+    """
+    kw = route_label_params(label_params)
+    train = metrics.summarize(train_trades, cfg.starting_capital, **kw["summarize"])  # type: ignore[arg-type]
+    test = metrics.summarize(test_trades, cfg.starting_capital, **kw["summarize"])  # type: ignore[arg-type]
+    verdict, why = metrics.label(
+        train,
+        test,
+        min_train=min_train,
+        min_test=min_test,
+        **kw["label"],  # type: ignore[arg-type]
+    )
+    dd_ok, dd_why = metrics.dd_check(test, **kw["dd_check"])  # type: ignore[arg-type]
+    return WalkForwardVerdict(verdict, why, train, test, bool(dd_ok), dd_why)
+
+
 # ---------------------------------------------------------------------------- check helpers
 @dataclass(frozen=True, slots=True)
 class _Ctx:
     record: AdoptionRecord
     cfg: StrategyConfig
     now: int
-    base_dir: Path | None
+    base_dir: Path
     model_fingerprint: str | None = None  # fingerprint of the ML model being promoted
+    cache: dict[str, object] = field(default_factory=dict)  # parsed evidence, per check
 
 
 def _is_int(value: object) -> bool:
@@ -510,17 +749,52 @@ def _time(value: str | None, name: str, now: int) -> tuple[int | None, str | Non
     return ts, None
 
 
-def _path(value: str | None, name: str, base_dir: Path | None) -> tuple[Path | None, str | None]:
-    """``(resolved existing path or None, problem sentence)``; existence only with base_dir."""
+def _resolve(ctx: _Ctx, value: str) -> Path:
+    p = Path(value.strip())
+    return p if p.is_absolute() else ctx.base_dir / p
+
+
+def _path(ctx: _Ctx, value: str | None, name: str) -> tuple[Path | None, str | None]:
+    """``(resolved existing path or None, problem sentence)``; existence only, no hash."""
     if _blank(value):
         return None, f"{name} is missing, so there is no evidence file to audit."
-    if base_dir is None:
-        return None, None
-    p = Path(value)  # type: ignore[arg-type]
-    p = p if p.is_absolute() else base_dir / p
+    p = _resolve(ctx, value)  # type: ignore[arg-type]
     if not p.is_file():
         return None, f"{name} {value!r} does not exist (looked for {p})."
     return p, None
+
+
+def _hash_bound(
+    ctx: _Ctx, path_value: str | None, sha_value: str | None, path_name: str, sha_name: str
+) -> tuple[Path | None, list[str]]:
+    """``(verified path or None, problems)``: recorded, hash recorded, exists, hash matches."""
+    if _blank(path_value):
+        return None, [f"{path_name} is missing, so there is no evidence file to audit."]
+    if _blank(sha_value):
+        return None, [
+            f"{sha_name} is missing, so {path_name} {path_value!r} is not bound to this record "
+            "by its sha256."
+        ]
+    sha = sha_value.strip()  # type: ignore[union-attr]
+    if not is_sha256_hex(sha):
+        return None, [
+            f"{sha_name} {sha[:_SHA256_HEX_LEN]!r} is not a sha256 hex digest "
+            f"({_SHA256_HEX_LEN} hex characters)."
+        ]
+    p = _resolve(ctx, path_value)  # type: ignore[arg-type]
+    if not p.is_file():
+        return None, [f"{path_name} {path_value!r} does not exist (looked for {p})."]
+    try:
+        actual = sha256_file(p)
+    except OSError as exc:
+        return None, [f"{path_name} {path_value!r} could not be read ({exc})."]
+    if actual != sha.lower():
+        return None, [
+            f"{path_name} {path_value!r} has sha256 {actual[:_FP_SHOWN]} but {sha_name} is "
+            f"{sha[:_FP_SHOWN].lower()} (first {_FP_SHOWN} hex digits shown), so the file is "
+            "not the evidence that was recorded."
+        ]
+    return p, []
 
 
 def _pos_int(value: object) -> bool:
@@ -533,17 +807,31 @@ def _positive_count(value: object, name: str) -> str | None:
     return f"{name} must be a positive trade count (got {value!r})."
 
 
-def _ids(ids: Sequence[int]) -> str:
-    shown = ", ".join(f"#{i}" for i in ids[:_MAX_IDS_SHOWN])
-    extra = len(ids) - _MAX_IDS_SHOWN
+def _shown(items: Sequence[str]) -> str:
+    shown = ", ".join(items[:_MAX_IDS_SHOWN])
+    extra = len(items) - _MAX_IDS_SHOWN
     return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _ids(ids: Sequence[int]) -> str:
+    return _shown([f"#{i}" for i in ids])
+
+
+def _keys(keys: Sequence[tuple[str, int]]) -> str:
+    return _shown([f"{window} #{i}" for window, i in keys])
 
 
 def _problems(*items: str | None) -> list[str]:
     return [p for p in items if p is not None]
 
 
-# ---------------------------------------------------------------------------- stage checks
+def _num_close(typed: object, actual: float) -> bool:
+    if isinstance(typed, bool) or not isinstance(typed, (int, float)):
+        return False
+    return abs(float(typed) - actual) <= AVG_R_TOL
+
+
+# ---------------------------------------------------------------------------- identity
 def _record_problems(ctx: _Ctx) -> list[Decision]:
     rec = ctx.record
     out: list[Decision] = []
@@ -603,13 +891,56 @@ def _model_fingerprint_problem(record: AdoptionRecord, supplied: str | None) -> 
     return None
 
 
+# ---------------------------------------------------------------------------- provenance
+def _provenance_value_problem(provenance: str | None) -> str | None:
+    if provenance == PROVENANCE_REAL:
+        return None
+    if _blank(provenance):
+        return (
+            "provenance is missing, so nothing shows the walk-forward ran on real market data "
+            f"(record {PROVENANCE_REAL!r} with the data file hashes)."
+        )
+    if provenance.strip().lower().startswith(SYNTHETIC_PROVENANCE_PREFIX):  # type: ignore[union-attr]
+        return (
+            f"provenance is {provenance!r}: a synthetic world only verifies the harness and is "
+            f"never evidence about real markets, so it may not go past {WALK_FORWARD}."
+        )
+    return (
+        f"provenance is {provenance!r}, but only {PROVENANCE_REAL!r} (hash-bound exchange data) "
+        f"may go past {WALK_FORWARD}."
+    )
+
+
+def _provenance_problems(ctx: _Ctx, require_real: bool) -> list[str]:
+    """C3 data binding: recorded data/event files hash-bound; later stages need real data."""
+    rec = ctx.record
+    out: list[str] = []
+    if require_real:
+        out += _problems(_provenance_value_problem(rec.provenance))
+        if not rec.data_files:
+            out.append(
+                "data_files is missing or empty, so the market data behind the backtest is not "
+                "bound to this record by sha256."
+            )
+    for path, sha in sorted((rec.data_files or {}).items()):
+        out += _hash_bound(ctx, path, sha, "data_files entry", f"data_files[{path!r}]")[1]
+    if rec.events_file is not None:
+        ef = rec.events_file
+        out += _hash_bound(ctx, ef.path, ef.sha256, "events_file.path", "events_file.sha256")[1]
+    return out
+
+
+# ---------------------------------------------------------------------------- backtest
 def _backtest_problems(ctx: _Ctx) -> list[str]:
     bt = ctx.record.backtest
-    _p, path_problem = _path(bt.report_path, "backtest.report_path", ctx.base_dir)
+    _p, path_problems = _hash_bound(
+        ctx, bt.report_path, bt.report_sha256, "backtest.report_path", "backtest.report_sha256"
+    )
     _ts, time_problem = _time(bt.completed_utc, "backtest.completed_utc", ctx.now)
-    return _problems(path_problem, time_problem)
+    return path_problems + _problems(time_problem)
 
 
+# ---------------------------------------------------------------------------- walk-forward
 def _label_problem(label: str | None) -> str | None:
     if label == REQUIRED_WF_LABEL:
         return None
@@ -627,28 +958,189 @@ def _dd_problem(dd_ok: bool | None) -> str | None:
     return "walk_forward.dd_ok is missing, so the test drawdown was never checked."
 
 
+def _avg_r_problem(avg_r: object) -> str | None:
+    if not isinstance(avg_r, bool) and isinstance(avg_r, (int, float)) and avg_r > 0:
+        return None
+    return (
+        f"walk_forward.test_avg_r must be a positive out-of-sample expectancy in R (got {avg_r!r})."
+    )
+
+
+def _wf_param_problems(wf: WalkForwardStage) -> list[str]:
+    out = [
+        f"walk_forward.{name} must be the positive minimum trade count passed to metrics.label "
+        f"(got {getattr(wf, name)!r})."
+        for name in ("min_train", "min_test")
+        if not _pos_int(getattr(wf, name))
+    ]
+    if wf.train_avg_r is None:
+        out.append(
+            "walk_forward.train_avg_r is missing, so the TRAIN expectancy cannot be checked "
+            "against its journal."
+        )
+    if wf.label_params is None:
+        out.append(
+            "walk_forward.label_params is missing: record the exact extra keyword arguments "
+            "given to metrics.summarize, metrics.label and metrics.dd_check (an empty object "
+            "for their defaults)."
+        )
+    return out
+
+
+def _robust_sample_problem(wf: WalkForwardStage) -> str | None:
+    if wf.label != REQUIRED_WF_LABEL:
+        return None
+    counts = (wf.train_n, wf.test_n)
+    if all(_is_int(n) and n >= ROBUST_MIN_N for n in counts):  # type: ignore[operator]
+        return None
+    return (
+        f"walk_forward.label is {REQUIRED_WF_LABEL} with train_n {wf.train_n!r} and test_n "
+        f"{wf.test_n!r}, but {REQUIRED_WF_LABEL} needs at least {ROBUST_MIN_N} trades in each "
+        "window (CONTRACT v3 C3), whatever min_train and min_test say."
+    )
+
+
+def _load_wf_journals(ctx: _Ctx) -> tuple[tuple[list[Trade], list[Trade]] | None, list[str]]:
+    wf = ctx.record.walk_forward
+    problems: list[str] = []
+    loaded: list[list[Trade]] = []
+    specs = (
+        ("train", wf.train_journal_path, wf.train_journal_sha256),
+        ("test", wf.test_journal_path, wf.test_journal_sha256),
+    )
+    for window, path_value, sha_value in specs:
+        name = f"walk_forward.{window}_journal"
+        path, found = _hash_bound(ctx, path_value, sha_value, f"{name}_path", f"{name}_sha256")
+        problems += found
+        if path is None:
+            continue
+        try:
+            loaded.append(read_journal(path))
+        except (OSError, ValueError) as exc:
+            problems.append(f"{name}_path could not be read as a trade journal ({exc}).")
+    if problems:
+        return None, problems
+    return (loaded[0], loaded[1]), []
+
+
+def _wf_journals(ctx: _Ctx) -> tuple[tuple[list[Trade], list[Trade]] | None, list[str]]:
+    """The hash-verified (TRAIN, TEST) journals, parsed once per check, or None + problems."""
+    if "wf_journals" not in ctx.cache:
+        ctx.cache["wf_journals"] = _load_wf_journals(ctx)
+    return ctx.cache["wf_journals"]  # type: ignore[return-value]
+
+
+def _window_problems(window: str, trades: Sequence[Trade], ctx: _Ctx) -> list[str]:
+    rec = ctx.record
+    split = _quiet_ts(rec.walk_forward.split_utc)
+    out: list[str] = []
+    unclosed = [t.trade_id for t in trades if t.exit_ts is None or t.r_multiple is None]
+    if unclosed:
+        out.append(
+            f"the {window} journal has trades {_ids(unclosed)} without an exit or R, but a "
+            "walk-forward journal holds closed trades only."
+        )
+    dup = sorted(i for i, n in Counter(t.trade_id for t in trades).items() if n > 1)
+    if dup:
+        out.append(
+            f"the {window} journal repeats trade ids {_ids(dup)}, so its rows cannot be matched "
+            "to the review pack."
+        )
+    foreign = [t.trade_id for t in trades if t.variant != rec.variant]
+    if foreign:
+        out.append(
+            f"{window} journal trades {_ids(foreign)} are not of variant {rec.variant!r}, so "
+            "the journal is not the evidence of the variant being promoted."
+        )
+    if split is not None:
+        wrong = [t.trade_id for t in trades if (t.signal_ts < split) != (window == WINDOW_TRAIN)]
+        if wrong:
+            out.append(
+                f"{window} journal trades {_ids(wrong)} have signals on the wrong side of "
+                f"walk_forward.split_utc {ms_to_iso(split)} (TRAIN signals are before it, TEST "
+                "signals at or after it)."
+            )
+    return out
+
+
+def _verdict_mismatches(wf: WalkForwardStage, v: WalkForwardVerdict) -> list[str]:
+    source = "recomputed from the hash-bound journals with the recorded parameters"
+    out: list[str] = []
+    if wf.label != v.label:
+        out.append(
+            f"walk_forward.label is {wf.label!r} but metrics.label {source} gives "
+            f"{v.label!r}, so the typed label does not match its evidence."
+        )
+    for name, typed, actual in (
+        ("train_n", wf.train_n, v.train.n),
+        ("test_n", wf.test_n, v.test.n),
+    ):
+        if typed != actual:
+            out.append(
+                f"walk_forward.{name} is {typed!r} but the journal holds {actual} closed trades, "
+                "so the typed count does not match its evidence."
+            )
+    for name, typed, avg in (
+        ("train_avg_r", wf.train_avg_r, v.train.avg_r),
+        ("test_avg_r", wf.test_avg_r, v.test.avg_r),
+    ):
+        if not _num_close(typed, avg):
+            out.append(
+                f"walk_forward.{name} is {typed!r} but the journal gives {avg!r}R (tolerance "
+                f"{AVG_R_TOL:g}), so the typed expectancy does not match its evidence."
+            )
+    if wf.dd_ok is not v.dd_ok:
+        out.append(
+            f"walk_forward.dd_ok is {wf.dd_ok!r} but metrics.dd_check {source} gives "
+            f"{v.dd_ok!r}, so the typed drawdown verdict does not match its evidence."
+        )
+    return out
+
+
+def _recompute_problems(ctx: _Ctx, train: list[Trade], test: list[Trade]) -> list[str]:
+    wf = ctx.record.walk_forward
+    if not (_pos_int(wf.min_train) and _pos_int(wf.min_test)) or wf.label_params is None:
+        return []  # _wf_param_problems already blocks; nothing well-defined to recompute
+    try:
+        verdict = recompute_walk_forward(
+            train,
+            test,
+            ctx.cfg,
+            wf.min_train,
+            wf.min_test,
+            wf.label_params,  # type: ignore[arg-type]
+        )
+    except (TypeError, ValueError) as exc:
+        return [f"the walk-forward verdict could not be recomputed from the journals ({exc})."]
+    return _verdict_mismatches(wf, verdict)
+
+
 def _walk_forward_problems(ctx: _Ctx) -> list[str]:
     wf = ctx.record.walk_forward
     _ts, split_problem = _time(wf.split_utc, "walk_forward.split_utc", ctx.now)
-    avg_r_problem = None
-    avg_r = wf.test_avg_r
-    if isinstance(avg_r, bool) or not (isinstance(avg_r, (int, float)) and avg_r > 0):
-        avg_r_problem = (
-            f"walk_forward.test_avg_r must be a positive out-of-sample expectancy in R "
-            f"(got {avg_r!r})."
-        )
-    _p, path_problem = _path(wf.report_path, "walk_forward.report_path", ctx.base_dir)
-    return _problems(
+    _p, path_problem = _path(ctx, wf.report_path, "walk_forward.report_path")
+    out = _problems(
         _label_problem(wf.label),
         _dd_problem(wf.dd_ok),
         split_problem,
         _positive_count(wf.train_n, "walk_forward.train_n"),
         _positive_count(wf.test_n, "walk_forward.test_n"),
-        avg_r_problem,
+        _robust_sample_problem(wf),
+        _avg_r_problem(wf.test_avg_r),
         path_problem,
     )
+    out += _wf_param_problems(wf)
+    journals, journal_problems = _wf_journals(ctx)
+    out += journal_problems
+    if journals is not None:
+        train, test = journals
+        out += _window_problems(WINDOW_TRAIN, train, ctx)
+        out += _window_problems(WINDOW_TEST, test, ctx)
+        out += _recompute_problems(ctx, train, test)
+    return out
 
 
+# ---------------------------------------------------------------------------- human review
 def _coverage_problems(ctx: _Ctx) -> list[str]:
     hr, wf = ctx.record.human_review, ctx.record.walk_forward
     total, reviewed = hr.trades_total, hr.trades_reviewed
@@ -674,6 +1166,85 @@ def _coverage_problems(ctx: _Ctx) -> list[str]:
     return out
 
 
+def _review_key_problems(
+    rows: Sequence[ReviewRow], train: Sequence[Trade], test: Sequence[Trade]
+) -> list[str]:
+    expected = {(WINDOW_TRAIN, t.trade_id): t for t in train}
+    expected.update({(WINDOW_TEST, t.trade_id): t for t in test})
+    got = {r.key: r for r in rows}
+    out: list[str] = []
+    missing = sorted(set(expected) - set(got))
+    if missing:
+        out.append(
+            f"the review pack has no row for walk-forward trades {_keys(missing)}, so they "
+            "were never reviewed."
+        )
+    extra = sorted(set(got) - set(expected))
+    if extra:
+        out.append(
+            f"the review pack has rows {_keys(extra)} that are not trades of the walk-forward "
+            "journals, so it is not the review pack of this walk-forward."
+        )
+    differ = sorted(
+        k
+        for k in set(expected) & set(got)
+        if (got[k].pair, got[k].signal_ts) != (expected[k].pair, expected[k].signal_ts)
+    )
+    if differ:
+        out.append(
+            f"review rows {_keys(differ)} name a different pair or signal time than the journal "
+            "trade with the same (window, trade_id), so the pack does not describe these trades."
+        )
+    return out
+
+
+def _review_verdict_problems(rows: Sequence[ReviewRow]) -> list[str]:
+    out: list[str] = []
+    blank = [r.key for r in rows if r.reviewer_ok not in (REVIEW_OK_YES, REVIEW_OK_NO)]
+    if blank:
+        out.append(
+            f"{len(blank)} review rows ({_keys(blank)}) have no reviewer_ok verdict, and every "
+            f"trade needs an explicit {REVIEW_OK_YES} or {REVIEW_OK_NO}."
+        )
+    rejected = [r.key for r in rows if r.reviewer_ok == REVIEW_OK_NO]
+    if rejected:
+        out.append(
+            f"the reviewer rejected {len(rejected)} trades ({_keys(rejected)}) with reviewer_ok "
+            f"{REVIEW_OK_NO}, and by policy {REVIEW_REJECTION_POLICY}."
+        )
+    return out
+
+
+def _review_pack_problems(ctx: _Ctx) -> list[str]:
+    hr, wf = ctx.record.human_review, ctx.record.walk_forward
+    path, problems = _hash_bound(
+        ctx,
+        hr.review_path,
+        hr.review_sha256,
+        "human_review.review_path",
+        "human_review.review_sha256",
+    )
+    if path is None:
+        return problems
+    try:
+        rows = load_review(path)
+    except (OSError, ValueError) as exc:
+        return [f"human_review.review_path could not be read as a review pack ({exc})."]
+    out: list[str] = []
+    if _pos_int(wf.train_n) and _pos_int(wf.test_n) and len(rows) != wf.train_n + wf.test_n:  # type: ignore[operator]
+        out.append(
+            f"the review pack has {len(rows)} rows but the walk-forward produced "
+            f"{wf.train_n + wf.test_n} trades (train {wf.train_n} + test {wf.test_n}), so it "  # type: ignore[operator]
+            "does not cover every trade exactly once."
+        )
+    # Without verified journals the WALK_FORWARD stage (always checked before this one)
+    # already blocks, so the key comparison is skipped rather than reported twice.
+    journals, _unused = _wf_journals(ctx)
+    if journals is not None:
+        out += _review_key_problems(rows, *journals)
+    return out + _review_verdict_problems(rows)
+
+
 def _human_review_problems(ctx: _Ctx) -> list[str]:
     hr = ctx.record.human_review
     reviewer_problem = None
@@ -695,9 +1266,10 @@ def _human_review_problems(ctx: _Ctx) -> list[str]:
     out = _problems(reviewer_problem, date_problem, order_problem)
     out += _coverage_problems(ctx)
     out += _problems(approved_problem)
-    return out
+    return out + _review_pack_problems(ctx)
 
 
+# ---------------------------------------------------------------------------- testnet
 def _testnet_window_problems(ctx: _Ctx) -> list[str]:
     tn = ctx.record.testnet
     start, start_problem = _time(tn.start_utc, "testnet.start_utc", ctx.now)
@@ -731,6 +1303,44 @@ def _violations_problem(value: object) -> str | None:
 
 def _violation_codes(trade: Trade, cfg: StrategyConfig) -> set[str]:
     return {flag_code(f) for f in auto_flags(trade, cfg)} & RULE_VIOLATION_FLAGS
+
+
+def _testnet_events(ctx: _Ctx) -> tuple[list[NewsEvent] | None, list[str]]:
+    """The hash-bound testnet news calendar, ``(None, [])`` if none is recorded."""
+    tn = ctx.record.testnet
+    if _blank(tn.events_path) and _blank(tn.events_sha256):
+        return None, []
+    path, problems = _hash_bound(
+        ctx, tn.events_path, tn.events_sha256, "testnet.events_path", "testnet.events_sha256"
+    )
+    if path is None:
+        return None, problems
+    try:
+        return load_events(path), []
+    except (OSError, ValueError) as exc:
+        return None, [f"testnet.events_path could not be read as a news calendar ({exc})."]
+
+
+def _cross_trade_problems(ctx: _Ctx, trades: Sequence[Trade]) -> list[str]:
+    """R6 / R9 (and R5 with a calendar) recomputed over the testnet journal, offset 0."""
+    events, problems = _testnet_events(ctx)
+    if problems:
+        return problems
+    try:
+        violations = cross_trade_violations(trades, ctx.cfg, events, exit_time_uncertainty_ms=0)
+    except ValueError as exc:
+        return [f"the testnet journal could not be audited for cross-trade rules ({exc})."]
+    if not violations:
+        return []
+    scope = "R5 checked against testnet.events_path" if events is not None else R5_NOT_VERIFIABLE
+    shown = "; ".join(violations[:_MAX_VIOLATIONS_SHOWN])
+    extra = len(violations) - _MAX_VIOLATIONS_SHOWN
+    more = f" (+{extra} more)" if extra > 0 else ""
+    return [
+        f"the testnet journal breaks mandatory cross-trade rules recomputed from its rows with "
+        f"exit offset 0 for real fill times (R6 and R9 checked; {scope}): {shown}{more}, so "
+        "testnet.rule_violations cannot be 0."
+    ]
 
 
 def _journal_problems(ctx: _Ctx, path: Path) -> list[str]:
@@ -768,7 +1378,7 @@ def _journal_problems(ctx: _Ctx, path: Path) -> list[str]:
             f"testnet journal trades {_ids([i for i, _c in flagged])} break mandatory rules "
             f"({', '.join(codes)}), so testnet.rule_violations cannot be 0."
         )
-    return out
+    return out + _cross_trade_problems(ctx, trades)
 
 
 def _testnet_problems(ctx: _Ctx) -> list[str]:
@@ -785,7 +1395,7 @@ def _testnet_problems(ctx: _Ctx) -> list[str]:
             f"testnet.trades must be at least 1 (got {tn.trades!r}): a run without trades "
             "never exercised order, stop and exit handling."
         )
-    journal, journal_problem = _path(tn.journal_path, "testnet.journal_path", ctx.base_dir)
+    journal, journal_problem = _path(ctx, tn.journal_path, "testnet.journal_path")
     out = _problems(exchange_problem) + _testnet_window_problems(ctx)
     out += _problems(trades_problem, _violations_problem(tn.rule_violations), journal_problem)
     if journal is not None:
@@ -813,15 +1423,23 @@ def _live_problems(ctx: _Ctx) -> list[str]:
     return out
 
 
-_STAGE_CHECKS = {
-    BACKTEST: _backtest_problems,
-    WALK_FORWARD: _walk_forward_problems,
-    HUMAN_REVIEW: _human_review_problems,
-    TESTNET: _testnet_problems,
-}
+_STAGE_CHECKS: Mapping[str, Callable[[_Ctx], list[str]]] = MappingProxyType(
+    {
+        BACKTEST: _backtest_problems,
+        WALK_FORWARD: _walk_forward_problems,
+        HUMAN_REVIEW: _human_review_problems,
+        TESTNET: _testnet_problems,
+    }
+)
 
 
 # ---------------------------------------------------------------------------- public checks
+def _stage_index(stage: str) -> int:
+    if stage not in STAGES:
+        raise ValueError(f"unknown adoption stage {stage!r}; expected one of {STAGES}")
+    return STAGES.index(stage)
+
+
 def check_promotion(
     record: AdoptionRecord,
     target_stage: str,
@@ -832,22 +1450,26 @@ def check_promotion(
 ) -> list[Decision]:
     """Every reason ``record`` may NOT be promoted to ``target_stage`` (empty = allowed).
 
-    All stages before ``target_stage`` must be complete (see the module docstring); a stage
-    with nothing recorded yields one "no recorded result" decision. The record's
+    All stages before ``target_stage`` must be complete and consistent with their evidence
+    files (the module docstring lists every check, and what is NOT verified). A stage with
+    nothing recorded yields one "no recorded result" decision. The record's
     ``config_fingerprint`` must equal ``config_fingerprint(cfg)`` for every target, and
     ``model_fingerprint`` (the ``MLFilter.fingerprint()`` of the ML model being promoted, or
-    ``None`` if there is none) must equal the record's ``model_fingerprint``; a ``"+ml"``
-    variant without a recorded model fingerprint is always blocked. With ``base_dir`` the
-    evidence files must exist and the testnet journal is cross-checked. Each decision has
-    ``allowed=False``, a rule id from :data:`ADOPTION_RULE_IDS` and a one-sentence reason.
-    Raises ``ValueError`` for an unknown ``target_stage``.
+    ``None`` if there is none) must equal the record's ``model_fingerprint``. Relative
+    evidence paths are resolved against ``base_dir`` (``None``: the current working
+    directory). Each decision has ``allowed=False``, a rule id from
+    :data:`ADOPTION_RULE_IDS` and a one-sentence reason, in the order identity, provenance,
+    stages, live. Raises ``ValueError`` for an unknown ``target_stage``.
     """
-    if target_stage not in STAGES:
-        raise ValueError(f"unknown adoption stage {target_stage!r}; expected one of {STAGES}")
-    root = None if base_dir is None else Path(base_dir)
+    target = _stage_index(target_stage)
+    root = Path.cwd() if base_dir is None else Path(base_dir)
     ctx = _Ctx(record, cfg, now_utc_ms, root, model_fingerprint)
     out = _record_problems(ctx)
-    for stage in STAGES[: STAGES.index(target_stage)]:
+    if target >= STAGES.index(WALK_FORWARD):
+        require_real = target >= STAGES.index(HUMAN_REVIEW)
+        problems = _provenance_problems(ctx, require_real)
+        out.extend(Decision(False, ADOPT_PROVENANCE, r) for r in problems)
+    for stage in STAGES[:target]:
         rule = STAGE_RULES[stage]
         if _is_empty(getattr(record, STAGE_SECTIONS[stage])):
             reason = (
@@ -859,6 +1481,42 @@ def check_promotion(
         out.extend(Decision(False, rule, r) for r in _STAGE_CHECKS[stage](ctx))
     if target_stage == LIVE:
         out.extend(Decision(False, ADOPT_LIVE, r) for r in _live_problems(ctx))
+    return out
+
+
+def unverified_notes(record: AdoptionRecord, target_stage: str) -> list[str]:
+    """One sentence per thing :func:`check_promotion` does NOT verify for ``target_stage``.
+
+    Read these before trusting a PASS (the CLI prints them). Raises ``ValueError`` for an
+    unknown stage.
+    """
+    target = _stage_index(target_stage)
+    out: list[str] = []
+    if target >= STAGES.index(HUMAN_REVIEW):
+        out.append(
+            "The sha256 hashes bind the data files, journals and report to this record, but "
+            "they do not prove the journals were produced from those data files (re-run "
+            "run_research or the invariants CLI on the data to check that)."
+        )
+        out.append(
+            "dd_ok is recomputed with metrics.dd_check on the closed-trade TEST summary only; "
+            "the mark-to-market drawdown of CONTRACT v3 C5 needs the candles and is not "
+            "recomputed here."
+        )
+    if target >= STAGES.index(TESTNET):
+        out.append(
+            "The review pack proves every trade got an explicit Y, not that the reviewer "
+            "inspected each trade."
+        )
+    if target_stage == LIVE:
+        if _blank(record.testnet.events_path):
+            out.append(f"{R5_NOT_VERIFIABLE[0].upper()}{R5_NOT_VERIFIABLE[1:]}.")
+        out.append(
+            "Per-candle rules of the testnet trades (R1-R4 gates, R8 structure stops, fill "
+            "prices) need the candles and are not checked here (use python -m "
+            "research.trendbot.invariants), and that the account was a testnet rests on the "
+            "typed exchange field."
+        )
     return out
 
 
@@ -924,6 +1582,8 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--force", action="store_true", help="overwrite an existing record")
     fingerprint = sub.add_parser("fingerprint", help="print a config's canonical JSON + sha256")
     fingerprint.add_argument("--config", type=Path, default=None, help=config_help)
+    hashes = sub.add_parser("hash", help="print the sha256 of evidence files (*_sha256 fields)")
+    hashes.add_argument("files", nargs="+", type=Path, help="files to hash")
     return parser
 
 
@@ -948,14 +1608,19 @@ def _cmd_check(args: argparse.Namespace, now: int) -> int:
             f"PASS: variant {record.variant!r} ({what}) may be promoted to "
             f"{args.stage} at {ms_to_iso(now)}."
         )
-        return 0
-    print(
-        f"BLOCKED: variant {record.variant!r} ({what}) may not be promoted to "
-        f"{args.stage} at {ms_to_iso(now)}; {len(decisions)} blocking reason(s):"
-    )
-    for d in decisions:
-        print(f"- [{d.rule}] {d.reason}")
-    return 1
+    else:
+        print(
+            f"BLOCKED: variant {record.variant!r} ({what}) may not be promoted to "
+            f"{args.stage} at {ms_to_iso(now)}; {len(decisions)} blocking reason(s):"
+        )
+        for d in decisions:
+            print(f"- [{d.rule}] {d.reason}")
+    notes = unverified_notes(record, args.stage)
+    if notes:
+        print("Not verified by this check (see the adoption.py docstring):")
+        for note in notes:
+            print(f"  * {note}")
+    return 1 if decisions else 0
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -997,6 +1662,12 @@ def _cmd_fingerprint(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_hash(args: argparse.Namespace) -> int:
+    for path in args.files:
+        print(f"{sha256_file(path)}  {path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -1006,12 +1677,14 @@ def main(argv: list[str] | None = None) -> int:
             now = iso_to_ms(args.now)
         except (ValueError, OverflowError):
             parser.error(f"--now: not an ISO-8601 time or epoch ms: {args.now!r}")
+    commands = {
+        "check": lambda: _cmd_check(args, now),
+        "init": lambda: _cmd_init(args),
+        "fingerprint": lambda: _cmd_fingerprint(args),
+        "hash": lambda: _cmd_hash(args),
+    }
     try:
-        if args.command == "check":
-            return _cmd_check(args, now)
-        if args.command == "init":
-            return _cmd_init(args)
-        return _cmd_fingerprint(args)
+        return commands[args.command]()
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

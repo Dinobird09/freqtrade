@@ -1,6 +1,6 @@
 # Trade review: discovery-selected `rr3_vol2_rsi50-70`
 
-**Human review pack.** The reviewer must inspect EVERY row of the trade table below (all 111 trades, also in `trades_review.csv`) before signing off: summary statistics alone are not a review. Automated flags only point at suspicious rows; an unflagged trade is not an approved trade. Record a verdict for every trade in the `reviewer_ok` (Y/N) and `reviewer_note` columns of `trades_review.csv`.
+**Human review pack.** The reviewer must inspect EVERY row of the trade table below (all 111 trades, also in `trades_review.csv`) before signing off: summary statistics alone are not a review. Automated flags only point at suspicious rows; an unflagged trade is not an approved trade. Record a verdict for every trade in the `reviewer_ok` (exactly Y or N; any other value is rejected when the sheet is read back) and `reviewer_note` columns of `trades_review.csv`.
 
 - Trades: 111 (TRAIN 72, TEST 39)
 - Closed trades: 111; open or missing exit: 0
@@ -10,6 +10,7 @@
 - Walk-forward split: 2023-03-14T00:00:00Z (TRAIN = signal candle before it, TEST = at or after it)
 - Config: `rr3_vol2_rsi50-70`, reward:risk 3.00 (net of costs), risk caps BNB 0.50%, BTC 1.00%, ETH 1.00%
 - Costs: fee 0.1000% per side, slippage 0.0500% on market fills (entry and stop), exchange `binance`. Risk is the ALL-IN loss at the stop, so a clean stop-out is -1R and a TP is +reward:risk R; `RR price` is the chart-distance ratio, `RR net` what a TP earns after both fees.
+- Row key: (window, trade_id), unique in this pack; `trades_review.csv` is matched against the TRAIN and TEST journals by this key
 
 ## Summary per window
 

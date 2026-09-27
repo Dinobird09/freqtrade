@@ -14,6 +14,7 @@ import pytest
 from research.trendbot.adoption import is_sha256_hex
 from research.trendbot.ml_filter import (
     FEATURES,
+    MODEL_FORMAT,
     InsufficientData,
     LogisticModel,
     MLEntryFilter,
@@ -416,3 +417,63 @@ def test_fingerprint_changes_whenever_the_model_changes() -> None:
     assert tweaked(model=model) != fp
     model.weights, model.intercept = ml.model.weights, ml.model.intercept + 1e-9  # type: ignore[operator]
     assert tweaked(model=model) != fp
+
+
+# ------------------------------------------------------------------ serialisation (live bot)
+def test_to_json_from_json_round_trip_is_exact() -> None:
+    cands = _candidates(15, 400, _hour_edge)
+    ml = MLFilter.fit(cands)
+    text = ml.to_json()
+    doc = json.loads(text)
+    assert doc["format"] == MODEL_FORMAT and doc["fingerprint"] == ml.fingerprint()
+    assert json.dumps(doc["model"], sort_keys=True, separators=(",", ":")) == ml.canonical_json()
+    assert text == json.dumps(doc, sort_keys=True, indent=2) + "\n"  # canonical form
+    back = MLFilter.from_json(text, expected_fingerprint=ml.fingerprint())
+    assert back.fingerprint() == ml.fingerprint() and back.to_json() == text
+    assert (back.means, back.stds, back.threshold, back.l2) == (
+        ml.means,
+        ml.stds,
+        ml.threshold,
+        ml.l2,
+    )
+    assert back.model.coefficients() == ml.model.coefficients()
+    assert (back.train_n, back.train_wins, back.avg_win_r, back.avg_loss_r) == (
+        ml.train_n,
+        ml.train_wins,
+        ml.avg_win_r,
+        ml.avg_loss_r,
+    )
+    # the reloaded filter takes exactly the same decisions, with the same reasons
+    for cand in _candidates(16, 200, _hour_edge):
+        row = _row(cand.features)
+        assert back.decide(row) == ml.decide(row)
+
+
+def test_from_json_refuses_a_model_that_is_not_the_fingerprinted_one() -> None:
+    ml = MLFilter.fit(_candidates(17, 400, _hour_edge))
+    doc = json.loads(ml.to_json())
+    tampered = json.loads(ml.to_json())
+    tampered["model"]["threshold"] = repr(ml.threshold + 0.01)
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        MLFilter.from_json(json.dumps(tampered))
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        MLFilter.from_json(ml.to_json(), expected_fingerprint="0" * 64)
+    for broken in (
+        {**doc, "format": "other/1"},
+        {k: v for k, v in doc.items() if k != "train"},
+        {**doc, "model": {**doc["model"], "features": ["rsi"]}},
+        {**doc, "model": {**doc["model"], "coefficients": doc["model"]["coefficients"][:-1]}},
+    ):
+        with pytest.raises(ValueError):
+            MLFilter.from_json(json.dumps(broken))
+    with pytest.raises(ValueError):
+        MLFilter.from_json("not json")
+
+
+def test_veto_wording_follows_contract_c1() -> None:
+    ml = MLFilter.fit(_candidates(18, 400, _hour_edge))
+    reasons = {ml.decide(_row(c.features))[2] for c in _candidates(19, 100, _hour_edge)}
+    assert any(r.endswith("so the entry is vetoed.") for r in reasons)
+    assert any(r.endswith("so the entry is allowed.") for r in reasons)
+    assert not any("removed" in r for r in reasons)
+    assert "vetoes every rule-passing signal" in ml.describe()

@@ -33,7 +33,7 @@ buy-and-hold landed below 0.05x for several of seeds 1-5. At 0.8-1.0 % every pai
 buy-and-hold multiple stays within [0.05x, 20x] for seeds 1-10 in EVERY world (measured
 range 0.07x-5.1x), so no world is dominated by a crash or a moonshot.
 
-Candles: open_t = close_{t-1} (no gaps), close_t = open_t * exp(r_pt),
+Candles: open_t = close_{t-1} (no gaps, unless gaps=True below), close_t = open_t * exp(r_pt),
 high_t = max(open, close) * exp(0.5 * sqrt(v_pt) * |z|), low_t = min(open, close) *
 exp(-0.5 * sqrt(v_pt) * |z'|). BNB additionally gets a "news wick" on 2 % of candles: low
 extended down by a further U(1 %, 3 %).
@@ -69,6 +69,25 @@ From ``active_end`` on, d = 0 exactly.
                 i.e. the 4H candles opening 08:00, 12:00 and 16:00 (closing 12:00, 16:00,
                 20:00). Spikes closing at 00:00, 04:00 or 08:00 trigger nothing, although
                 a window opened by an earlier edge-hour trigger keeps running through them.
+    zero_edge : "planted" at ZERO_EDGE_MU_SIGMAS = 0.15 instead of 0.7: a real, positive
+                PRE-cost conditional edge that fees and slippage eat, so the base strategy's
+                expected NET R is ~0 in both walk-forward windows (calibration below). It
+                tests that the pipeline does not call a cost-neutral edge ROBUST.
+
+``effect_strength`` (make_world / generate_world) replaces the world's strength in sigma
+units (EFFECT_MU_SIGMAS, or ZERO_EDGE_MU_SIGMAS for zero_edge) for power curves; ``None``
+keeps the default, 0 gives exactly the null world's candles, the null world accepts only
+None or 0, and values must lie in [0, MAX_EFFECT_MU_SIGMAS].
+
+``gaps=True`` (opt-in): a share GAP_PROB = 1 % of candles (never candle 0) opens away from the
+previous close, open_t = close_{t-1} * exp(+/-g - log(cosh(g))) with g = U(1, 3) * sigma_p and
+the sign 50/50. The -log(cosh(g)) term makes E[gap factor] = 1 exactly, so the price stays a
+martingale and gaps add jump risk only (no drift, no edge). The draws come from their own
+random stream ("gaps:<pair>"), so a gaps world shares every other draw with the default
+world. Gaps exercise the gap-through stop fill (SL at open * (1 - slippage), worse than -1R)
+and the R8 "gapped through stop" entry skip (fill candle opening at or below the stop).
+With gaps=False (the default) not a single byte of any world changes; a regression test pins
+the sha256 of the default seed-1 worlds.
 
 Calibration of EFFECT_MU_SIGMAS / EFFECT_HORIZON (a POSITIVE-CONTROL fixture strength, not
 a market claim): measured with ``backtester.run_backtest`` over the full 6-year history,
@@ -86,6 +105,22 @@ A2 breaker timing; 125-175 trades per seed (about 21-29 per year across the thre
               others -0.19 R (per seed -0.37 .. +0.16), so an hour-aware filter has
               something real to learn
 
+Calibration of ZERO_EDGE_MU_SIGMAS (net R ~0; base config, synthetic news, 6 years, the
+70/30 walk-forward windows run as two separate backtests like walkforward.py; "per-seed"
+is the mean over seeds of each seed's average R, with its standard error). Chosen on
+seeds 2001-2150 (150 seeds per strength), where per-seed TRAIN / TEST avg R was
+-0.008 / -0.010 at 0.14, +0.012 / +0.021 at 0.17, +0.035 / +0.049 at 0.20 and +0.060 /
++0.075 at 0.23 (SE ~0.011 TRAIN, ~0.019 TEST; ~0.8 R per sigma unit): the zero crossing is
+~0.15 in both windows. Validated on seeds the choice never saw, at 0.15:
+
+    seeds 3001-3100: TRAIN -0.001 (SE 0.016), TEST -0.012 (SE 0.021); 14,976 trades
+    seeds    1-50  : TRAIN +0.035 (SE 0.021), TEST +0.027 (SE 0.032);  7,495 trades
+
+(null, seeds 2001-2200: TRAIN -0.104 (SE 0.011), TEST -0.130 (SE 0.015).) One seed's
+window average has an SD of ~0.15 R (TRAIN) to ~0.21 R (TEST), so a 20-seed mean has an SE
+of ~0.03-0.05 R: zero_edge sits within ~0.05 R of zero, but any single seed may look
+positive or negative. These numbers were measured with the R5 C2 news semantics.
+
 The v1 arithmetic (risk = price distance only, target = entry + 2 x stop distance) gave
 null -0.10, planted +0.42, decay +0.24, hour_edge +0.12 (+0.49 / -0.19): A1 moved every world
 by at most 0.03 R, so EFFECT_MU_SIGMAS was left at 0.7.
@@ -98,12 +133,16 @@ Synthetic news (identical in every world, NO price impact; they exercise R5 only
 note "synthetic": 1-3 (mean 2) high-impact "macro" events scoped "ALL" per calendar month;
 one high-impact "regulatory" event scoped "EXCHANGE:binance" per quarter; one medium "bnb_burn"
 (scope "BNB") per quarter, 9-20 days into the quarter; one medium "launchpool" (scope "BNB")
-per month; one high-impact "unlock" scoped "ETH" per calendar year.
+per month; one high-impact "unlock" scoped "ETH" per calendar year. ``known_from_ts`` is
+left None on every event, i.e. the CONTRACT v3 C2 kind default applies (news.py): macro,
+unlock, bnb_burn and launchpool are scheduled (blocked +/-w), the "regulatory" events are
+unscheduled and block only [event, event + 2h], never the hours before a surprise headline.
 
 Determinism: every random draw comes from ``random.Random`` instances seeded with strings
 derived from (seed, stream name), so the same seed gives identical output across runs and
 Python processes, a pair's path does not depend on which other pairs are generated, and
-all four worlds share the same noise for a given seed (only the planted drift differs).
+all worlds share the same noise for a given seed (only the planted drift differs; gaps
+use a separate stream).
 """
 
 from __future__ import annotations
@@ -117,7 +156,7 @@ from datetime import UTC, datetime
 from .models import DAY_MS, HOUR_MS, Candle, NewsEvent, base_of
 
 
-WORLDS = ("null", "planted", "decay", "hour_edge")
+WORLDS = ("null", "planted", "decay", "hour_edge", "zero_edge")
 DEFAULT_PAIRS = ("BTC/USDT", "ETH/USDT", "BNB/USDT")
 
 TIMEFRAME_MS = 4 * HOUR_MS
@@ -127,6 +166,13 @@ START_TS = 1_546_300_800_000  # 2019-01-01T00:00:00Z
 # Ground truth of the planted effect.
 EFFECT_HORIZON = 12  # candles of extra drift after a qualifying trigger
 EFFECT_MU_SIGMAS = 0.7  # in-window extra drift per candle (before the offset), sigma units
+# "zero_edge": the planted-world mechanism at the strength where the base strategy's NET R
+# is ~0 (a positive pre-cost edge that the costs eat exactly; calibrated, see docstring).
+ZERO_EDGE_MU_SIGMAS = 0.15
+MAX_EFFECT_MU_SIGMAS = 5.0  # sanity bound for effect_strength overrides (power curves)
+# Opt-in gaps (gaps=True): the open of a candle jumps away from the previous close.
+GAP_PROB = 0.01  # share of candles that open with a gap
+GAP_SIGMAS = (1.0, 3.0)  # |log gap| ~ U(1, 3) x the pair's per-candle sigma, sign +/- 50/50
 # Numerical search for the zero-mean offset (see _conditional_offset).
 _OFFSET_MAX_ITER = 40
 _OFFSET_FIXED_STEPS = 6
@@ -182,9 +228,10 @@ class PairTruth:
     # elsewhere in [0, active_end), exactly 0.0 from active_end on. Sums to ~0.
     drift: tuple[float, ...]
     triggers: tuple[int, ...]  # indices of spike candles that switched the drift on
-    mu: float  # EFFECT_MU_SIGMAS * sigma for this pair
+    mu: float  # effect strength (EFFECT_MU_SIGMAS by default) * sigma for this pair
     offset: float = 0.0  # mu * share of in-window candles in [0, active_end)
     active_end: int = 0  # first candle index that is never drifted (n, or split_idx for decay)
+    gaps: tuple[int, ...] = ()  # gaps=True only: candles whose open != the previous close
 
     def in_window(self, t: int) -> bool:
         """True if candle ``t`` received the planted effect (not just the offset)."""
@@ -199,6 +246,8 @@ class SyntheticWorld:
     candles: dict[str, list[Candle]]
     events: list[NewsEvent]
     truth: dict[str, PairTruth]
+    effect_strength: float = EFFECT_MU_SIGMAS  # in-window drift in sigma units (0 for null)
+    gaps: bool = False  # opt-in open gaps (see GAP_PROB / GAP_SIGMAS)
 
     @property
     def split_ts(self) -> int:
@@ -213,7 +262,7 @@ def close_hour(idx: int) -> int:
 
 def trigger_qualifies(world: str, idx: int, split_idx: int) -> bool:
     """True if an up-closing spike at candle ``idx`` switches the planted drift on."""
-    if world == "planted":
+    if world in ("planted", "zero_edge"):
         return True
     if world == "decay":
         return idx < split_idx
@@ -281,50 +330,72 @@ def _pair_noise(seed: int, pair: str, spec: PairSpec, n: int) -> _PairNoise:
     return noise
 
 
+def _gap_factors(seed: int, pair: str, spec: PairSpec, n: int) -> tuple[list[float], list[int]]:
+    """Open-gap multipliers (1.0 = no gap) and the gapped candle indices, for gaps=True.
+
+    Drawn from their OWN stream, so a gaps=True world shares every other draw with the
+    default world. A gap of log size ``g = U(GAP_SIGMAS) * sigma`` is applied as
+    ``exp(+/-g - log(cosh(g)))``: its expectation is exactly 1, so gaps keep the price a
+    martingale (no drift, no edge) and only add jump risk. Candle 0 never gaps.
+    """
+    rng = _rng(seed, f"gaps:{pair}")
+    lo, hi = GAP_SIGMAS
+    factors = [1.0] * n
+    idx: list[int] = []
+    for t in range(n):
+        u, size, sign = rng.random(), rng.uniform(lo, hi) * spec.sigma, rng.random()
+        if t > 0 and u < GAP_PROB:
+            g = size if sign < 0.5 else -size
+            factors[t] = math.exp(g - math.log(math.cosh(size)))
+            idx.append(t)
+    return factors, idx
+
+
 # ---------------------------------------------------------------------- price paths
-def _drift_windows(
-    spec: PairSpec,
-    noise: _PairNoise,
-    factor: tuple[list[float], list[float]],
-    qualifies: Callable[[int], bool],
-    drift_end: int,
-    offset: float,
-) -> tuple[list[bool], list[int]]:
+@dataclass(frozen=True, slots=True)
+class _Path:
+    """Everything that determines one pair's price path, apart from the offset."""
+
+    spec: PairSpec
+    noise: _PairNoise
+    factor: tuple[list[float], list[float]]
+    qualifies: Callable[[int], bool]
+    drift_end: int  # first candle index that is never drifted
+    mu: float  # in-window extra drift per candle (effect strength * sigma)
+    gap: list[float] | None = None  # open-gap multipliers (gaps=True), else None
+
+
+def _drift_windows(path: _Path, offset: float) -> tuple[list[bool], list[int]]:
     """(in-window flag per candle, trigger indices) of the close path with this ``offset``.
 
     Uses exactly the float arithmetic of :func:`_simulate_pair`, so the trigger test
     ``close > open`` agrees bit-for-bit with the candles that are finally emitted.
     """
-    f_shock, f_var = factor
+    spec, noise, (f_shock, f_var), qualifies = path.spec, path.noise, path.factor, path.qualifies
+    drift_end, mu, gap = path.drift_end, path.mu, path.gap
     beta = spec.sigma * math.sqrt(spec.factor_share)
     idio = spec.sigma * math.sqrt(1.0 - spec.factor_share)
     beta2, idio2 = beta * beta, idio * idio
-    mu = EFFECT_MU_SIGMAS * spec.sigma
     exp = math.exp
     window: list[bool] = []
     triggers: list[int] = []
     active_until = -1
-    o = spec.start_price
+    price = spec.start_price
     for t in range(len(noise.shock)):
         v = beta2 * f_var[t] + idio2 * noise.var[t]
         on = t <= active_until and t < drift_end
         d = (mu if on else 0.0) - offset if t < drift_end else 0.0
+        o = price if gap is None else price * gap[t]
         c = o * exp(-0.5 * v + d + beta * f_shock[t] + idio * noise.shock[t])
         window.append(on)
         if noise.spike[t] and c > o and qualifies(t):
             active_until = t + EFFECT_HORIZON
             triggers.append(t)
-        o = c
+        price = c
     return window, triggers
 
 
-def _conditional_offset(
-    spec: PairSpec,
-    noise: _PairNoise,
-    factor: tuple[list[float], list[float]],
-    qualifies: Callable[[int], bool],
-    drift_end: int,
-) -> float:
+def _conditional_offset(path: _Path) -> float:
     """Offset that makes the planted drift average (almost exactly) zero over [0, drift_end).
 
     The offset changes the returns and therefore which spike candles close up, i.e. which
@@ -334,12 +405,12 @@ def _conditional_offset(
     ``|residual|`` seen is returned; ``residual`` is a step function, so an exact zero need
     not exist, but the leftover is a few candles' worth of drift over the whole history.
     """
+    drift_end, mu = path.drift_end, path.mu
     if drift_end <= 0:
         return 0.0
-    mu = EFFECT_MU_SIGMAS * spec.sigma
 
     def residual(offset: float) -> float:
-        window, _ = _drift_windows(spec, noise, factor, qualifies, drift_end, offset)
+        window, _ = _drift_windows(path, offset)
         return mu * sum(window[:drift_end]) / drift_end - offset
 
     lo, hi = 0.0, mu
@@ -360,19 +431,13 @@ def _conditional_offset(
     return best_off
 
 
-def _simulate_pair(
-    spec: PairSpec,
-    noise: _PairNoise,
-    factor: tuple[list[float], list[float]],
-    qualifies: Callable[[int], bool],
-    drift_end: int,
-) -> tuple[list[Candle], PairTruth]:
-    f_shock, f_var = factor
+def _simulate_pair(path: _Path, gap_idx: Sequence[int] = ()) -> tuple[list[Candle], PairTruth]:
+    spec, noise, (f_shock, f_var), qualifies = path.spec, path.noise, path.factor, path.qualifies
+    drift_end, mu, gap = path.drift_end, path.mu, path.gap
     beta = spec.sigma * math.sqrt(spec.factor_share)
     idio = spec.sigma * math.sqrt(1.0 - spec.factor_share)
     beta2, idio2 = beta * beta, idio * idio
-    mu = EFFECT_MU_SIGMAS * spec.sigma
-    offset = _conditional_offset(spec, noise, factor, qualifies, drift_end)
+    offset = _conditional_offset(path)
     exp, sqrt = math.exp, math.sqrt
     candles: list[Candle] = []
     drift: list[float] = []
@@ -383,7 +448,7 @@ def _simulate_pair(
         v = beta2 * f_var[t] + idio2 * noise.var[t]
         on = t <= active_until and t < drift_end
         d = (mu if on else 0.0) - offset if t < drift_end else 0.0
-        o = price
+        o = price if gap is None else price * gap[t]
         c = o * exp(-0.5 * v + d + beta * f_shock[t] + idio * noise.shock[t])
         sd = sqrt(v)
         hi = max(o, c) * exp(WICK_SCALE * sd * noise.wick_up[t])
@@ -394,7 +459,9 @@ def _simulate_pair(
             active_until = t + EFFECT_HORIZON
             triggers.append(t)
         price = c
-    truth = PairTruth(tuple(noise.spike), tuple(drift), tuple(triggers), mu, offset, drift_end)
+    truth = PairTruth(
+        tuple(noise.spike), tuple(drift), tuple(triggers), mu, offset, drift_end, tuple(gap_idx)
+    )
     return candles, truth
 
 
@@ -414,7 +481,11 @@ def _uniform_ts(rng: random.Random, lo: int, hi: int) -> int:
 
 
 def make_events(seed: int, start_ts: int, end_ts: int) -> list[NewsEvent]:
-    """Synthetic news calendar over ``[start_ts, end_ts)``, sorted by time."""
+    """Synthetic news calendar over ``[start_ts, end_ts)``, sorted by time.
+
+    ``known_from_ts`` stays None: each event gets its kind's C2 default in news.py (scheduled
+    macro / unlock / bnb_burn / launchpool block +/-w; unscheduled regulatory only after).
+    """
     rng = _rng(seed, "events")
     start = datetime.fromtimestamp(start_ts // 1000, tz=UTC)
     first = start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -441,6 +512,13 @@ def make_events(seed: int, start_ts: int, end_ts: int) -> list[NewsEvent]:
 
 
 # ---------------------------------------------------------------------- public API
+def default_strength(world: str) -> float:
+    """In-window drift of ``world`` in sigma units when ``effect_strength`` is None."""
+    if world == "null":
+        return 0.0
+    return ZERO_EDGE_MU_SIGMAS if world == "zero_edge" else EFFECT_MU_SIGMAS
+
+
 def _check_args(world: str, years: float, pairs: Sequence[str], split_frac: float) -> int:
     if world not in WORLDS:
         raise ValueError(f"unknown world {world!r}; choose one of {WORLDS}")
@@ -454,15 +532,36 @@ def _check_args(world: str, years: float, pairs: Sequence[str], split_frac: floa
     return n
 
 
+def _strength(world: str, effect_strength: float | None) -> float:
+    if effect_strength is None:
+        return default_strength(world)
+    if isinstance(effect_strength, bool) or not isinstance(effect_strength, (int, float)):
+        raise ValueError(f"effect_strength must be a number or None, got {effect_strength!r}")
+    value = float(effect_strength)
+    if not (math.isfinite(value) and 0.0 <= value <= MAX_EFFECT_MU_SIGMAS):
+        raise ValueError(
+            f"effect_strength must be in [0, {MAX_EFFECT_MU_SIGMAS:g}] sigma units, got {value!r}"
+        )
+    if world == "null" and value != 0.0:
+        raise ValueError(
+            "the null world plants no effect; use 'planted' (or 'decay' / 'hour_edge') with "
+            "effect_strength for a power curve"
+        )
+    return value
+
+
 def generate_world(
     world: str,
     seed: int,
     years: float = 6.0,
     pairs: Sequence[str] = DEFAULT_PAIRS,
     split_frac: float = 0.7,
+    effect_strength: float | None = None,
+    gaps: bool = False,
 ) -> SyntheticWorld:
-    """Like ``make_world`` but also returns the ground truth (spikes, drift, triggers)."""
+    """Like ``make_world`` but also returns the ground truth (spikes, drift, triggers, gaps)."""
     n = _check_args(world, years, pairs, split_frac)
+    strength = _strength(world, effect_strength)
     split_idx = int(split_frac * n)
     factor = _factor_path(seed, n)
     drift_end = split_idx if world == "decay" else n
@@ -475,9 +574,11 @@ def generate_world(
     for pair in pairs:
         spec = PAIR_SPECS.get(base_of(pair), DEFAULT_SPEC)
         noise = _pair_noise(seed, pair, spec, n)
-        candles[pair], truth[pair] = _simulate_pair(spec, noise, factor, qualifies, drift_end)
+        gap, gap_idx = _gap_factors(seed, pair, spec, n) if gaps else (None, [])
+        path = _Path(spec, noise, factor, qualifies, drift_end, strength * spec.sigma, gap)
+        candles[pair], truth[pair] = _simulate_pair(path, gap_idx)
     events = make_events(seed, START_TS, START_TS + n * TIMEFRAME_MS)
-    return SyntheticWorld(world, seed, split_idx, candles, events, truth)
+    return SyntheticWorld(world, seed, split_idx, candles, events, truth, strength, bool(gaps))
 
 
 def make_world(
@@ -486,11 +587,19 @@ def make_world(
     years: float = 6.0,
     pairs: Sequence[str] = DEFAULT_PAIRS,
     split_frac: float = 0.7,
+    effect_strength: float | None = None,
+    gaps: bool = False,
 ) -> tuple[dict[str, list[Candle]], list[NewsEvent]]:
     """Generate one synthetic world: ``(candles per pair, sorted news events)``.
 
     ``years`` of 4H candles (2190 per year; 6 years = 13,140 per pair) from 2019-01-01 UTC.
     See the module docstring for the exact generative model of each world.
+
+    ``effect_strength`` overrides the world's in-window drift in sigma units (None = the
+    world default: EFFECT_MU_SIGMAS, ZERO_EDGE_MU_SIGMAS for "zero_edge"; the null world
+    only accepts None or 0). ``gaps=True`` adds occasional opens away from the previous
+    close (GAP_PROB, GAP_SIGMAS). With both left at their defaults the output is
+    byte-identical to the worlds before these options existed.
     """
-    w = generate_world(world, seed, years, pairs, split_frac)
+    w = generate_world(world, seed, years, pairs, split_frac, effect_strength, gaps)
     return w.candles, w.events

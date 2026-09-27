@@ -13,6 +13,7 @@ more than the background the ground truth implies", not "exactly zero".
 
 from __future__ import annotations
 
+import hashlib
 import math
 from functools import cache
 from itertools import pairwise
@@ -25,8 +26,11 @@ from research.trendbot.models import HOUR_MS
 from research.trendbot.synthetic import (
     EFFECT_HORIZON,
     EFFECT_MU_SIGMAS,
+    GAP_PROB,
+    GAP_SIGMAS,
     PAIR_SPECS,
     WORLDS,
+    ZERO_EDGE_MU_SIGMAS,
     generate_world,
     make_world,
 )
@@ -353,3 +357,132 @@ def test_synthetic_events():
     assert YEARS - 1 <= len(unlocks) <= YEARS
     assert all(e.scope == "ETH" and e.impact == "high" for e in unlocks)
     assert {e.kind for e in ev} == {"macro", "regulatory", "bnb_burn", "launchpool", "unlock"}
+
+
+# ---------------------------------------------------------------------- v3 C6 options
+def world_digest(data, events) -> tuple[str, str]:
+    """sha256 of every candle (exact float repr) and of every event, in a canonical order."""
+    candles = hashlib.sha256()
+    for pair in sorted(data):
+        for c in data[pair]:
+            row = f"{pair},{c.ts},{c.open!r},{c.high!r},{c.low!r},{c.close!r},{c.volume!r}\n"
+            candles.update(row.encode())
+    ev = hashlib.sha256()
+    for e in events:
+        ev.update(f"{e.ts},{e.scope},{e.impact},{e.kind},{e.note},{e.known_from_ts}\n".encode())
+    return candles.hexdigest(), ev.hexdigest()
+
+
+# Digests of the committed default worlds (seed 1, 6 years, default pairs), taken from the
+# generator BEFORE effect_strength / gaps / zero_edge existed. Any change to a default
+# world's bytes (and therefore to every committed result) fails here.
+PINNED_EVENTS = "d2e7ee8555d725576d056179e63f6ab5946763191198c896863e3b9518994b1f"
+PINNED_CANDLES = {
+    "null": "8d2bf31364aa64954b2323355e4e03d2bbfa5459714f3ba77d945df0a4cf21c8",
+    "planted": "26063bfc7d91cfebbf41620bbb792af3c353fd9589c1eaee53c9edcc008eacef",
+    "decay": "b5ce0d4609a6dcfb20c3a5d8d520783f44ffbe5052572706e0e8a7cc0e7b7161",
+    "hour_edge": "0f1c95b2f5aeca5b95fa41736a44fc85af1d0c6680666bcb69a7a7a8990e147d",
+}
+
+
+@pytest.mark.parametrize("name", sorted(PINNED_CANDLES))
+def test_default_worlds_are_byte_identical_to_the_committed_ones(name):
+    data, events = make_world(name, 1)
+    assert world_digest(data, events) == (PINNED_CANDLES[name], PINNED_EVENTS)
+    # Passing the defaults explicitly changes nothing either.
+    explicit = make_world(name, 1, effect_strength=None, gaps=False)
+    assert world_digest(*explicit) == (PINNED_CANDLES[name], PINNED_EVENTS)
+
+
+def test_effect_strength_overrides_the_planted_drift():
+    base = world("planted")
+    same = generate_world("planted", SEED, years=YEARS, effect_strength=EFFECT_MU_SIGMAS)
+    assert same.candles == base.candles and same.effect_strength == EFFECT_MU_SIGMAS
+    zero = generate_world("planted", SEED, years=YEARS, effect_strength=0.0)
+    assert zero.candles == world("null").candles  # strength 0 is exactly the null world
+    strong = generate_world("planted", SEED, years=YEARS, effect_strength=1.4)
+    for pair in PAIRS:
+        truth = strong.truth[pair]
+        assert truth.mu == pytest.approx(1.4 * sigma(pair))
+        assert abs(math.fsum(truth.drift)) <= 2 * K * truth.mu  # still conditional only
+        assert_present(pair, strong.candles[pair], truth, up_spikes(strong.candles[pair]))
+    # Stronger planted effect -> larger ground-truth in-window drift, same noise.
+    for pair in PAIRS:
+        vols = [c.volume for c in strong.candles[pair]]
+        assert vols == [c.volume for c in base.candles[pair]]
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("planted", -0.1, "effect_strength must be in"),
+        ("planted", float("nan"), "effect_strength must be in"),
+        ("planted", 50.0, "effect_strength must be in"),
+        ("planted", "0.5", "must be a number"),
+        ("planted", True, "must be a number"),
+        ("null", 0.3, "null world plants no effect"),
+    ],
+)
+def test_invalid_effect_strength(name, value, message):
+    with pytest.raises(ValueError, match=message):
+        make_world(name, 1, years=0.2, effect_strength=value)
+
+
+def test_null_accepts_zero_strength():
+    assert make_world("null", 1, years=0.2, effect_strength=0.0) == make_world("null", 1, years=0.2)
+
+
+def test_zero_edge_world_is_the_planted_mechanism_at_the_calibrated_strength():
+    assert "zero_edge" in WORLDS
+    w = world("zero_edge")
+    assert w.effect_strength == ZERO_EDGE_MU_SIGMAS
+    assert 0.0 < ZERO_EDGE_MU_SIGMAS < EFFECT_MU_SIGMAS
+    same = generate_world("planted", SEED, years=YEARS, effect_strength=ZERO_EDGE_MU_SIGMAS)
+    assert w.candles == same.candles and w.events == world("null").events
+    for pair in PAIRS:
+        truth = w.truth[pair]
+        assert truth.mu == pytest.approx(ZERO_EDGE_MU_SIGMAS * sigma(pair))
+        assert truth.triggers and truth.active_end == len(truth.drift)  # whole history
+        assert abs(math.fsum(truth.drift)) <= 2 * K * truth.mu
+        assert [c.volume for c in w.candles[pair]] == [
+            c.volume for c in world("null").candles[pair]
+        ]
+
+
+def test_gaps_are_opt_in_rare_sized_and_otherwise_share_the_noise():
+    plain, gapped = world("planted"), generate_world("planted", SEED, years=YEARS, gaps=True)
+    assert not plain.gaps and gapped.gaps
+    lo, hi = GAP_SIGMAS
+    total = 0
+    for pair in PAIRS:
+        assert plain.truth[pair].gaps == ()
+        idx = gapped.truth[pair].gaps
+        candles = gapped.candles[pair]
+        n = len(candles)
+        total += n
+        assert idx and 0 not in idx
+        rate = len(idx) / n
+        assert 0.5 * GAP_PROB <= rate <= 1.6 * GAP_PROB, f"{pair}: gap rate {rate:.4f}"
+        gap_set = set(idx)
+        for t in range(1, n):
+            jump = math.log(candles[t].open / candles[t - 1].close)
+            if t in gap_set:
+                size = abs(jump) / sigma(pair)
+                # |g| in [1, 3] sigma, shifted by the tiny martingale term -log(cosh(g)).
+                tol = math.log(math.cosh(hi * sigma(pair))) / sigma(pair) + 1e-9
+                assert lo - tol <= size <= hi + tol, f"{pair} candle {t}: {size:.3f} sigma"
+            else:
+                assert candles[t].open == candles[t - 1].close
+        ups = sum(candles[t].open > candles[t - 1].close for t in idx)
+        assert 0.25 * len(idx) <= ups <= 0.75 * len(idx)  # both directions
+        assert all(candle_problem(c) is None for c in candles)
+        assert [c.volume for c in candles] == [c.volume for c in plain.candles[pair]]
+    assert gapped.events == plain.events
+    assert generate_world("planted", SEED, years=YEARS, gaps=True).candles == gapped.candles
+
+
+def test_synthetic_events_leave_known_from_to_the_kind_default():
+    """C2: make_events never sets known_from_ts, so the news module applies the kind
+    default: scheduled kinds (macro, unlock, bnb_burn, launchpool) block +/-w, the
+    unscheduled 'regulatory' events only from their own timestamp on."""
+    assert all(e.known_from_ts is None for e in world("null").events)

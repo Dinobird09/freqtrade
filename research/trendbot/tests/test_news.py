@@ -1,3 +1,4 @@
+import random
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -7,9 +8,15 @@ from research.trendbot import news as news_mod
 from research.trendbot.config import StrategyConfig
 from research.trendbot.models import HOUR_MS, NewsEvent
 from research.trendbot.news import (
+    KNOWN_KINDS,
     RULE,
+    SCHEDULED_KINDS,
+    UNSCHEDULED_KINDS,
     NewsCalendar,
+    block_interval,
     format_time_utc,
+    is_scheduled,
+    known_from,
     load_events,
     parse_time_utc,
 )
@@ -27,17 +34,19 @@ def _ms(y, mo, d, h=0, mi=0):
     return int(datetime(y, mo, d, h, mi, tzinfo=UTC).timestamp() * 1000)
 
 
-def _ev(ts=T, scope="ALL", impact="high", kind="macro", note="test event"):
-    return NewsEvent(ts=ts, scope=scope, impact=impact, kind=kind, note=note)
+def _ev(ts=T, scope="ALL", impact="high", kind="macro", note="test event", known_from_ts=None):
+    return NewsEvent(
+        ts=ts, scope=scope, impact=impact, kind=kind, note=note, known_from_ts=known_from_ts
+    )
 
 
 def _cal(*events, cfg=CFG):
     return NewsCalendar(events, cfg)
 
 
-def _write(tmp_path, body, name="events.csv"):
+def _write(tmp_path, body, name="events.csv", header=HEADER):
     path = tmp_path / name
-    path.write_text(HEADER + body, encoding="utf-8")
+    path.write_text(header + body, encoding="utf-8")
     return path
 
 
@@ -65,6 +74,10 @@ def test_load_example_calendar():
     assert by_kind["regulatory"].ts == _ms(2024, 2, 20, 8)  # the +00:00 row
     assert by_kind["bnb_burn"].impact == "low"
     assert sum(e.kind == "macro" and e.impact == "high" for e in events) == 3
+    # known_from_utc: empty = kind default for every row but the pre-announced launchpool.
+    assert by_kind["launchpool"].known_from_ts == _ms(2024, 3, 19, 12)
+    assert all(e.known_from_ts is None for e in events if e.kind != "launchpool")
+    assert not is_scheduled(by_kind["regulatory"].kind)  # the headline is unscheduled
 
 
 def test_loader_normalizes_case_and_skips_blank_lines(tmp_path):
@@ -241,6 +254,11 @@ def test_calendar_rejects_invalid_events():
         NewsCalendar([_ev(impact="severe")], CFG)
     with pytest.raises(ValueError, match="scope"):
         NewsCalendar([_ev(scope="")], CFG)
+    with pytest.raises(ValueError, match="kind"):  # every kind must be (un)scheduled
+        NewsCalendar([_ev(kind="rumour")], CFG)
+    for bad in (1.5, "123", True, float("nan")):
+        with pytest.raises(ValueError, match="known_from_ts"):
+            NewsCalendar([_ev(known_from_ts=bad)], CFG)
 
 
 def test_bisect_only_scans_the_window_on_a_large_calendar(monkeypatch):
@@ -274,6 +292,10 @@ def test_example_calendar_semantics():
     assert all(cal.check(p, fomc - 2 * H - 1).allowed for p in PAIRS)
     reg = _ms(2024, 2, 20, 8)
     assert all(not cal.check(p, reg + H).allowed for p in PAIRS)
+    assert all(not cal.check(p, reg).allowed for p in PAIRS)
+    assert all(cal.check(p, reg - 1).allowed for p in PAIRS)  # unscheduled: no pre-window
+    assert all(cal.check(p, reg - H).allowed for p in PAIRS)
+    assert "unscheduled regulatory" in cal.check("BTC/USDT", reg + H).reason
     unlock = _ms(2024, 3, 1)
     assert not cal.check("BTC/USDT", unlock).allowed
     assert cal.check("ETH/USDT", unlock).allowed
@@ -287,7 +309,245 @@ def test_example_calendar_semantics():
     pool = _ms(2024, 3, 20)
     assert not cal.check("BNB/USDT", pool + 24 * H).allowed
     assert cal.check("BNB/USDT", pool + 24 * H + 1).allowed
+    # Announced 12h ahead (known_from_utc): the 24h pre-window starts only at the announcement.
+    assert not cal.check("BNB/USDT", pool - 12 * H).allowed
+    assert cal.check("BNB/USDT", pool - 12 * H - 1).allowed
+    assert "known from 2024-03-19T12:00:00Z" in cal.check("BNB/USDT", pool).reason
     assert cal.check("ETH/USDT", pool).allowed  # medium impact: no block for ETH
     quiet = _ms(2024, 2, 5)
     dec = cal.check("BNB/USDT", quiet)
-    assert dec.allowed and dec.rule == RULE and "No high-impact news" in dec.reason
+    assert dec.allowed and dec.rule == RULE and "No news blackout covers" in dec.reason
+    assert "unscheduled news from the moment it happened" in dec.reason
+
+
+# ------------------------------------------------------------------ C2: no look-ahead on R5
+M = 60_000
+
+
+def test_kind_partition_is_complete_and_disjoint():
+    assert set(SCHEDULED_KINDS) | set(UNSCHEDULED_KINDS) == set(KNOWN_KINDS)
+    assert not set(SCHEDULED_KINDS) & set(UNSCHEDULED_KINDS)
+    assert set(SCHEDULED_KINDS) == {"macro", "unlock", "bnb_burn", "launchpool"}
+    assert set(UNSCHEDULED_KINDS) == {"regulatory", "legal", "other"}
+    assert set(CFG.bnb_event_kinds) <= set(SCHEDULED_KINDS)
+    assert is_scheduled(" Macro ") and not is_scheduled("LEGAL")
+    with pytest.raises(ValueError, match="kind"):
+        is_scheduled("rumour")
+
+
+@pytest.mark.parametrize("kind", SCHEDULED_KINDS)
+def test_block_interval_scheduled_default_is_the_full_window(kind):
+    ev = _ev(kind=kind)
+    assert known_from(ev) == float("-inf")
+    assert block_interval(ev, 2 * H) == (T - 2 * H, T + 2 * H)
+    assert block_interval(ev, 24 * H) == (T - 24 * H, T + 24 * H)
+
+
+@pytest.mark.parametrize("kind", UNSCHEDULED_KINDS)
+def test_block_interval_unscheduled_default_starts_at_the_event(kind):
+    ev = _ev(kind=kind)
+    assert known_from(ev) == T
+    assert block_interval(ev, 2 * H) == (T, T + 2 * H)
+
+
+def test_block_interval_explicit_known_from():
+    # A scheduled print announced only 30 min ahead: the pre-window shrinks to 30 min.
+    assert block_interval(_ev(known_from_ts=T - 30 * M), 2 * H) == (T - 30 * M, T + 2 * H)
+    # known_from before the window start never widens the window.
+    assert block_interval(_ev(known_from_ts=T - 5 * H), 2 * H) == (T - 2 * H, T + 2 * H)
+    # An unscheduled kind that was in fact announced gets (at most) the full window back.
+    reg = _ev(kind="regulatory", known_from_ts=T - H)
+    assert block_interval(reg, 2 * H) == (T - H, T + 2 * H)
+    reg = _ev(kind="legal", known_from_ts=T - 9 * H)
+    assert block_interval(reg, 2 * H) == (T - 2 * H, T + 2 * H)
+    # Known only after its window had ended: an empty interval (start > end).
+    start, end = block_interval(_ev(kind="other", known_from_ts=T + 3 * H), 2 * H)
+    assert start > end
+
+
+def test_block_interval_rejects_bad_windows_and_floors_fractional_ms():
+    for bad in (-1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="window_ms"):
+            block_interval(_ev(), bad)
+    assert block_interval(_ev(), 2 * H + 0.9) == (T - 2 * H, T + 2 * H)
+    assert block_interval(_ev(), 0) == (T, T)
+
+
+@pytest.mark.parametrize("kind", UNSCHEDULED_KINDS)
+@pytest.mark.parametrize("scope", ["ALL", "BTC", "EXCHANGE:binance"])
+def test_unscheduled_headline_after_the_decision_does_not_block(kind, scope):
+    # The headline breaks 1h AFTER the entry decision: the live bot could not have known.
+    cal = _cal(_ev(kind=kind, scope=scope, note="surprise"))
+    dec = cal.check("BTC/USDT", T - H)
+    assert dec.allowed, dec.reason
+    assert dec.rule == RULE
+    assert cal.check("BTC/USDT", T - 1).allowed
+    assert cal.check("BTC/USDT", T - 2 * H).allowed
+
+
+@pytest.mark.parametrize("kind", UNSCHEDULED_KINDS)
+@pytest.mark.parametrize("scope", ["ALL", "BTC", "EXCHANGE:binance"])
+def test_unscheduled_headline_before_the_decision_blocks_its_tail(kind, scope):
+    # The same headline 1h BEFORE the decision: inside its +2h tail, so R5 blocks.
+    cal = _cal(_ev(kind=kind, scope=scope, note="surprise"))
+    dec = cal.check("BTC/USDT", T + H)
+    assert not dec.allowed
+    assert dec.rule == RULE
+    assert f"unscheduled {kind} event" in dec.reason
+    assert "blocks only from the moment it happened" in dec.reason
+    assert "blocked 2024-03-12T12:30:00Z to 2024-03-12T14:30:00Z" in dec.reason
+    for ts in (T, T + 1, T + 2 * H):
+        assert not cal.check("BTC/USDT", ts).allowed, ts
+    assert cal.check("BTC/USDT", T + 2 * H + 1).allowed
+
+
+@pytest.mark.parametrize("kind", ["macro", "unlock"])
+def test_scheduled_high_impact_still_blocks_before_the_print(kind):
+    cal = _cal(_ev(kind=kind, scope="ALL", note="CPI"))
+    dec = cal.check("ETH/USDT", T - H)  # 1h before the print
+    assert not dec.allowed
+    assert f"high-impact scheduled {kind} event" in dec.reason
+    assert "unscheduled" not in dec.reason
+    assert "scheduled, so known in advance" in dec.reason
+    assert "blocked 2024-03-12T10:30:00Z to 2024-03-12T14:30:00Z" in dec.reason
+    assert not cal.check("ETH/USDT", T - 2 * H).allowed
+    assert cal.check("ETH/USDT", T - 2 * H - 1).allowed
+    assert not cal.check("ETH/USDT", T + 2 * H).allowed
+
+
+def test_explicit_known_from_narrows_a_scheduled_pre_window():
+    cal = _cal(_ev(kind="macro", note="snap decision", known_from_ts=T - 30 * M))
+    assert cal.check("BTC/USDT", T - H).allowed  # before it was announced
+    assert cal.check("BTC/USDT", T - 30 * M - 1).allowed
+    dec = cal.check("BTC/USDT", T - 30 * M)
+    assert not dec.allowed
+    assert "known from 2024-03-12T12:00:00Z" in dec.reason
+    assert "scheduled macro event" in dec.reason
+    assert not cal.check("BTC/USDT", T + 2 * H).allowed  # the tail is unchanged
+    assert cal.check("BTC/USDT", T + 2 * H + 1).allowed
+
+
+def test_late_known_event_never_blocks():
+    cal = _cal(_ev(kind="regulatory", known_from_ts=T + 3 * H))
+    for ts in (T - 2 * H, T, T + H, T + 2 * H, T + 3 * H):
+        assert cal.check("BTC/USDT", ts).allowed, ts
+
+
+@pytest.mark.parametrize("kind", ["bnb_burn", "launchpool"])
+def test_bnb_24h_semantics_unchanged_and_explicit_known_from_narrows_them(kind):
+    cal = _cal(_ev(scope="BNB", impact="low", kind=kind))
+    for ts in (T - 24 * H, T - H, T + 24 * H):
+        dec = cal.check("BNB/USDT", ts)
+        assert not dec.allowed
+        assert f"scheduled {kind} event" in dec.reason and "unscheduled" not in dec.reason
+    assert cal.check("BNB/USDT", T - 24 * H - 1).allowed
+    assert cal.check("BNB/USDT", T + 24 * H + 1).allowed
+    announced = _cal(_ev(scope="BNB", impact="low", kind=kind, known_from_ts=T - 6 * H))
+    assert announced.check("BNB/USDT", T - 6 * H - 1).allowed
+    assert not announced.check("BNB/USDT", T - 6 * H).allowed
+    assert not announced.check("BNB/USDT", T + 24 * H).allowed
+
+
+def test_unscheduled_exchange_headline_on_bnb_uses_the_2h_news_window():
+    cal = _cal(_ev(scope="EXCHANGE:binance", kind="regulatory"))
+    assert cal.check("BNB/USDT", T - H).allowed
+    dec = cal.check("BNB/USDT", T + 2 * H)
+    assert not dec.allowed and "+/-2h news blackout" in dec.reason
+    assert cal.check("BNB/USDT", T + 2 * H + 1).allowed
+
+
+def test_calendar_keeps_known_from_through_normalization():
+    cal = _cal(_ev(scope="all", impact="HIGH", kind="Macro", known_from_ts=float(T - H)))
+    [ev] = cal.events
+    assert ev.known_from_ts == T - H and isinstance(ev.known_from_ts, int)
+    assert cal.check("BTC/USDT", T - H).allowed is False
+    assert cal.check("BTC/USDT", T - H - 1).allowed
+
+
+def test_check_matches_a_brute_force_oracle():
+    # Random calendars and decision times: check() must block exactly when some applicable
+    # event's block_interval contains ts (the bisect slice may never drop a blocking event).
+    rng = random.Random(7)
+    kinds = KNOWN_KINDS
+    scopes = ("ALL", "BTC", "BNB", "ETH", "EXCHANGE:binance", "EXCHANGE:coinbase")
+    for _ in range(40):
+        events = []
+        for _ in range(rng.randint(1, 12)):
+            ts = T + rng.randint(-60, 60) * 30 * M
+            kf = rng.choice([None, None, ts + rng.randint(-50, 10) * 30 * M])
+            events.append(
+                _ev(
+                    ts=ts,
+                    scope=rng.choice(scopes),
+                    impact=rng.choice(("high", "medium", "low")),
+                    kind=rng.choice(kinds),
+                    known_from_ts=kf,
+                )
+            )
+        cal = _cal(*events)
+        for _ in range(30):
+            ts = T + rng.randint(-70, 70) * 15 * M + rng.choice((0, 1, -1))
+            for pair in PAIRS:
+                base = pair.split("/")[0]
+                want = False
+                for ev in events:
+                    windows = []
+                    if ev.impact == "high" and ev.scope in ("ALL", base, "EXCHANGE:binance"):
+                        windows.append(2 * H)
+                    bnb_scope = ev.scope in ("ALL", "BNB", "EXCHANGE:binance")
+                    if base == "BNB" and ev.kind in ("bnb_burn", "launchpool") and bnb_scope:
+                        windows.append(24 * H)
+                    for w in windows:
+                        lo, hi = block_interval(ev, w)
+                        want = want or lo <= ts <= hi
+                assert cal.check(pair, ts).allowed is not want, (pair, ts, events)
+
+
+# ------------------------------------------------------------------ C2: known_from_utc column
+HEADER_KF = "time_utc,scope,impact,kind,note,known_from_utc\n"
+
+
+def test_loader_reads_the_known_from_column(tmp_path):
+    body = (
+        f"{T},ALL,high,macro,iso,2024-03-12T12:00:00Z\n"
+        f"{T},ALL,high,macro,ms,{T - H}\n"
+        f"{T},ALL,high,regulatory,empty = kind default,\n"
+        f"{T},ALL,high,macro,blank = kind default,   \n"
+        f"{T},ALL,high,other,offset,2024-03-12T13:00:00+01:00\n"
+    )
+    events = load_events(_write(tmp_path, body, header=HEADER_KF))
+    assert [e.known_from_ts for e in events] == [T - 30 * M, T - H, None, None, T - 30 * M]
+    cal = NewsCalendar(events[2:3], CFG)  # the regulatory row: unscheduled default
+    assert cal.check("BTC/USDT", T - H).allowed and not cal.check("BTC/USDT", T + H).allowed
+
+
+def test_loader_header_without_known_from_is_still_accepted(tmp_path):
+    [ev] = load_events(_write(tmp_path, f"{T},ALL,high,regulatory,old format\n"))
+    assert ev.known_from_ts is None
+    assert block_interval(ev, 2 * H) == (T, T + 2 * H)
+
+
+@pytest.mark.parametrize(
+    ("body", "line", "fragment"),
+    [
+        (f"{T},ALL,high,macro,ok,\n{T},ALL,high,macro,bad,soon\n", 3, "known_from_utc"),
+        (f"{T},ALL,high,macro,naive,2024-03-12T12:00:00\n", 2, "offset"),
+        (f"{T},ALL,high,macro,five columns only\n", 2, "columns"),
+        (f"{T},ALL,high,macro,seven,{T},x\n", 2, "columns"),
+    ],
+)
+def test_loader_known_from_errors_name_the_line(tmp_path, body, line, fragment):
+    path = _write(tmp_path, body, header=HEADER_KF)
+    with pytest.raises(ValueError, match=f"line {line}:") as info:
+        load_events(path)
+    assert fragment in str(info.value)
+
+
+def test_loader_rejects_a_misplaced_or_unknown_extra_column(tmp_path):
+    for header in (
+        "time_utc,known_from_utc,scope,impact,kind,note\n",
+        "time_utc,scope,impact,kind,note,known_from\n",
+    ):
+        path = _write(tmp_path, f"{T},ALL,high,macro,x,\n", header=header)
+        with pytest.raises(ValueError, match=r"line 1:.*header"):
+            load_events(path)

@@ -128,11 +128,70 @@ def test_load_dataset(tmp_path):
 
 def test_load_dataset_rejects_wrong_timeframe_and_empty_files(tmp_path):
     save_candles_csv(make(10, step=HOUR_MS), tmp_path / "BTC_USDT-4h.csv")  # 1h data, 4h name
-    with pytest.raises(ValueError, match="not a whole number of 4h apart"):
+    with pytest.raises(ValueError, match=r"lines 2-3: .* 1h apart, not a whole number of 4h"):
         load_dataset(tmp_path, ["BTC/USDT"])
     save_candles_csv([], tmp_path / "ETH_USDT-4h.csv")
     with pytest.raises(ValueError, match="no candles"):
         load_dataset(tmp_path, ["ETH/USDT"])
+
+
+def test_load_dataset_rejects_a_daily_file_saved_as_4h(tmp_path):
+    """Every 1d step IS a whole number of 4h bars, so only the MINIMUM spacing reveals it."""
+    daily = make(10, step=24 * HOUR_MS)
+    save_candles_csv(daily, tmp_path / "BTC_USDT-4h.csv")
+    with pytest.raises(ValueError, match="smallest spacing") as err:
+        load_dataset(tmp_path, ["BTC/USDT"])
+    msg = str(err.value)
+    assert "BTC_USDT-4h.csv" in msg and "is 1d" in msg and "not 4h" in msg
+    # The offending rows are named by line number and timestamp (first smallest step).
+    assert f"lines 2-3: {T0} (2024-01-01T00:00:00Z) -> {T0 + 24 * HOUR_MS}" in msg
+    with pytest.raises(ValueError, match="smallest spacing"):
+        load_candles_csv(tmp_path / "BTC_USDT-4h.csv", "4h")
+    with pytest.raises(ValueError, match="smallest spacing"):
+        load_candles_csv(tmp_path / "BTC_USDT-4h.csv", TF)
+    # Without a timeframe the file is just a valid candle file; as a 1d file it loads.
+    assert load_candles_csv(tmp_path / "BTC_USDT-4h.csv") == daily
+    save_candles_csv(daily, tmp_path / "BTC_USDT-1d.csv")
+    assert load_dataset(tmp_path, ["BTC/USDT"], "1d")["BTC/USDT"] == daily
+
+
+@pytest.mark.parametrize(
+    ("keep", "ok"),
+    [
+        (lambda i: True, True),  # complete 4h file
+        (lambda i: i not in (3, 4, 7), True),  # gaps are fine: the smallest step is still 4h
+        (lambda i: i % 2 == 0, False),  # every other candle missing: 8h file, not 4h
+    ],
+    ids=["complete", "with-gaps", "8h"],
+)
+def test_minimum_spacing_must_equal_the_timeframe(tmp_path, keep, ok):
+    candles = [c for i, c in enumerate(make(12)) if keep(i)]
+    save_candles_csv(candles, tmp_path / "BTC_USDT-4h.csv")
+    if ok:
+        assert load_dataset(tmp_path, ["BTC/USDT"])["BTC/USDT"] == candles
+        assert load_candles_csv(tmp_path / "BTC_USDT-4h.csv", "4h") == candles
+    else:
+        with pytest.raises(ValueError, match="smallest spacing between consecutive candles is 8h"):
+            load_dataset(tmp_path, ["BTC/USDT"])
+
+
+def test_the_smallest_step_is_reported_with_its_lines(tmp_path):
+    p = write(
+        tmp_path,
+        HEADER,
+        f"{T0},1,2,0.5,1.5,10",
+        f"{T0 + 3 * TF},1,2,0.5,1.5,10",
+        "",  # blank lines keep the physical line numbers
+        f"{T0 + 5 * TF},1,2,0.5,1.5,10",
+        f"{T0 + 7 * TF},1,2,0.5,1.5,10",
+    )
+    with pytest.raises(ValueError, match=r"is 8h \(first at lines 3-5: "):
+        load_candles_csv(p, "4h")
+    one = write(tmp_path, HEADER, f"{T0},1,2,0.5,1.5,10")
+    with pytest.raises(ValueError, match="at least 2 are needed to verify the 4h spacing"):
+        load_candles_csv(one, "4h")
+    with pytest.raises(ValueError):
+        load_candles_csv(one, 0)
 
 
 def test_gap_report():

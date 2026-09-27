@@ -1,4 +1,5 @@
 import csv
+import io
 import random
 import re
 from dataclasses import replace
@@ -29,12 +30,19 @@ from research.trendbot.review_sheet import (
     FLAG_WINDOW_END,
     FLAG_ZERO_HOLD,
     MD_NAME,
+    REVIEW_KEY,
+    REVIEW_OK_VALUES,
+    ReviewRow,
     auto_flags,
+    duplicate_keys,
+    entry_order,
     expected_sl_r,
     flag_code,
+    load_review,
     main,
     planned_net_rr,
     planned_rr,
+    review_key,
     review_row,
     write_review_pack,
 )
@@ -530,6 +538,7 @@ def test_md_has_every_trade_flags_and_signoff(tmp_path):
     md = paths["md"].read_text(encoding="utf-8")
     assert md.startswith("# Review\n")
     assert "must inspect EVERY row" in md
+    assert "(exactly Y or N; any other value is rejected when the sheet is read back)" in md
     assert "- Costs: fee 0.1000% per side, slippage 0.0500% on market fills" in md
     assert "| RR price | RR net |" in md
     for t in trades:
@@ -573,14 +582,18 @@ def test_md_decision_section_only_when_given(tmp_path):
 
 
 def test_md_escapes_pipes_and_warns(tmp_path):
+    # The same trade id in TRAIN and TEST is two distinct keys: allowed, with a note.
     trades = [replace(_trade(1), variant="a|b"), replace(_trade(1, signal_ts=T0 + TF))]
     cfg = CFG.with_changes(regime_filter=False)
-    md = write_review_pack(trades, tmp_path, "A | B", cfg)["md"].read_text(encoding="utf-8")
+    md = write_review_pack(trades, tmp_path, "A | B", cfg, split_ts=T0 + TF)["md"].read_text(
+        encoding="utf-8"
+    )
     assert md.startswith("# A \\| B\n")
     assert "| a\\|b |" in md
     assert "TEST-ONLY config" in md
-    assert "duplicate trade ids 1" in md
-    table_rows = [line for line in md.splitlines() if re.match(r"^\| 1 \| ALL \| ", line)]
+    assert "- Row key: (window, trade_id), unique in this pack" in md
+    assert "trade ids 1 appear in more than one window" in md
+    table_rows = [line for line in md.splitlines() if re.match(r"^\| 1 \| (TRAIN|TEST) \| ", line)]
     assert len(table_rows) == 2
 
 
@@ -682,3 +695,241 @@ def test_cli_reports_a_missing_journal_as_usage_error(tmp_path):
         main(["--journal", str(tmp_path / "missing.csv"), "--out-dir", str(tmp_path / "o")])
     assert exc.value.code == 2
     assert not (tmp_path / "o").exists()
+
+
+# ---------------------------------------------------------------------------- row keys (C3)
+def _split_trades():
+    """TRAIN ids 1-3 and TEST ids 4-5, like run_research (TEST ids offset past TRAIN)."""
+    split = T0 + 25 * TF
+    return split, _sample_trades()
+
+
+def test_review_key_and_duplicates():
+    split, trades = _split_trades()
+    assert REVIEW_KEY == ("window", "trade_id")
+    assert [review_key(t, split) for t in trades] == [
+        ("TRAIN", 1),
+        ("TRAIN", 2),
+        ("TRAIN", 3),
+        ("TEST", 4),
+        ("TEST", 5),
+    ]
+    assert duplicate_keys(trades, split) == []
+    twin = replace(trades[1], signal_ts=trades[1].signal_ts + TF)
+    assert duplicate_keys([*trades, twin], split) == [("TRAIN", 2)]
+    # The same id in different windows is two keys.
+    other_window = replace(trades[0], signal_ts=split + 50 * TF)
+    assert duplicate_keys([*trades, other_window], split) == []
+    assert duplicate_keys([*trades, other_window], None) == [("ALL", 1)]
+
+
+def test_pack_with_duplicate_keys_raises_and_writes_nothing(tmp_path):
+    split, trades = _split_trades()
+    dup = replace(trades[3], signal_ts=trades[3].signal_ts + TF)  # a second TEST id 4
+    with pytest.raises(
+        ValueError, match=r"duplicate review keys \(window, trade_id\): \(TEST, 4\)"
+    ):
+        write_review_pack([*trades, dup], tmp_path / "pack", "dup", CFG, split_ts=split)
+    assert not (tmp_path / "pack").exists()
+    with pytest.raises(ValueError, match=r"\(ALL, 1\)"):
+        write_review_pack([trades[0], replace(trades[0])], tmp_path / "all", "dup", CFG)
+
+
+def test_cli_rejects_a_journal_with_duplicate_ids(tmp_path, capsys):
+    journal = tmp_path / "trades.csv"
+    trades = _sample_trades()
+    write_journal([*trades, replace(trades[1], signal_ts=T0 + 60 * TF)], journal)
+    with pytest.raises(SystemExit) as exc:
+        main(["--journal", str(journal), "--out-dir", str(tmp_path / "o")])
+    assert exc.value.code == 2
+    assert "duplicate review keys" in capsys.readouterr().err
+    assert not (tmp_path / "o").exists()
+
+
+# ---------------------------------------------------------------------------- load_review
+def _fill(csv_path, verdicts, notes=None):
+    """Write reviewer verdicts (by trade_id) into a review CSV, like a person would."""
+    with csv_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    header = rows[0]
+    ok_col, note_col, id_col = (
+        header.index(c) for c in ("reviewer_ok", "reviewer_note", "trade_id")
+    )
+    for row in rows[1:]:
+        tid = int(row[id_col])
+        row[ok_col] = verdicts.get(tid, row[ok_col])
+        row[note_col] = (notes or {}).get(tid, row[note_col])
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh, lineterminator="\n").writerows(rows)
+    return csv_path
+
+
+def _rewrite(csv_path, transform):
+    lines = csv_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    csv_path.write_text("".join(transform(lines)), encoding="utf-8")
+    return csv_path
+
+
+def test_load_review_round_trips_a_fresh_pack(tmp_path):
+    split, trades = _split_trades()
+    paths = write_review_pack(trades, tmp_path, "rt", CFG, split_ts=split)
+    rows = load_review(paths["csv"])
+    assert all(isinstance(r, ReviewRow) for r in rows)
+    assert [r.key for r in rows] == [review_key(t, split) for t in entry_order(trades)]
+    by_id = {t.trade_id: t for t in trades}
+    for r in rows:
+        t = by_id[r.trade_id]
+        assert (r.pair, r.signal_ts) == (t.pair, t.signal_ts)
+        assert (r.reviewer_ok, r.reviewer_note) == ("", "")
+    # A plain tuple in the documented field order as well.
+    window, trade_id, pair, signal_ts, ok, note = rows[0]
+    assert (window, trade_id, pair, signal_ts, ok, note) == ("TRAIN", 1, "BTC/USDT", T0, "", "")
+
+
+def test_load_review_key_set_matches_the_journals(tmp_path):
+    # run_research: TRAIN journal ids 1..3, TEST journal ids offset past them (4, 5).
+    split, trades = _split_trades()
+    train = [t for t in trades if t.signal_ts < split]
+    test = [t for t in trades if t.signal_ts >= split]
+    paths = write_review_pack([*train, *test], tmp_path, "keys", CFG, split_ts=split)
+    keys = {r.key for r in load_review(paths["csv"])}
+    want = {("TRAIN", t.trade_id) for t in train} | {("TEST", t.trade_id) for t in test}
+    assert keys == want and len(keys) == len(trades)
+
+
+def test_load_review_reads_verdicts_and_notes(tmp_path):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "filled", CFG, split_ts=split)["csv"]
+    _fill(
+        csv_path,
+        {1: "Y", 2: " N ", 3: "Y", 4: "", 5: "Y"},
+        {2: "  stop sits above the swing low, reject ", 5: "gap-through explained"},
+    )
+    rows = {r.trade_id: r for r in load_review(csv_path)}
+    assert {i: r.reviewer_ok for i, r in rows.items()} == {1: "Y", 2: "N", 3: "Y", 4: "", 5: "Y"}
+    assert rows[2].reviewer_note == "stop sits above the swing low, reject"
+    assert rows[5].reviewer_note == "gap-through explained"
+    assert set(REVIEW_OK_VALUES) == {"Y", "N", ""}
+
+
+@pytest.mark.parametrize("bad", ["y", "n", "yes", "OK", "X", "1", "Y?", "YN"])
+def test_load_review_rejects_other_verdicts_with_the_line(tmp_path, bad):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "bad", CFG, split_ts=split)["csv"]
+    _fill(csv_path, {1: "Y", 3: bad})
+    with pytest.raises(ValueError, match=r"line 4: reviewer_ok") as info:
+        load_review(csv_path)
+    assert "must be Y (approved), N (rejected) or blank" in str(info.value)
+    assert str(csv_path) in str(info.value)
+
+
+def _header_edit(old, new):
+    def transform(lines):
+        return [lines[0].replace(old, new, 1), *lines[1:]]
+
+    return transform
+
+
+@pytest.mark.parametrize(
+    ("transform", "fragment"),
+    [
+        (_header_edit(",reviewer_ok,", ",verdict,"), "last 5 columns"),
+        (_header_edit(",reviewer_note", ""), "last 5 columns"),
+        (_header_edit("trade_id,window", "window,trade_id"), "first 24 columns"),
+        (_header_edit("signal_time_utc", "signal_ts"), "first 24 columns"),
+        (_header_edit("f_dist_regime_pct,", ""), "f_dist_regime_pct are missing"),
+        (_header_edit("f_rsi,f_vol_ratio", "f_vol_ratio,f_rsi"), "unique and sorted"),
+        (_header_edit("f_rsi,", "rsi,"), "must all be f_<feature>"),
+        (lambda lines: ["trade_id,window,reviewer_ok\n", *lines[1:]], "fewer than"),
+    ],
+)
+def test_load_review_validates_the_header(tmp_path, transform, fragment):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "hdr", CFG, split_ts=split)["csv"]
+    _rewrite(csv_path, transform)
+    with pytest.raises(ValueError, match=r"line 1: not a trades_review.csv header") as info:
+        load_review(csv_path)
+    assert fragment in str(info.value)
+
+
+def _cell_edit(line_no, column, value):
+    def transform(lines):
+        header = next(csv.reader([lines[0]]))
+        cells = next(csv.reader([lines[line_no - 1]]))
+        cells[header.index(column)] = value
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerow(cells)
+        return [*lines[: line_no - 1], buf.getvalue(), *lines[line_no:]]
+
+    return transform
+
+
+@pytest.mark.parametrize(
+    ("transform", "line", "fragment"),
+    [
+        (_cell_edit(3, "window", "train"), 3, "window 'train' is not one of"),
+        (_cell_edit(2, "window", "VALIDATION"), 2, "window"),
+        (_cell_edit(4, "trade_id", "3.0"), 4, "trade_id '3.0'"),
+        (_cell_edit(4, "trade_id", "-3"), 4, "trade_id"),
+        (_cell_edit(5, "pair", " "), 5, "pair is empty"),
+        (_cell_edit(2, "signal_time_utc", "2024-01-01T00:00:00"), 2, "no UTC offset"),
+        (_cell_edit(2, "signal_time_utc", "yesterday"), 2, "signal_time_utc"),
+        (_cell_edit(3, "trade_id", "1"), 3, "duplicate key (window, trade_id) = (TRAIN, 1)"),
+        (_cell_edit(6, "window", "ALL"), 6, "mixed with TRAIN/TEST"),
+        (lambda lines: [*lines[:2], lines[2].rstrip("\n") + ",extra\n", *lines[3:]], 3, "cells"),
+        (lambda lines: [*lines[:3], "4,TEST,BTC/USDT\n", *lines[3:]], 4, "cells"),
+    ],
+)
+def test_load_review_rejects_malformed_rows_with_the_line(tmp_path, transform, line, fragment):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "rows", CFG, split_ts=split)["csv"]
+    _rewrite(csv_path, transform)
+    with pytest.raises(ValueError, match=f"line {line}:") as info:
+        load_review(csv_path)
+    assert fragment in str(info.value)
+
+
+def test_load_review_duplicate_key_names_both_lines(tmp_path):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "dup", CFG, split_ts=split)["csv"]
+    _rewrite(csv_path, lambda lines: [*lines, lines[4]])  # repeat the TEST id 4 row
+    with pytest.raises(
+        ValueError, match=r"line 7: duplicate key .*\(TEST, 4\), first seen on line 5"
+    ):
+        load_review(csv_path)
+
+
+def test_load_review_tolerates_bom_blank_lines_and_crlf(tmp_path):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "bom", CFG, split_ts=split)["csv"]
+    _fill(csv_path, {1: "Y", 2: "N"})
+    text = csv_path.read_text(encoding="utf-8").replace("\n", "\r\n")
+    lines = text.splitlines(keepends=True)
+    csv_path.write_bytes(("﻿" + lines[0] + "\r\n" + "".join(lines[1:]) + ",,\r\n").encode())
+    rows = load_review(csv_path)
+    assert [r.key for r in rows] == [review_key(t, split) for t in entry_order(trades)]
+    assert [r.reviewer_ok for r in rows[:2]] == ["Y", "N"]
+
+
+def test_load_review_same_id_in_both_windows_and_all_packs(tmp_path):
+    split = T0 + 5 * TF
+    trades = [_trade(1, signal_ts=T0), _trade(1, signal_ts=split)]
+    rows = load_review(write_review_pack(trades, tmp_path / "a", "x", CFG, split_ts=split)["csv"])
+    assert [r.key for r in rows] == [("TRAIN", 1), ("TEST", 1)]
+    rows = load_review(write_review_pack(_sample_trades(), tmp_path / "b", "x", CFG)["csv"])
+    assert {r.window for r in rows} == {"ALL"} and len(rows) == 5
+
+
+def test_load_review_empty_and_header_only(tmp_path):
+    empty = tmp_path / "empty.csv"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="line 1: empty file"):
+        load_review(empty)
+    paths = write_review_pack([], tmp_path / "none", "none", CFG, split_ts=T0)
+    assert load_review(paths["csv"]) == []
+
+
+def test_load_review_accepts_extra_sorted_feature_columns(tmp_path):
+    t = _trade(features={**FEATURES, "zeta": 1.0, "alpha": 2.0})
+    rows = load_review(write_review_pack([t], tmp_path, "feat", CFG)["csv"])
+    assert [r.key for r in rows] == [("ALL", 1)]

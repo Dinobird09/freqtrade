@@ -5,6 +5,7 @@ import pytest
 from research.trendbot.config import RULE_IDS, StrategyConfig
 from research.trendbot.journal import ms_to_iso, write_journal
 from research.trendbot.journal_rules import (
+    GUARD_ADOPTION_NOTE,
     Adaptation,
     audit,
     main,
@@ -225,6 +226,22 @@ def test_cli_prints_table(tmp_path: Path, capsys):
     assert main([*argv, "--expectancy-guard"]) == 0
     out = capsys.readouterr().out
     assert "| L_expectancy_guard | ETH/USDT | risk x0.5 |" in out
+
+
+def test_cli_expectancy_guard_prints_the_adoption_note(tmp_path: Path, capsys):
+    path = tmp_path / "trades.csv"
+    write_journal([], path)
+    argv = ["--journal", str(path), "--equity", "10000", "--now", ms_to_iso(T0)]
+    assert main(argv) == 0
+    assert GUARD_ADOPTION_NOTE not in capsys.readouterr().out
+    assert main([*argv, "--expectancy-guard"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        "L_expectancy_guard is an optional layer; it may only be enabled live through the "
+        "adoption path with its own walk-forward evidence (run_research pre-registers "
+        "base+guard)"
+    ) in out
+    assert out.splitlines()[1] == GUARD_ADOPTION_NOTE  # right under the journal header line
 
 
 def test_cli_no_active_adaptations(tmp_path: Path, capsys):

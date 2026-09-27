@@ -26,12 +26,24 @@ The two phases are exposed separately (:func:`run_train`, then :func:`run_test`)
 ``strategy_discovery`` can complete every TRAIN phase, record its selection, and only then
 run any TEST backtest. :func:`walk_forward` simply chains them for one variant.
 
-Labels come from :func:`metrics.label` (expectancy with a bootstrap CI, never win rate) and
-the drawdown check from :func:`metrics.dd_check` on the TEST window.
+Labels come from :func:`metrics.label` (expectancy with multiplicity-adjusted iid and
+calendar-month block bootstrap lower bounds, never win rate; ``m`` pre-registered candidates,
+CONTRACT.md v3 C4). The drawdown check (C5, :func:`metrics.dd_check`) uses the TEST
+MARK-TO-MARKET max drawdown (:func:`metrics.mtm_max_dd_pct`, open positions valued at every
+4H close) against ``min(20 %, the 95th percentile of the max drawdown of TRAIN trade
+sequences bootstrapped at the TEST length)`` (:func:`metrics.train_dd_quantile`); both the
+realised and the MTM drawdown of each window are kept on the result.
+
+Layers (C1): :func:`layer_diff` compares a layer variant's journal with the base's per window
+by ``(pair, signal_ts)``: signals the layer vetoed, base trades absent from the layer's
+journal and layer trades absent from the base's journal. A layer can only VETO an entry that
+passed every mandatory rule; a veto (or the expectancy guard's smaller risk) can free R6
+budget or change R9 state, admitting other rule-compliant trades the base never took.
 """
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -39,9 +51,21 @@ from itertools import pairwise
 
 from .backtester import BacktestResult, enumerate_candidates, run_backtest
 from .config import StrategyConfig
-from .metrics import Summary, dd_check, label, summarize
+from .metrics import (
+    ALPHA,
+    M_CANDIDATES,
+    N_BOOT,
+    ROBUST_MIN_N,
+    Summary,
+    dd_check,
+    dd_limit,
+    label,
+    mtm_max_dd_pct,
+    summarize,
+    train_dd_quantile,
+)
 from .ml_filter import InsufficientData
-from .models import CandidateOutcome, Candle, EntryFilter, NewsEvent
+from .models import CandidateOutcome, Candle, EntryFilter, NewsEvent, Trade
 
 
 EntryFilterFactory = Callable[[Sequence[CandidateOutcome]], EntryFilter]
@@ -51,7 +75,13 @@ DEFAULT_MAX_DD_PCT = 20.0
 MIN_TRAIN = 30
 MIN_TEST = 30
 ML_LAYER = "L_ml_filter"
+GUARD_LAYER = "L_expectancy_guard"
 IN_SAMPLE = "in-sample"
+SUMMARY_SEED = 7  # metrics.summarize seed (recorded in the adoption label_params)
+BASE = "base"
+ML_VARIANT = "base+ml"
+GUARD_VARIANT = "base+guard"
+_GUARD_NOTE = re.compile(r"guard x([0-9.eE+-]+)")
 
 
 # ---------------------------------------------------------------------------- split
@@ -99,6 +129,23 @@ def split_ts(
     return start + k * tf
 
 
+# ---------------------------------------------------------------------------- statistics
+@dataclass(frozen=True)
+class Stats:
+    """How every summary of one walk-forward was computed (recorded for re-computation)."""
+
+    m: int = M_CANDIDATES  # pre-registered candidates sharing alpha (C4)
+    alpha: float = ALPHA
+    n_boot: int = N_BOOT
+    seed: int = SUMMARY_SEED
+
+    def summarize(self, trades: Sequence[Trade], starting_equity: float) -> Summary:
+        return summarize(trades, starting_equity, self.seed, self.n_boot, self.m, self.alpha)
+
+
+DEFAULT_STATS = Stats()
+
+
 # ---------------------------------------------------------------------------- results
 @dataclass
 class TrainPhase:
@@ -113,6 +160,8 @@ class TrainPhase:
     entry_filter: EntryFilter | None = None  # the fitted filter, applied unchanged to TEST
     n_train_candidates: int | None = None  # purged TRAIN candidates the layer was fit on
     fit_error: str | None = None  # InsufficientData message: nothing was backtested
+    train_mtm_dd_pct: float = 0.0  # mark-to-market max drawdown of the TRAIN window, %
+    stats: Stats = DEFAULT_STATS
 
     @property
     def train_in_sample(self) -> bool:
@@ -138,6 +187,12 @@ class WalkForwardResult:
     n_train_candidates: int | None = None
     fit_error: str | None = None
     max_dd_pct: float = DEFAULT_MAX_DD_PCT
+    train_mtm_dd_pct: float = 0.0  # mark-to-market (4H close) max drawdown, TRAIN window, %
+    test_mtm_dd_pct: float = 0.0  # mark-to-market (4H close) max drawdown, TEST window, %
+    train_dd_p95_pct: float | None = None  # C5 bootstrap p95 of TRAIN max DD at TEST length
+    min_train: int = MIN_TRAIN
+    min_test: int = MIN_TEST
+    stats: Stats = DEFAULT_STATS
 
     @property
     def train_in_sample(self) -> bool:
@@ -153,6 +208,33 @@ class WalkForwardResult:
     def ran(self) -> bool:
         """False when the layer could not be fitted and no backtest was run."""
         return self.fit_error is None
+
+    @property
+    def dd_limit_pct(self) -> float:
+        """The C5 limit the TEST MTM drawdown was held to: min(20 %, max_dd_pct, p95)."""
+        return dd_limit(self.max_dd_pct, self.train_dd_p95_pct)
+
+    @property
+    def reached_test_gate(self) -> bool:
+        """TRAIN avg R > 0 and >= 30 trades in both windows: the TEST lower bound decides."""
+        a, b = self.train_summary, self.test_summary
+        return self.ran and a.avg_r > 0 and min(a.n, b.n) >= ROBUST_MIN_N
+
+    def label_params(self) -> dict[str, object]:
+        """Keyword arguments that make ``adoption.recompute_walk_forward`` (metrics.summarize,
+        label and dd_check over the written journals) reproduce this label and ``dd_ok``.
+
+        The two drawdown numbers need the candles, so they are recorded as measured.
+        """
+        return {
+            "seed": self.stats.seed,
+            "n_boot": self.stats.n_boot,
+            "m": self.stats.m,
+            "alpha": self.stats.alpha,
+            "max_dd_pct": self.max_dd_pct,
+            "train_dd_p95_pct": self.train_dd_p95_pct,
+            "mtm_max_dd_pct": self.test_mtm_dd_pct,
+        }
 
 
 def _placeholder(
@@ -171,6 +253,10 @@ def _placeholder(
     )
 
 
+def _mtm(bt: BacktestResult, data: Mapping[str, Sequence[Candle]], cfg: StrategyConfig) -> float:
+    return mtm_max_dd_pct(bt.trades, data, cfg.starting_capital, cfg.fee_rate)
+
+
 # ---------------------------------------------------------------------------- phases
 def run_train(
     data: Mapping[str, Sequence[Candle]],
@@ -180,10 +266,12 @@ def run_train(
     entry_filter_factory: EntryFilterFactory | None = None,
     variant: str = "base",
     layer: str = ML_LAYER,
+    stats: Stats = DEFAULT_STATS,
 ) -> TrainPhase:
     """TRAIN phase: fit the layer on purged TRAIN candidates, then backtest ``[.., split)``.
 
-    Reads no candle at or after ``split``.
+    Reads no candle at or after ``split`` (the TRAIN backtest cuts its input there, and the
+    TRAIN trades it values mark-to-market all close before the split).
     """
     layer_name = layer if entry_filter_factory is not None else None
     entry_filter: EntryFilter | None = None
@@ -200,11 +288,12 @@ def run_train(
                 cfg,
                 split,
                 empty,
-                summarize([], cfg.starting_capital),
+                stats.summarize([], cfg.starting_capital),
                 layer_name,
                 None,
                 n_cands,
                 str(exc),
+                stats=stats,
             )
     train = run_backtest(
         data, cfg, events, start_ts=None, end_ts=split, entry_filter=entry_filter, variant=variant
@@ -214,15 +303,17 @@ def run_train(
         cfg,
         split,
         train,
-        summarize(train.trades, cfg.starting_capital),
+        stats.summarize(train.trades, cfg.starting_capital),
         layer_name,
         entry_filter,
         n_cands,
+        train_mtm_dd_pct=_mtm(train, data, cfg),
+        stats=stats,
     )
 
 
 def _unfitted_result(
-    phase: TrainPhase, events: Sequence[NewsEvent], max_dd_pct: float
+    phase: TrainPhase, events: Sequence[NewsEvent], max_dd_pct: float, min_train: int, min_test: int
 ) -> WalkForwardResult:
     empty_test = _placeholder(phase.cfg, bool(events), (phase.split_ts, None), phase.variant)
     reason = (
@@ -235,7 +326,7 @@ def _unfitted_result(
         train=phase.train,
         test=empty_test,
         train_summary=phase.train_summary,
-        test_summary=summarize([], phase.cfg.starting_capital),
+        test_summary=phase.stats.summarize([], phase.cfg.starting_capital),
         label="UNTESTED",
         label_reason=reason,
         dd_ok=False,
@@ -246,6 +337,9 @@ def _unfitted_result(
         n_train_candidates=phase.n_train_candidates,
         fit_error=phase.fit_error,
         max_dd_pct=max_dd_pct,
+        min_train=min_train,
+        min_test=min_test,
+        stats=phase.stats,
     )
 
 
@@ -257,10 +351,14 @@ def run_test(
     min_train: int = MIN_TRAIN,
     min_test: int = MIN_TEST,
 ) -> WalkForwardResult:
-    """TEST phase: backtest ``[split, ..)`` with the TRAIN-fitted filter, label the pair."""
+    """TEST phase: backtest ``[split, ..)`` with the TRAIN-fitted filter, label the pair.
+
+    The label uses ``phase.stats`` (m, alpha, n_boot, seed) for both windows; the drawdown
+    rule compares the TEST mark-to-market max drawdown with the C5 limit.
+    """
     if phase.fit_error is not None:
-        return _unfitted_result(phase, events, max_dd_pct)
-    cfg = phase.cfg
+        return _unfitted_result(phase, events, max_dd_pct, min_train, min_test)
+    cfg, stats = phase.cfg, phase.stats
     test = run_backtest(
         data,
         cfg,
@@ -270,9 +368,13 @@ def run_test(
         entry_filter=phase.entry_filter,
         variant=phase.variant,
     )
-    test_summary = summarize(test.trades, cfg.starting_capital)
-    verdict, why = label(phase.train_summary, test_summary, min_train, min_test)
-    dd_ok, dd_why = dd_check(test_summary, max_dd_pct)
+    test_summary = stats.summarize(test.trades, cfg.starting_capital)
+    verdict, why = label(
+        phase.train_summary, test_summary, min_train, min_test, stats.m, stats.alpha
+    )
+    test_mtm = _mtm(test, data, cfg)
+    p95 = train_dd_quantile(phase.train.trades, test_summary.n, stats.n_boot, stats.seed)
+    dd_ok, dd_why = dd_check(test_summary, max_dd_pct, p95, test_mtm)
     return WalkForwardResult(
         variant=phase.variant,
         split_ts=phase.split_ts,
@@ -289,6 +391,12 @@ def run_test(
         entry_filter=phase.entry_filter,
         n_train_candidates=phase.n_train_candidates,
         max_dd_pct=max_dd_pct,
+        train_mtm_dd_pct=phase.train_mtm_dd_pct,
+        test_mtm_dd_pct=test_mtm,
+        train_dd_p95_pct=p95,
+        min_train=min_train,
+        min_test=min_test,
+        stats=stats,
     )
 
 
@@ -305,14 +413,70 @@ def walk_forward(
     min_train: int = MIN_TRAIN,
     min_test: int = MIN_TEST,
     layer: str = ML_LAYER,
+    stats: Stats = DEFAULT_STATS,
 ) -> WalkForwardResult:
     """One variant through TRAIN then TEST (see the module docstring).
 
     ``split`` overrides :func:`split_ts` (used to share one split across many variants).
     ``entry_filter_factory(train_candidates) -> EntryFilter`` is FIT ON TRAIN ONLY and then
     applied unchanged to TEST; ``InsufficientData`` yields an ``UNTESTED`` result.
+    ``stats`` fixes m (pre-registered candidates), alpha, n_boot and the bootstrap seed.
     """
     evs = list(events)
     s = split if split is not None else split_ts(data, train_frac, cfg.timeframe_ms)
-    phase = run_train(data, cfg, evs, s, entry_filter_factory, variant, layer)
+    phase = run_train(data, cfg, evs, s, entry_filter_factory, variant, layer, stats)
     return run_test(data, phase, evs, max_dd_pct, min_train, min_test)
+
+
+# ---------------------------------------------------------------------------- layers (C1)
+TradeKey = tuple[str, int]  # (pair, signal_ts)
+
+
+def trade_keys(trades: Iterable[Trade]) -> set[TradeKey]:
+    """``(pair, signal_ts)`` of every trade: the identity used to compare two journals."""
+    return {(t.pair, t.signal_ts) for t in trades}
+
+
+def guard_multiplier_of(trade: Trade) -> float | None:
+    """The expectancy-guard multiplier the backtester noted on a trade (None if absent)."""
+    found = _GUARD_NOTE.search(trade.notes or "")
+    if found is None:
+        return None
+    try:
+        return float(found.group(1))
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class LayerDiff:
+    """One window of a layer variant compared with the base journal (CONTRACT.md v3 C1)."""
+
+    window: str  # "TRAIN" | "TEST"
+    vetoed: int  # signals the layer vetoed after every mandatory rule passed
+    reduced_risk: int  # layer trades entered at a guard multiplier < 1
+    base_only: int  # base trades absent from the layer's journal
+    layer_only: int  # layer trades absent from the base journal (admitted by freed R6/R9)
+    shared: int  # trades in both journals
+    base_n: int
+    layer_n: int
+
+
+def layer_diff(
+    base: Sequence[Trade], layer: Sequence[Trade], window: str, vetoed: int = 0
+) -> LayerDiff:
+    """Compare one window's journals by ``(pair, signal_ts)``; ``vetoed`` from the decisions."""
+    a, b = trade_keys(base), trade_keys(layer)
+    reduced = sum(1 for t in layer if (guard_multiplier_of(t) or 1.0) < 1.0)
+    return LayerDiff(window, vetoed, reduced, len(a - b), len(b - a), len(a & b), len(a), len(b))
+
+
+def layer_diffs(base: WalkForwardResult, layer: WalkForwardResult, rule: str) -> list[LayerDiff]:
+    """TRAIN and TEST :class:`LayerDiff` of ``layer`` versus ``base`` (vetoes counted under
+    ``rule``, e.g. ``L_ml_filter``); empty if the layer did not run."""
+    if not layer.ran:
+        return []
+    return [
+        layer_diff(base.train.trades, layer.train.trades, "TRAIN", layer.train.decisions[rule]),
+        layer_diff(base.test.trades, layer.test.trades, "TEST", layer.test.decisions[rule]),
+    ]

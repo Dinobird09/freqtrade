@@ -1,6 +1,6 @@
 # Trade review: ML layer `base+ml`
 
-**Human review pack.** The reviewer must inspect EVERY row of the trade table below (all 128 trades, also in `trades_review.csv`) before signing off: summary statistics alone are not a review. Automated flags only point at suspicious rows; an unflagged trade is not an approved trade. Record a verdict for every trade in the `reviewer_ok` (Y/N) and `reviewer_note` columns of `trades_review.csv`.
+**Human review pack.** The reviewer must inspect EVERY row of the trade table below (all 128 trades, also in `trades_review.csv`) before signing off: summary statistics alone are not a review. Automated flags only point at suspicious rows; an unflagged trade is not an approved trade. Record a verdict for every trade in the `reviewer_ok` (exactly Y or N; any other value is rejected when the sheet is read back) and `reviewer_note` columns of `trades_review.csv`.
 
 - Trades: 128 (TRAIN 94, TEST 34)
 - Closed trades: 128; open or missing exit: 0
@@ -10,6 +10,7 @@
 - Walk-forward split: 2023-03-14T00:00:00Z (TRAIN = signal candle before it, TEST = at or after it)
 - Config: `rr2_vol1.5_rsi50-70`, reward:risk 2.00 (net of costs), risk caps BNB 0.50%, BTC 1.00%, ETH 1.00%
 - Costs: fee 0.1000% per side, slippage 0.0500% on market fills (entry and stop), exchange `binance`. Risk is the ALL-IN loss at the stop, so a clean stop-out is -1R and a TP is +reward:risk R; `RR price` is the chart-distance ratio, `RR net` what a TP earns after both fees.
+- Row key: (window, trade_id), unique in this pack; `trades_review.csv` is matched against the TRAIN and TEST journals by this key
 
 ## Summary per window
 
@@ -173,7 +174,7 @@ Signal candles denied by each rule (the first failing rule is counted), for cont
 | R2_momentum | 5074 | Momentum: RSI(14) within [50, 70] on the entry candle |
 | R4_regime | 250 | Regime: close > EMA200 (unless explicitly testing it off) |
 | R6_correlation_cap | 164 | BTC/ETH/BNB share one risk budget; BNB never stacks |
-| L_ml_filter | 88 | Layer: logistic-regression filter (only removes trades, never adds) |
+| L_ml_filter | 88 | Layer: logistic-regression veto; it can only veto an entry that passed every mandatory rule and never approves one a rule denies (a veto can free R6 budget or change R9 state, which may admit other rule-compliant trades) |
 | R5_news_blackout | 17 | No entries within +/-2h of high-impact news; BNB +/-24h burns/launchpool |
 | R8_structure_stop | 3 | Stop behind a confirmed swing low with a buffer (BNB 0.5-0.8%) |
 

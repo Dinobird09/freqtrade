@@ -8,7 +8,10 @@ journal rows (``trade_id``) that caused it so a human can check it against the C
 - ``R9_circuit_breaker`` halt (scope = ``ALL``): trailing 7-day realized loss limit hit.
 - ``L_expectancy_guard`` (scope = the pair), only when ``cfg.expectancy_guard`` is True: the
   pair's last ``cfg.guard_window`` closed trades average R < 0 -> risk x ``guard_risk_mult``.
-  The window must be full (fewer closed trades never trigger it). Off by default.
+  The window must be full (fewer closed trades never trigger it). Off by default. It is an
+  optional layer: it may only be enabled live through the adoption path with its own
+  walk-forward evidence (``run_research`` pre-registers ``base+guard``, CONTRACT.md v3 C3),
+  and the CLI prints :data:`GUARD_ADOPTION_NOTE` whenever ``--expectancy-guard`` is used.
 
 Exit timing (CONTRACT.md v2 A2): every rule uses the effective exit time
 ``t_e = exit_ts + exit_time_uncertainty_ms``, exactly like ``CircuitBreakers``. A trade only
@@ -40,6 +43,11 @@ from .models import HOUR_MS, Trade
 
 R9 = "R9_circuit_breaker"
 GUARD = "L_expectancy_guard"
+# Printed by the CLI whenever --expectancy-guard is used (CONTRACT.md v3 C3).
+GUARD_ADOPTION_NOTE = (
+    "L_expectancy_guard is an optional layer; it may only be enabled live through the adoption "
+    "path with its own walk-forward evidence (run_research pre-registers base+guard)"
+)
 _BACKTEST_TF_H = StrategyConfig().timeframe_ms / HOUR_MS  # --backtest-journal offset, hours
 
 
@@ -218,7 +226,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expectancy-guard",
         action="store_true",
-        help="also evaluate the optional L_expectancy_guard layer (off by default)",
+        help=(
+            "also evaluate the optional L_expectancy_guard layer (off by default; enabling it "
+            "live needs its own walk-forward evidence through the adoption path)"
+        ),
     )
     parser.add_argument(
         "--backtest-journal",
@@ -262,6 +273,8 @@ def main(argv: list[str] | None = None) -> int:
         f"Journal {args.journal}: {len(trades)} trades ({closed} closed), audited at "
         f"{ms_to_iso(now_ts)} with equity {args.equity:.2f} ({convention})."
     )
+    if args.expectancy_guard:
+        print(GUARD_ADOPTION_NOTE)
     print()
     print(render_markdown(adaptations))
     return 0

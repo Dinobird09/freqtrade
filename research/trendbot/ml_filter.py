@@ -7,16 +7,28 @@ Newton/IRLS in pure Python. There is NO hyper-parameter search and NO threshold 
 
 - features are standardised with TRAIN mean/std only (std 0 -> 1);
 - the label is ``r_multiple > 0`` (fees and slippage included);
-- a trade is kept iff the predicted win probability exceeds the break-even probability
+- an entry is allowed iff the predicted win probability exceeds the break-even probability
   implied by the TRAIN average win and loss sizes,
-  ``p* = -avg_loss_r / (avg_win_r - avg_loss_r)``, i.e. where expectancy crosses zero.
+  ``p* = -avg_loss_r / (avg_win_r - avg_loss_r)``, i.e. where expectancy crosses zero;
+  otherwise it is vetoed.
 
-The layer can only REMOVE trades that already passed every mandatory rule.
+What the layer can and cannot do (CONTRACT.md v3 C1): it can only VETO an entry that passed
+every mandatory rule, and it never approves an entry a rule denies. A veto can free R6 risk
+budget or change R9 state, which may admit other rule-compliant trades the base variant did
+not take, so the layer's trade list is NOT a subset of the base's; reports count vetoed
+signals, base trades missing from the layer's journal and layer trades missing from the
+base's journal, matched by ``(pair, signal_ts)``.
 
 A fitted filter has an identity, :meth:`MLFilter.fingerprint` (CONTRACT.md v2 A3): the
 sha256 of a canonical JSON of its features, TRAIN means/stds, intercept, coefficients,
 threshold and l2 (floats as ``repr`` strings). The ML variant's adoption record pins it, so
 refitting the model, which changes the fingerprint, restarts the adoption path.
+
+Serialisation for the live bot: :meth:`MLFilter.to_json` writes the canonical model object,
+its fingerprint and the TRAIN statistics (every float as its exact ``repr`` string);
+:meth:`MLFilter.from_json` rebuilds the identical filter and raises ``ValueError`` if the
+recomputed fingerprint differs from the stored one (or from ``expected_fingerprint``), so a
+bot can only ever load the exact model that was tested.
 """
 
 from __future__ import annotations
@@ -35,6 +47,7 @@ _RAW_FEATURES = ("rsi", "vol_ratio", "ema_gap_pct", "dist_regime_pct")
 LOGIT_CLIP = 30.0  # |logit| cap: keeps exp() finite and probabilities strictly in (0, 1)
 _ARMIJO = 1e-4
 _MAX_HALVINGS = 40
+MODEL_FORMAT = "trendbot.MLFilter/1"  # to_json / from_json format tag
 
 
 class InsufficientData(ValueError):
@@ -379,7 +392,7 @@ class MLFilter:
                 None,
                 (
                     "ML filter cannot score this signal because an input feature is missing "
-                    "(insufficient indicator history), so the trade is removed."
+                    "(insufficient indicator history), so the entry is vetoed."
                 ),
             )
         basis = (
@@ -392,7 +405,7 @@ class MLFilter:
                 p,
                 (
                     f"ML win probability {p:.3f} is above the break-even {self.threshold:.3f} "
-                    f"({basis}), so the trade is kept."
+                    f"({basis}), so the entry is allowed."
                 ),
             )
         return (
@@ -400,7 +413,7 @@ class MLFilter:
             p,
             (
                 f"ML win probability {p:.3f} is at or below the break-even {self.threshold:.3f} "
-                f"({basis}), so the trade is removed."
+                f"({basis}), so the entry is vetoed."
             ),
         )
 
@@ -442,12 +455,86 @@ class MLFilter:
         """
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
 
+    def to_json(self) -> str:
+        """Canonical serialisation for the live bot (sorted keys, 2-space indent, newline).
+
+        ``{"format": MODEL_FORMAT, "fingerprint": <sha256>, "model": <the canonical_json
+        object>, "train": {train_n, train_wins, train_skipped, avg_win_r, avg_loss_r}}``;
+        every float is its exact ``repr`` string, so :meth:`from_json` rebuilds the model bit
+        for bit and ``fingerprint`` is exactly :meth:`fingerprint`.
+        """
+        data = {
+            "format": MODEL_FORMAT,
+            "fingerprint": self.fingerprint(),
+            "model": json.loads(self.canonical_json()),
+            "train": {
+                "train_n": self.train_n,
+                "train_wins": self.train_wins,
+                "train_skipped": self.train_skipped,
+                "avg_win_r": _float_text(self.avg_win_r),
+                "avg_loss_r": _float_text(self.avg_loss_r),
+            },
+        }
+        return json.dumps(data, sort_keys=True, indent=2) + "\n"
+
+    @classmethod
+    def from_json(cls, text: str, expected_fingerprint: str | None = None) -> MLFilter:
+        """Rebuild a filter written by :meth:`to_json`; verify its fingerprint on load.
+
+        Raises ``ValueError`` if the text is not a model of this format, if the fingerprint
+        recomputed from the rebuilt model differs from the stored one (the file was edited
+        or corrupted), or if ``expected_fingerprint`` (e.g. the adoption record's
+        ``model_fingerprint``) is given and differs.
+        """
+        try:
+            data = json.loads(text)
+            if data.get("format") != MODEL_FORMAT:
+                raise ValueError(f"not a {MODEL_FORMAT} model (format {data.get('format')!r})")
+            model, train = data["model"], data["train"]
+            if list(model["features"]) != list(FEATURES):
+                raise ValueError(f"model features {model['features']!r} are not {FEATURES}")
+            logistic = LogisticModel()
+            logistic.intercept = float(model["intercept"])
+            logistic.weights = tuple(float(w) for w in model["coefficients"])
+            logistic.l2 = float(model["l2"])
+            logistic.converged = True
+            ml = cls(
+                model=logistic,
+                means=[float(v) for v in model["means"]],
+                stds=[float(v) for v in model["stds"]],
+                threshold=float(model["threshold"]),
+                train_n=int(train["train_n"]),
+                train_wins=int(train["train_wins"]),
+                avg_win_r=float(train["avg_win_r"]),
+                avg_loss_r=float(train["avg_loss_r"]),
+                train_skipped=int(train["train_skipped"]),
+            )
+            stored = str(data["fingerprint"])
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise ValueError(f"malformed ML model JSON ({exc!r})") from exc
+        dims = {len(FEATURES), len(ml.means), len(ml.stds), len(logistic.weights)}
+        if len(dims) != 1:
+            raise ValueError("malformed ML model JSON: feature, mean, std and weight counts differ")
+        actual = ml.fingerprint()
+        if actual != stored:
+            raise ValueError(
+                f"ML model fingerprint mismatch: the file says {stored[:16]} but the model it "
+                f"contains hashes to {actual[:16]}, so it is not the model that was fingerprinted"
+            )
+        if expected_fingerprint is not None and actual != expected_fingerprint.strip().lower():
+            raise ValueError(
+                f"ML model fingerprint mismatch: expected {expected_fingerprint[:16]} (e.g. the "
+                f"adoption record) but the loaded model is {actual[:16]}"
+            )
+        return ml
+
     def describe(self) -> str:
         """One-sentence description of the fitted filter for reports."""
         return (
             f"Logistic filter (l2={self.l2:g}) fitted on {self.train_n} TRAIN candidates "
-            f"(TRAIN base win rate {self.train_base_rate:.1%}, context only) keeps signals whose "
-            f"predicted win probability exceeds the break-even {self.threshold:.3f}."
+            f"(TRAIN base win rate {self.train_base_rate:.1%}, context only) vetoes every "
+            f"rule-passing signal whose predicted win probability is at or below the "
+            f"break-even {self.threshold:.3f}."
         )
 
 

@@ -1,0 +1,62 @@
+{
+  "variant": "base+guard",
+  "config_fingerprint": "2c5274264328eeee055bc0d10a5fc963e931a4ca8e8bb7d1470ea8721e012a62",
+  "model_fingerprint": null,
+  "provenance": "synthetic:decay:1",
+  "data_files": null,
+  "events_file": null,
+  "backtest": {
+    "report_path": "REPORT.md",
+    "completed_utc": "2026-09-27T12:00:00Z",
+    "report_sha256": "139ed3f3cf45717d6a3afb7b416374ef0f08933d0a08c77173b06327453f9c96"
+  },
+  "walk_forward": {
+    "label": "TRAIN-ONLY",
+    "dd_ok": false,
+    "split_utc": "2023-03-14T00:00:00Z",
+    "train_n": 114,
+    "test_n": 56,
+    "test_avg_r": -0.1428571428571436,
+    "report_path": "REPORT.md",
+    "train_journal_path": "journals/base_plus_guard_train.csv",
+    "train_journal_sha256": "06d0397ca434621d4d0be7440015983cf44cbb1436cf08255a09400d9584cb8a",
+    "test_journal_path": "journals/base_plus_guard_test.csv",
+    "test_journal_sha256": "78134c578d74629c2d535dcfa067bf5a6ee75917438e74e90203d5581907f451",
+    "min_train": 30,
+    "min_test": 30,
+    "train_avg_r": 0.3066605174010761,
+    "label_params": {
+      "seed": 7,
+      "n_boot": 4000,
+      "m": 4,
+      "alpha": 0.05,
+      "max_dd_pct": 20.0,
+      "train_dd_p95_pct": 9.638060971478327,
+      "mtm_max_dd_pct": 13.759902797513963
+    }
+  },
+  "human_review": {
+    "reviewer": null,
+    "date_utc": null,
+    "trades_reviewed": null,
+    "trades_total": null,
+    "approved": null,
+    "notes": null,
+    "review_path": "review_base_plus_guard/trades_review.csv",
+    "review_sha256": "8749d2e585e29ab18bf950e8f4b512ab994cb09614fc3d9f6a97dba7989ad64a"
+  },
+  "testnet": {
+    "exchange": null,
+    "start_utc": null,
+    "end_utc": null,
+    "trades": null,
+    "rule_violations": null,
+    "journal_path": null,
+    "notes": null,
+    "events_path": null,
+    "events_sha256": null
+  },
+  "live": {
+    "enabled_utc": null
+  }
+}

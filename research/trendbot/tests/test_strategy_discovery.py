@@ -167,3 +167,13 @@ def test_selection_is_invariant_to_test_period_candles(world, result) -> None:
         if r.test_summary != s.test_summary
     ]
     assert changed, "the TEST perturbation must actually change TEST results"
+
+
+def test_only_the_selected_variant_is_judged(result: sd.DiscoveryResult) -> None:
+    """C4: discovery contributes ONE pre-registered TEST look; the rest is context."""
+    judged = [r.variant for r in result.results if result.judged(r.variant)]
+    assert judged == [result.selection.variant]
+    assert not result.judged(result.test_only[0])
+    for r in result.results:  # every variant is summarised with the same m = 4 rule
+        assert r.test_summary.lb_confidence == pytest.approx(1 - 0.05 / 4)
+        assert r.stats == wf.DEFAULT_STATS

@@ -7,9 +7,10 @@ from collections.abc import Sequence
 import pytest
 
 from research.trendbot import walkforward as wf
+from research.trendbot.adoption import recompute_walk_forward
 from research.trendbot.backtester import enumerate_candidates, run_backtest
 from research.trendbot.config import StrategyConfig
-from research.trendbot.metrics import dd_check, label
+from research.trendbot.metrics import dd_check, label, mtm_max_dd_pct, train_dd_quantile
 from research.trendbot.ml_filter import InsufficientData, MLFilter, make_factory
 from research.trendbot.models import HOUR_MS, CandidateOutcome, Candle
 from research.trendbot.synthetic import generate_world, make_world
@@ -105,7 +106,66 @@ def test_train_and_test_windows(world) -> None:
     assert not res.train_in_sample and res.train_tag == "TRAIN" and res.ran
     # label and drawdown check are exactly metrics.label / dd_check of the two summaries
     assert (res.label, res.label_reason) == label(res.train_summary, res.test_summary, 5, 5)
-    assert (res.dd_ok, res.dd_reason) == dd_check(res.test_summary, res.max_dd_pct)
+    # C5: TEST mark-to-market drawdown vs min(20%, TRAIN bootstrap p95 at the TEST length)
+    cap = CFG.starting_capital
+    assert res.test_mtm_dd_pct == mtm_max_dd_pct(res.test.trades, data, cap, CFG.fee_rate)
+    assert res.train_mtm_dd_pct == mtm_max_dd_pct(res.train.trades, data, cap, CFG.fee_rate)
+    assert res.train_dd_p95_pct == train_dd_quantile(res.train.trades, res.test_summary.n)
+    assert res.dd_limit_pct == min(20.0, res.train_dd_p95_pct)
+    assert (res.dd_ok, res.dd_reason) == dd_check(
+        res.test_summary, res.max_dd_pct, res.train_dd_p95_pct, res.test_mtm_dd_pct
+    )
+    assert res.dd_ok == (res.test_mtm_dd_pct <= res.dd_limit_pct)
+    assert res.test_mtm_dd_pct > 0 and res.train_mtm_dd_pct > 0
+
+
+def test_label_params_reproduce_the_verdict_from_the_journals(world) -> None:
+    """adoption.recompute_walk_forward(journals, label_params) == the walk-forward's own."""
+    data, events, _split = world
+    res = wf.walk_forward(data, CFG, events, min_train=5, min_test=5)
+    params = res.label_params()
+    assert set(params) == {
+        "seed",
+        "n_boot",
+        "m",
+        "alpha",
+        "max_dd_pct",
+        "train_dd_p95_pct",
+        "mtm_max_dd_pct",
+    }
+    assert (params["m"], params["alpha"], params["n_boot"]) == (4, 0.05, 4000)
+    v = recompute_walk_forward(res.train.trades, res.test.trades, CFG, 5, 5, params)
+    assert (v.label, v.label_reason) == (res.label, res.label_reason)
+    assert (v.dd_ok, v.dd_reason) == (res.dd_ok, res.dd_reason)
+    assert v.train == res.train_summary and v.test == res.test_summary
+
+
+def test_stats_fix_m_alpha_and_resamples(world) -> None:
+    data, events, _ = world
+    one = wf.walk_forward(data, CFG, events, stats=wf.Stats(m=1, n_boot=500))
+    assert one.test_summary.lb_confidence == pytest.approx(0.95)
+    assert one.test_summary.n_boot == 500 and one.label_params()["m"] == 1
+    four = wf.walk_forward(data, CFG, events)
+    assert four.test_summary.iid_lb < one.test_summary.iid_lb  # wider under m = 4
+
+
+def test_reached_test_gate(world) -> None:
+    data, events, _ = world
+    res = wf.walk_forward(data, CFG, events)
+    a, b = res.train_summary, res.test_summary
+    assert res.reached_test_gate == (a.avg_r > 0 and a.n >= 30 and b.n >= 30)
+
+
+def test_layer_diff_counts_both_directions() -> None:
+    def t(pair: str, ts: int, notes: str = "") -> object:
+        return type("T", (), {"pair": pair, "signal_ts": ts, "notes": notes})()
+
+    base = [t("BTC/USDT", 1), t("ETH/USDT", 2), t("BNB/USDT", 3)]
+    layer = [t("BTC/USDT", 1, "reserved 0.5% (guard x0.5)"), t("ETH/USDT", 9, "guard x1)")]
+    d = wf.layer_diff(base, layer, "TEST", vetoed=4)  # type: ignore[arg-type]
+    assert (d.window, d.vetoed, d.base_only, d.layer_only, d.shared) == ("TEST", 4, 2, 1, 1)
+    assert (d.reduced_risk, d.base_n, d.layer_n) == (1, 3, 2)
+    assert wf.guard_multiplier_of(layer[0]) == 0.5 and wf.guard_multiplier_of(base[0]) is None
 
 
 def test_test_backtest_starts_fresh(world) -> None:
@@ -125,6 +185,7 @@ def test_train_is_invariant_to_test_period_candles(world, perturbed) -> None:
     b = wf.walk_forward(perturbed, CFG, events)
     assert b.split_ts == split
     assert a.train_summary == b.train_summary
+    assert a.train_mtm_dd_pct == b.train_mtm_dd_pct  # MTM of TRAIN reads no TEST candle
     assert [(t.signal_ts, t.pnl) for t in a.train.trades] == [
         (t.signal_ts, t.pnl) for t in b.train.trades
     ]

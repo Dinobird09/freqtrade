@@ -15,6 +15,11 @@ Loading is strict: rows must be strictly ascending (no duplicates), prices finit
 raises ``ValueError`` naming the file and the 1-based line number, so bad data is fixed at the
 source instead of leaking into a backtest. Missing candles are NOT an error; use
 ``gap_report`` to list them.
+
+The timeframe is verified whenever it is known (``load_dataset``, or ``load_candles_csv``
+with ``timeframe=``): every spacing between consecutive candles must be a whole multiple of
+the timeframe and the SMALLEST spacing must equal it, so a 1h or a 1d file saved under a
+``-4h.csv`` name is refused with the offending line numbers and timestamps.
 """
 
 from __future__ import annotations
@@ -138,10 +143,9 @@ def _row_to_candle(row: Sequence[str], prev_ts: int | None) -> Candle:
     return candle
 
 
-def load_candles_csv(path: str | Path) -> list[Candle]:
-    """Load and validate one candle file; raise ValueError with the 1-based line number."""
-    p = Path(path)
-    out: list[Candle] = []
+def _read_rows(p: Path) -> list[tuple[int, Candle]]:
+    """``(1-based line number, candle)`` for every data row of a validated candle file."""
+    out: list[tuple[int, Candle]] = []
     with p.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.reader(fh)
         header = next(reader, None)
@@ -155,9 +159,67 @@ def load_candles_csv(path: str | Path) -> list[Candle]:
                 candle = _row_to_candle(row, prev_ts)
             except ValueError as exc:
                 raise ValueError(f"{p}: line {reader.line_num}: {exc}") from None
-            out.append(candle)
+            out.append((reader.line_num, candle))
             prev_ts = candle.ts
     return out
+
+
+def _fmt_span(ms: int) -> str:
+    """``14_400_000 -> "4h"``, ``86_400_000 -> "1d"`` (largest whole unit; else ms)."""
+    for unit in ("w", "d", "h", "m"):
+        if ms % _UNIT_MS[unit] == 0:
+            return f"{ms // _UNIT_MS[unit]}{unit}"
+    return f"{ms} ms"
+
+
+def _check_spacing(p: Path, rows: Sequence[tuple[int, Candle]], tf_ms: int) -> None:
+    """Refuse a file whose candles are not ``tf_ms`` candles (wrong or mixed timeframe).
+
+    Every spacing between consecutive candles must be a whole multiple of ``tf_ms`` (gaps
+    are allowed) AND the SMALLEST spacing must equal ``tf_ms``: a 1d file saved as
+    ``*-4h.csv`` passes the first test (1d is six 4h bars) but not the second.
+    """
+    tf = _fmt_span(tf_ms)
+    if len(rows) < 2:
+        raise ValueError(
+            f"{p}: {len(rows)} candle(s): at least 2 are needed to verify the {tf} spacing"
+        )
+    for (la, a), (lb, b) in pairwise(rows):
+        step = b.ts - a.ts
+        if step % tf_ms:
+            raise ValueError(
+                f"{p}: lines {la}-{lb}: candles at {a.ts} ({ts_to_iso(a.ts)}) and {b.ts} "
+                f"({ts_to_iso(b.ts)}) are {_fmt_span(step)} apart, not a whole number of {tf}: "
+                "wrong timeframe or misaligned file"
+            )
+    # The FIRST pair of consecutive rows with the smallest spacing.
+    k = min(range(len(rows) - 1), key=lambda i: rows[i + 1][1].ts - rows[i][1].ts)
+    (la, a), (lb, b) = rows[k], rows[k + 1]
+    step = b.ts - a.ts
+    if step != tf_ms:
+        raise ValueError(
+            f"{p}: the smallest spacing between consecutive candles is {_fmt_span(step)} "
+            f"(first at lines {la}-{lb}: {a.ts} ({ts_to_iso(a.ts)}) -> {b.ts} "
+            f"({ts_to_iso(b.ts)})), not {tf}: the file does not hold {tf} candles "
+            "(wrong timeframe in the file name?)"
+        )
+
+
+def load_candles_csv(path: str | Path, timeframe: str | int | None = None) -> list[Candle]:
+    """Load and validate one candle file; raise ValueError with the 1-based line number.
+
+    With ``timeframe`` (``"4h"`` or milliseconds) the candle spacing is verified too: every
+    step a whole multiple of it and the smallest step EQUAL to it (see ``_check_spacing``),
+    so a file holding another timeframe is refused with the offending lines and timestamps.
+    """
+    p = Path(path)
+    rows = _read_rows(p)
+    if timeframe is not None:
+        tf_ms = timeframe if isinstance(timeframe, int) else timeframe_to_ms(timeframe)
+        if isinstance(tf_ms, bool) or tf_ms <= 0:
+            raise ValueError(f"timeframe must be > 0 ms, got {timeframe!r}")
+        _check_spacing(p, rows, tf_ms)
+    return [c for _, c in rows]
 
 
 def save_candles_csv(candles: Iterable[Candle], path: str | Path) -> None:
@@ -188,9 +250,10 @@ def load_dataset(
 ) -> dict[str, list[Candle]]:
     """Load ``<data_dir>/<pair_filename>`` for every pair, in the given order.
 
-    Besides the per-file checks, every pair must be non-empty and its candle spacing must
-    be a whole multiple of the timeframe (catches e.g. a 1h file saved under a 4h name).
-    Gaps are allowed; see ``gap_report``.
+    Besides the per-file checks, every pair must be non-empty and hold ``timeframe``
+    candles: each spacing a whole multiple of the timeframe (gaps are allowed; see
+    ``gap_report``) and the smallest spacing exactly one timeframe. That catches a 1h file
+    saved under a 4h name as well as a 1d file saved under a 4h name.
     """
     tf_ms = timeframe_to_ms(timeframe)
     root = Path(data_dir)
@@ -202,16 +265,11 @@ def load_dataset(
                 f"{path}: no {timeframe} candle file for {pair}; download it with "
                 "`python -m research.trendbot.fetch_data` (needs network + ccxt)"
             )
-        candles = load_candles_csv(path)
-        if not candles:
+        rows = _read_rows(path)
+        if not rows:
             raise ValueError(f"{path}: header only, no candles")
-        for a, b in pairwise(candles):
-            if (b.ts - a.ts) % tf_ms:
-                raise ValueError(
-                    f"{path}: candles at {ts_to_iso(a.ts)} and {ts_to_iso(b.ts)} are not a "
-                    f"whole number of {timeframe} apart; wrong timeframe or misaligned file"
-                )
-        out[pair] = candles
+        _check_spacing(path, rows, tf_ms)
+        out[pair] = [c for _, c in rows]
     return out
 
 

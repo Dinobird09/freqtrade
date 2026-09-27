@@ -33,6 +33,17 @@ Window labels: with ``split_ts`` a trade is ``TRAIN`` if ``signal_ts < split_ts`
 ``TEST`` otherwise (entries are windowed by their signal candle, like the backtester);
 without a split every trade is ``ALL``.
 
+Row key (CONTRACT.md v3 C3): a row of ``trades_review.csv`` is identified by
+``(window, trade_id)`` (:data:`REVIEW_KEY`). The key is unique within a pack:
+:func:`write_review_pack` raises ``ValueError`` before writing anything if two trades share
+it (``run_research`` offsets TEST ids past the TRAIN ids, so its ids are even unique across
+windows). The adoption check reads the filled-in sheet back with :func:`load_review` and
+matches the key set against the TRAIN and TEST journals (the TRAIN journal supplies the
+``TRAIN`` keys, the TEST journal the ``TEST`` keys). ``load_review`` validates the header
+written here and every ``reviewer_ok`` cell: ``Y`` (approved), ``N`` (rejected) or blank
+(not reviewed yet); anything else (``y``, ``yes``, ``OK`` ...) is rejected with its line
+number, so a verdict is never guessed.
+
 Output is deterministic: stable row order, fixed-decimal number formatting, no timestamps
 of the run itself. The summary reports expectancy (avg R) only; win rate is deliberately
 not shown because it is never a target.
@@ -43,13 +54,16 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 from .config import RULE_IDS, ConfigError, StrategyConfig
 from .journal import FEATURE_PREFIX, iso_to_ms, ms_to_iso, read_journal
 from .models import EXIT_END, EXIT_SL, EXIT_TP, HOUR_MS, Trade
+from .news import parse_time_utc
 from .sizing import loss_per_unit, stop_fill_price
 
 
@@ -59,6 +73,14 @@ MD_NAME = "trades_review.md"
 WINDOW_TRAIN = "TRAIN"
 WINDOW_TEST = "TEST"
 WINDOW_ALL = "ALL"
+WINDOWS = (WINDOW_TRAIN, WINDOW_TEST, WINDOW_ALL)
+
+# The unique key of a review row (C3), and the verdicts a reviewer may enter.
+REVIEW_KEY = ("window", "trade_id")
+REVIEW_OK_YES = "Y"
+REVIEW_OK_NO = "N"
+REVIEW_OK_BLANK = ""  # not reviewed yet
+REVIEW_OK_VALUES = (REVIEW_OK_YES, REVIEW_OK_NO, REVIEW_OK_BLANK)
 
 # Keys of FeatureRow.ml_features(), sorted like the journal's f_<name> columns. They are
 # always present so the header is stable; extra feature keys on trades are merged in sorted.
@@ -256,6 +278,17 @@ def window_of(trade: Trade, split_ts: int | None) -> str:
 def entry_order(trades: Sequence[Trade]) -> list[Trade]:
     """Trades sorted by entry time, ties broken by ``trade_id``, pair, variant."""
     return sorted(trades, key=lambda t: (t.entry_ts, t.trade_id, t.pair, t.variant))
+
+
+def review_key(trade: Trade, split_ts: int | None) -> tuple[str, int]:
+    """The row key ``(window, trade_id)`` of ``trade`` in a pack split at ``split_ts``."""
+    return window_of(trade, split_ts), trade.trade_id
+
+
+def duplicate_keys(trades: Sequence[Trade], split_ts: int | None) -> list[tuple[str, int]]:
+    """Sorted ``(window, trade_id)`` keys shared by more than one trade (``[]`` if unique)."""
+    counts = Counter(review_key(t, split_ts) for t in trades)
+    return sorted(k for k, n in counts.items() if n > 1)
 
 
 # ---------------------------------------------------------------------------- auto flags
@@ -572,8 +605,9 @@ def _header_lines(
         "**Human review pack.** The reviewer must inspect EVERY row of the trade table below "
         f"(all {n} trades, also in `{CSV_NAME}`) before signing off: summary statistics alone "
         "are not a review. Automated flags only point at suspicious rows; an unflagged trade "
-        "is not an approved trade. Record a verdict for every trade in the `reviewer_ok` (Y/N) "
-        f"and `reviewer_note` columns of `{CSV_NAME}`.",
+        "is not an approved trade. Record a verdict for every trade in the `reviewer_ok` "
+        "(exactly Y or N; any other value is rejected when the sheet is read back) and "
+        f"`reviewer_note` columns of `{CSV_NAME}`.",
         "",
         f"- Trades: {n} ({', '.join(f'{w} {by_window[w]}' for w in windows)})",
         f"- Closed trades: {closed}; open or missing exit: {n - closed}",
@@ -604,9 +638,18 @@ def _header_lines(
             "- **TEST-ONLY config: the R4 regime filter is OFF. This variant can never be "
             "adopted.**"
         )
-    dup = sorted(k for k, v in Counter(t.trade_id for t in trades).items() if v > 1)
-    if dup:
-        lines.append(f"- **WARNING: duplicate trade ids {', '.join(map(str, dup))}**")
+    matched = (
+        "matched against the journal by this key"
+        if split_ts is None
+        else "matched against the TRAIN and TEST journals by this key"
+    )
+    lines.append(f"- Row key: (window, trade_id), unique in this pack; `{CSV_NAME}` is {matched}")
+    shared = sorted(k for k, v in Counter(t.trade_id for t in trades).items() if v > 1)
+    if shared:
+        lines.append(
+            f"- Note: trade ids {', '.join(map(str, shared))} appear in more than one window; "
+            "always quote the window with the id"
+        )
     return lines
 
 
@@ -734,8 +777,18 @@ def write_review_pack(
     Returns ``{"csv": path, "md": path}``. Rows are in entry order; ``split_ts`` labels
     trades TRAIN/TEST by signal time (else ALL); ``decision_counts`` (rule id -> denied
     signal candles, e.g. ``BacktestResult.decisions``) adds a denial table when given.
+    Raises ``ValueError`` (and writes nothing) if two trades share a ``(window, trade_id)``
+    key.
     """
     ordered = entry_order(list(trades))
+    dup = duplicate_keys(ordered, split_ts)
+    if dup:
+        shown = ", ".join(f"({w}, {i})" for w, i in dup)
+        raise ValueError(
+            f"duplicate review keys (window, trade_id): {shown}; every row of a review pack "
+            "must be identifiable by its key, so renumber the trades (e.g. offset the TEST "
+            "ids past the TRAIN ids)"
+        )
     flag_lists = [auto_flags(t, cfg) for t in ordered]
     rows = [review_row(t, cfg, split_ts, f) for t, f in zip(ordered, flag_lists, strict=True)]
     windows = [WINDOW_ALL] if split_ts is None else [WINDOW_TRAIN, WINDOW_TEST]
@@ -759,6 +812,121 @@ def write_review_pack(
     text = "\n\n".join("\n".join(s) for s in sections) + "\n"
     md_path.write_text(text, encoding="utf-8")
     return {"csv": csv_path, "md": md_path}
+
+
+# ---------------------------------------------------------------------------- reading back
+class ReviewRow(NamedTuple):
+    """One row of a filled-in ``trades_review.csv``, as read back by :func:`load_review`."""
+
+    window: str  # TRAIN | TEST | ALL
+    trade_id: int
+    pair: str
+    signal_ts: int  # epoch ms of the signal candle open (from signal_time_utc)
+    reviewer_ok: str  # "Y" (approved), "N" (rejected) or "" (not reviewed yet)
+    reviewer_note: str
+
+    @property
+    def key(self) -> tuple[str, int]:
+        """``(window, trade_id)``: the unique key of the row within its pack."""
+        return self.window, self.trade_id
+
+
+_TRADE_ID_RE = re.compile(r"[0-9]+")
+_LOAD_COLUMNS = ("window", "trade_id", "pair", "signal_time_utc", *REVIEWER_COLUMNS)
+
+
+def _header_problem(header: tuple[str, ...]) -> str | None:
+    """Why ``header`` is not one :func:`review_header` can write, or ``None`` if it is."""
+    n_head, n_tail = len(HEAD_COLUMNS), len(TAIL_COLUMNS)
+    if len(header) < n_head + n_tail:
+        return f"it has {len(header)} columns, fewer than the {n_head + n_tail} fixed ones"
+    if header[:n_head] != HEAD_COLUMNS:
+        return f"the first {n_head} columns must be {','.join(HEAD_COLUMNS)}"
+    if header[-n_tail:] != TAIL_COLUMNS:
+        return f"the last {n_tail} columns must be {','.join(TAIL_COLUMNS)}"
+    features = header[n_head:-n_tail]
+    if any(not c.startswith(FEATURE_PREFIX) or c == FEATURE_PREFIX for c in features):
+        return f"the columns between hold_h and ml_prob must all be {FEATURE_PREFIX}<feature>"
+    if list(features) != sorted(set(features)):
+        return f"the {FEATURE_PREFIX}<feature> columns must be unique and sorted"
+    missing = [FEATURE_PREFIX + k for k in BASE_FEATURES if FEATURE_PREFIX + k not in features]
+    if missing:
+        return f"the feature columns {','.join(missing)} are missing"
+    return None
+
+
+def _parse_review_row(cells: Mapping[str, str]) -> ReviewRow:
+    window = cells["window"].strip()
+    if window not in WINDOWS:
+        raise ValueError(f"window {window!r} is not one of {', '.join(WINDOWS)}")
+    trade_id = cells["trade_id"].strip()
+    if not _TRADE_ID_RE.fullmatch(trade_id):
+        raise ValueError(f"trade_id {trade_id!r} is not a non-negative integer")
+    pair = cells["pair"].strip()
+    if not pair:
+        raise ValueError("pair is empty")
+    signal_ts = parse_time_utc(cells["signal_time_utc"], "signal_time_utc")
+    ok = cells["reviewer_ok"].strip()
+    if ok not in REVIEW_OK_VALUES:
+        raise ValueError(
+            f"reviewer_ok {ok!r} must be {REVIEW_OK_YES} (approved), {REVIEW_OK_NO} (rejected) "
+            "or blank (not reviewed yet)"
+        )
+    return ReviewRow(window, int(trade_id), pair, signal_ts, ok, cells["reviewer_note"].strip())
+
+
+def load_review(path: str | Path) -> list[ReviewRow]:
+    """Read a (filled-in) ``trades_review.csv`` back, in file order, for the adoption check.
+
+    Validates that the header is one :func:`write_review_pack` writes (fixed head columns,
+    sorted ``f_<feature>`` columns, fixed tail), that every row has one cell per column, a
+    window in :data:`WINDOWS` (``ALL`` never mixed with ``TRAIN``/``TEST``), an integer
+    ``trade_id``, a pair, an offset-aware ``signal_time_utc`` and a ``reviewer_ok`` of
+    ``Y``, ``N`` or blank (surrounding whitespace ignored), and that the ``(window,
+    trade_id)`` keys are unique. Raises ``ValueError`` naming the file and line number of
+    the first problem. Blank lines are skipped; a UTF-8 BOM (spreadsheet export) is fine.
+    Whether every verdict is ``Y`` is for the caller (``adoption.check_promotion``) to judge.
+    """
+    p = Path(path)
+    rows: list[ReviewRow] = []
+    first_line: dict[tuple[str, int], int] = {}
+    split_pack: bool | None = None  # True: TRAIN/TEST rows; False: ALL rows
+    with p.open(newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        raw = next(reader, None)
+        if raw is None:
+            raise ValueError(f"{p}: line 1: empty file, expected a {CSV_NAME} header")
+        header = tuple(h.strip() for h in raw)
+        problem = _header_problem(header)
+        if problem is not None:
+            raise ValueError(f"{p}: line 1: not a {CSV_NAME} header: {problem}")
+        for fields in reader:
+            where = f"{p}: line {reader.line_num}"
+            if not any(f.strip() for f in fields):
+                continue
+            if len(fields) != len(header):
+                raise ValueError(f"{where}: expected {len(header)} cells, got {len(fields)}")
+            cells = dict(zip(header, fields, strict=True))
+            try:
+                row = _parse_review_row({c: cells[c] for c in _LOAD_COLUMNS})
+            except ValueError as exc:
+                raise ValueError(f"{where}: {exc}") from None
+            if row.key in first_line:
+                raise ValueError(
+                    f"{where}: duplicate key (window, trade_id) = ({row.window}, "
+                    f"{row.trade_id}), first seen on line {first_line[row.key]}"
+                )
+            is_split = row.window != WINDOW_ALL
+            if split_pack is not None and is_split != split_pack:
+                raise ValueError(
+                    f"{where}: window {row.window} mixed with "
+                    f"{'TRAIN/TEST' if split_pack else 'ALL'} rows (a pack is either split "
+                    "or not)"
+                )
+            split_pack = is_split
+            first_line[row.key] = reader.line_num
+            rows.append(row)
+    return rows
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -814,7 +982,10 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         parser.error(f"--journal: {exc}")
     title = args.title or f"Trade review: {Path(args.journal).name}"
-    paths = write_review_pack(trades, args.out_dir, title, cfg, split_ts=split)
+    try:
+        paths = write_review_pack(trades, args.out_dir, title, cfg, split_ts=split)
+    except ValueError as exc:
+        parser.error(f"--journal: {exc}")
     flagged = sum(1 for t in trades if auto_flags(t, cfg))
     print(f"{len(trades)} trades ({flagged} flagged) -> {paths['csv']} and {paths['md']}")
     return 0

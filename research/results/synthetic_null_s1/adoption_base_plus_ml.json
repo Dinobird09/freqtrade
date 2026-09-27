@@ -2,18 +2,38 @@
   "variant": "base+ml",
   "config_fingerprint": "9be9d6da6ad86d8579570ae32c09984ac335bda8ac8a52bbb11751042e1e03b9",
   "model_fingerprint": "bbc52bd7ee0166eaf2899d12f2aad10e5118cfc5595e36550ac6f5358d44f32d",
+  "provenance": "synthetic:null:1",
+  "data_files": null,
+  "events_file": null,
   "backtest": {
     "report_path": "REPORT.md",
-    "completed_utc": "2026-09-27T12:00:00Z"
+    "completed_utc": "2026-09-27T12:00:00Z",
+    "report_sha256": "a99b5bba981eecea6bb04bfe90b10af60b66686f86f21e6b4532569ea2b342c4"
   },
   "walk_forward": {
     "label": "UNTESTED",
-    "dd_ok": true,
+    "dd_ok": false,
     "split_utc": "2023-03-14T00:00:00Z",
     "train_n": 45,
     "test_n": 17,
     "test_avg_r": -0.29411764705882426,
-    "report_path": "REPORT.md"
+    "report_path": "REPORT.md",
+    "train_journal_path": "journals/base_plus_ml_train.csv",
+    "train_journal_sha256": "ff3b0eb4e1885b57e52daf4b3e9b6b666cdfb6fcdd66b4eb558ec211fa9472df",
+    "test_journal_path": "journals/base_plus_ml_test.csv",
+    "test_journal_sha256": "cd6c979e133f7bbcd3d26b8b93e371d3c70dc3fb6b1050c12a6e5af4929ab945",
+    "min_train": 30,
+    "min_test": 30,
+    "train_avg_r": 0.2666666666666652,
+    "label_params": {
+      "seed": 7,
+      "n_boot": 4000,
+      "m": 4,
+      "alpha": 0.05,
+      "max_dd_pct": 20.0,
+      "train_dd_p95_pct": 8.205264605710106,
+      "mtm_max_dd_pct": 8.834002282763702
+    }
   },
   "human_review": {
     "reviewer": null,
@@ -21,7 +41,9 @@
     "trades_reviewed": null,
     "trades_total": null,
     "approved": null,
-    "notes": null
+    "notes": null,
+    "review_path": "review_base_plus_ml/trades_review.csv",
+    "review_sha256": "04ea217a23f321b861d4be6c2a523de01014db00a47347e357b0cb7f4133644a"
   },
   "testnet": {
     "exchange": null,
@@ -30,7 +52,9 @@
     "trades": null,
     "rule_violations": null,
     "journal_path": null,
-    "notes": null
+    "notes": null,
+    "events_path": null,
+    "events_sha256": null
   },
   "live": {
     "enabled_utc": null

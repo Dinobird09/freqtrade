@@ -1,26 +1,51 @@
-"""R5 news blackout: a CSV news calendar and an O(log n) blackout check.
+"""R5 news blackout: a CSV news calendar and an O(log n) blackout check, without look-ahead.
 
-An entry at time ``ts`` for ``pair`` is blocked if ANY event satisfies:
+An event applies to an entry on ``pair`` with a window ``w`` when:
 
 - ``impact == "high"`` and ``scope`` is ``"ALL"``, the pair's base asset, or
-  ``"EXCHANGE:<cfg.exchange_id>"``, and ``|event.ts - ts| <= news_blackout_hours``;
-- the pair's base is ``BNB``, ``kind`` is in ``cfg.bnb_event_kinds`` (any impact), ``scope``
-  is ``"ALL"``, ``"BNB"`` or ``"EXCHANGE:binance"``, and
-  ``|event.ts - ts| <= bnb_event_blackout_hours``.
+  ``"EXCHANGE:<cfg.exchange_id>"``: ``w = news_blackout_hours`` (+/-2h by mandate);
+- the pair's base is ``BNB``, ``kind`` is in ``cfg.bnb_event_kinds`` (any impact), and
+  ``scope`` is ``"ALL"``, ``"BNB"`` or ``"EXCHANGE:binance"``: ``w = bnb_event_blackout_hours``
+  (+/-24h by mandate).
 
-Both boundaries are inclusive: an event exactly 2h away blocks, 2h + 1 ms does not. The
-lookup bisects the sorted event times for ``[ts - w, ts + w]`` (``w`` = widest window that
-can apply to the pair) and only filters the events inside that slice.
+If both apply, the wider window is used. An applicable event blocks an entry at ``ts`` iff
+``ts`` lies in its block interval (CONTRACT.md v3 C2, both ends inclusive)::
 
-CSV format (header required): ``time_utc,scope,impact,kind,note``. ``time_utc`` is either
-ISO-8601 with an explicit offset (``2024-03-12T12:30:00Z`` or ``...+00:00``; other offsets
-are converted to UTC) or integer epoch milliseconds. Timestamps without an offset are
-rejected so that a local-time typo can never silently shift a blackout window.
+    [max(event.ts - w, known_from), event.ts + w]          (see block_interval)
+
+``known_from`` is when the event became knowable. It is ``event.known_from_ts`` when set,
+otherwise the kind default:
+
+- :data:`SCHEDULED_KINDS` (macro, unlock, bnb_burn, launchpool) are on a calendar in advance:
+  ``known_from = -inf``, so the full ``+/-w`` window applies;
+- :data:`UNSCHEDULED_KINDS` (regulatory, legal, other) are headlines nobody could see coming:
+  ``known_from = event.ts``, so they block only ``[event.ts, event.ts + w]``. Blocking the
+  hours BEFORE a surprise headline would be look-ahead: a backtest would dodge news the
+  live bot could not have known about.
+
+An explicit ``known_from_ts`` narrows the pre-event window (a print announced only 30 min
+ahead blocks from then on) or, for an unscheduled kind that was in fact announced, widens it
+back up to ``event.ts - w``; it never widens anything beyond ``+/-w``. A ``known_from_ts``
+later than ``event.ts + w`` gives an empty interval (known only after its window had ended).
+Boundaries are inclusive: a scheduled event exactly 2h away blocks, 2h + 1 ms does not.
+The lookup bisects the sorted event times for ``[ts - W, ts + W]`` (``W`` = widest window
+that can apply to the pair) and only filters the events inside that slice.
+
+CSV format (header required), with or without the optional last column::
+
+    time_utc,scope,impact,kind,note[,known_from_utc]
+
+``time_utc`` and ``known_from_utc`` are either ISO-8601 with an explicit offset
+(``2024-03-12T12:30:00Z`` or ``...+00:00``; other offsets are converted to UTC) or integer
+epoch milliseconds. Timestamps without an offset are rejected so that a local-time typo can
+never silently shift a blackout window. An empty ``known_from_utc`` cell means the kind
+default above.
 """
 
 from __future__ import annotations
 
 import csv
+import math
 import re
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable
@@ -32,9 +57,16 @@ from .models import HOUR_MS, Decision, NewsEvent, base_of
 
 
 RULE = "R5_news_blackout"
+KNOWN_FROM_COLUMN = "known_from_utc"
 CSV_HEADER = ("time_utc", "scope", "impact", "kind", "note")
+CSV_HEADER_WITH_KNOWN_FROM = (*CSV_HEADER, KNOWN_FROM_COLUMN)
+ACCEPTED_HEADERS = (CSV_HEADER, CSV_HEADER_WITH_KNOWN_FROM)
 IMPACTS = ("high", "medium", "low")
 KNOWN_KINDS = ("macro", "regulatory", "legal", "unlock", "bnb_burn", "launchpool", "other")
+# CONTRACT.md v3 C2: scheduled kinds are knowable in advance (default known_from = -inf);
+# unscheduled kinds only from their own timestamp (default known_from = event.ts).
+SCHEDULED_KINDS: tuple[str, ...] = ("macro", "unlock", "bnb_burn", "launchpool")
+UNSCHEDULED_KINDS: tuple[str, ...] = ("regulatory", "legal", "other")
 BNB_EVENT_SCOPES = frozenset({"ALL", "BNB", "EXCHANGE:binance"})
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -43,8 +75,48 @@ _ASSET_RE = re.compile(r"[A-Z0-9]+")
 _EXCHANGE_ID_RE = re.compile(r"[a-z0-9_.-]+")
 
 
+# ---------------------------------------------------------------------------- semantics
+def is_scheduled(kind: str) -> bool:
+    """True for :data:`SCHEDULED_KINDS`, False for :data:`UNSCHEDULED_KINDS` (case-insensitive).
+
+    Raises ``ValueError`` for any other kind, so no event has an undefined default.
+    """
+    k = kind.strip().lower()
+    if k in SCHEDULED_KINDS:
+        return True
+    if k in UNSCHEDULED_KINDS:
+        return False
+    raise ValueError(f"kind {kind.strip()!r} is not one of {', '.join(KNOWN_KINDS)}")
+
+
+def known_from(event: NewsEvent) -> float:
+    """When ``event`` became knowable, epoch ms: ``event.known_from_ts`` if set, else ``-inf``
+    for a scheduled kind and ``event.ts`` for an unscheduled one (CONTRACT.md v3 C2)."""
+    scheduled = is_scheduled(event.kind)
+    if event.known_from_ts is not None:
+        return int(event.known_from_ts)
+    return -math.inf if scheduled else int(event.ts)
+
+
+def block_interval(event: NewsEvent, window_ms: float) -> tuple[int, int]:
+    """Inclusive block interval ``(start, end)`` of ``event`` for a +/-``window_ms`` blackout.
+
+    ``start = max(event.ts - w, known_from(event))`` and ``end = event.ts + w``: an entry
+    at ``ts`` is blocked iff ``start <= ts <= end``. The interval is empty (``start > end``)
+    if the event only became known after its window ended. ``w = floor(window_ms)``, which
+    is exactly equivalent to ``<= window_ms`` for integer-ms timestamps. Pure: this is the
+    single definition of R5 timing, shared by :class:`NewsCalendar` and the invariants.
+    """
+    if not (math.isfinite(window_ms) and window_ms >= 0):
+        raise ValueError(f"window_ms must be finite and >= 0, got {window_ms!r}")
+    w = math.floor(window_ms)
+    ts = int(event.ts)
+    start = max(ts - w, known_from(event))
+    return int(start), ts + w
+
+
 # ---------------------------------------------------------------------------- parsing
-def parse_time_utc(text: str) -> int:
+def parse_time_utc(text: str, column: str = "time_utc") -> int:
     """Parse integer epoch ms or offset-aware ISO-8601 into epoch ms (UTC)."""
     s = text.strip()
     if _INT_MS_RE.fullmatch(s):
@@ -52,9 +124,9 @@ def parse_time_utc(text: str) -> int:
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
-        raise ValueError(f"time_utc {s!r} is neither integer ms nor ISO-8601") from None
+        raise ValueError(f"{column} {s!r} is neither integer ms nor ISO-8601") from None
     if dt.utcoffset() is None:
-        raise ValueError(f"time_utc {s!r} has no UTC offset; append 'Z' or '+00:00'")
+        raise ValueError(f"{column} {s!r} has no UTC offset; append 'Z' or '+00:00'")
     delta = dt - _EPOCH
     return (delta.days * 86_400 + delta.seconds) * 1000 + delta.microseconds // 1000
 
@@ -100,45 +172,67 @@ def _normalize_kind(raw: str) -> str:
     return kind
 
 
-def _parse_row(fields: list[str], where: str) -> NewsEvent:
-    if len(fields) != len(CSV_HEADER):
+def _normalize_known_from(value: object) -> int | None:
+    if value is None:
+        return None
+    integral_float = isinstance(value, float) and math.isfinite(value) and value.is_integer()
+    if isinstance(value, bool) or not (isinstance(value, int) or integral_float):
+        raise ValueError(f"known_from_ts must be integer epoch ms or None, got {value!r}")
+    return int(value)  # type: ignore[arg-type]
+
+
+def _parse_known_from(text: str) -> int | None:
+    """``known_from_utc`` cell: empty -> ``None`` (kind default), else a timestamp."""
+    if not text.strip():
+        return None
+    return parse_time_utc(text, KNOWN_FROM_COLUMN)
+
+
+def _parse_row(fields: list[str], where: str, header: tuple[str, ...]) -> NewsEvent:
+    if len(fields) != len(header):
         raise ValueError(
-            f"{where}: expected {len(CSV_HEADER)} columns ({','.join(CSV_HEADER)}), "
-            f"got {len(fields)}"
+            f"{where}: expected {len(header)} columns ({','.join(header)}), got {len(fields)}"
         )
-    time_s, scope_s, impact_s, kind_s, note_s = fields
+    time_s, scope_s, impact_s, kind_s, note_s = fields[:5]
     try:
         ts = parse_time_utc(time_s)
         scope = normalize_scope(scope_s)
         impact = _normalize_impact(impact_s)
         kind = _normalize_kind(kind_s)
+        known = _parse_known_from(fields[5]) if len(header) > 5 else None
     except ValueError as exc:
         raise ValueError(f"{where}: {exc}") from None
-    return NewsEvent(ts=ts, scope=scope, impact=impact, kind=kind, note=note_s.strip())
+    return NewsEvent(
+        ts=ts, scope=scope, impact=impact, kind=kind, note=note_s.strip(), known_from_ts=known
+    )
 
 
 def load_events(path: str | Path) -> list[NewsEvent]:
     """Load a news calendar CSV; events are returned sorted by time (stable for ties).
 
-    Raises ``ValueError`` naming the file and line number of the first malformed row.
-    Blank lines are ignored. A header-only file yields an empty list.
+    The header is ``time_utc,scope,impact,kind,note`` with or without a trailing
+    ``known_from_utc`` column (empty cell = kind default, see module doc). Raises
+    ``ValueError`` naming the file and line number of the first malformed row. Blank lines
+    are ignored. A header-only file yields an empty list.
     """
     p = Path(path)
     events: list[NewsEvent] = []
+    accepted = " or ".join(",".join(h) for h in ACCEPTED_HEADERS)
     with p.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.reader(fh)
-        header = next(reader, None)
-        if header is None:
-            raise ValueError(f"{p}: line 1: empty file, expected header {','.join(CSV_HEADER)}")
-        if tuple(h.strip().lower() for h in header) != CSV_HEADER:
+        raw_header = next(reader, None)
+        if raw_header is None:
+            raise ValueError(f"{p}: line 1: empty file, expected header {accepted}")
+        header = tuple(h.strip().lower() for h in raw_header)
+        if header not in ACCEPTED_HEADERS:
             raise ValueError(
-                f"{p}: line {reader.line_num}: header must be {','.join(CSV_HEADER)} "
-                f"(got {','.join(header)})"
+                f"{p}: line {reader.line_num}: header must be {accepted} "
+                f"(got {','.join(raw_header)})"
             )
         for fields in reader:
             if not any(f.strip() for f in fields):
                 continue
-            events.append(_parse_row(fields, f"{p}: line {reader.line_num}"))
+            events.append(_parse_row(fields, f"{p}: line {reader.line_num}", header))
     events.sort(key=lambda e: e.ts)
     return events
 
@@ -148,10 +242,27 @@ def _normalize_event(ev: NewsEvent) -> NewsEvent:
     try:
         scope = normalize_scope(ev.scope)
         impact = _normalize_impact(ev.impact)
+        kind = _normalize_kind(ev.kind)
+        known = _normalize_known_from(ev.known_from_ts)
     except ValueError as exc:
         raise ValueError(f"invalid news event {ev!r}: {exc}") from None
-    kind = ev.kind.strip().lower()
-    return NewsEvent(ts=int(ev.ts), scope=scope, impact=impact, kind=kind, note=ev.note.strip())
+    return NewsEvent(
+        ts=int(ev.ts),
+        scope=scope,
+        impact=impact,
+        kind=kind,
+        note=ev.note.strip(),
+        known_from_ts=known,
+    )
+
+
+def _timing_text(ev: NewsEvent) -> str:
+    """How the event's pre-window was derived, for the denial reason."""
+    if ev.known_from_ts is not None:
+        return f"known from {format_time_utc(ev.known_from_ts)}"
+    if is_scheduled(ev.kind):
+        return "scheduled, so known in advance"
+    return "unscheduled, so it blocks only from the moment it happened"
 
 
 # ---------------------------------------------------------------------------- calendar
@@ -185,14 +296,22 @@ class NewsCalendar:
         return max(self._news_ms, self._bnb_ms) if base == "BNB" else self._news_ms
 
     def _window(self, ts: int, half_width_ms: float) -> tuple[int, int]:
-        """Index slice ``[lo, hi)`` of events with ``ts - w <= event.ts <= ts + w``."""
+        """Index slice ``[lo, hi)`` of events with ``ts - w <= event.ts <= ts + w``.
+
+        Every block interval lies inside ``[event.ts - w, event.ts + w]``, so this slice
+        holds every event that can block ``ts``.
+        """
         return (
             bisect_left(self._times, ts - half_width_ms),
             bisect_right(self._times, ts + half_width_ms),
         )
 
     def _applicable(self, ev: NewsEvent, base: str) -> tuple[float, float, str] | None:
-        """(window_ms, window_hours, label) of the widest blackout ``ev`` imposes on ``base``."""
+        """(window_ms, window_hours, label) of the widest blackout ``ev`` imposes on ``base``.
+
+        The wider window's block interval contains the narrower one's (same ``known_from``),
+        so checking only the widest applicable window is exact.
+        """
         best: tuple[float, float, str] | None = None
         if ev.impact == "high" and ev.scope in ("ALL", base, self._exchange_scope):
             best = (self._news_ms, self._news_hours, "news")
@@ -204,26 +323,31 @@ class NewsCalendar:
     def check(self, pair: str, ts: int) -> Decision:
         """R5 verdict for a long entry on ``pair`` at epoch-ms ``ts``; O(log n + k)."""
         base = base_of(pair)
-        width = self._max_window_ms(base)
-        lo, hi = self._window(ts, width)
-        hit: tuple[int, NewsEvent, float, str] | None = None
+        lo, hi = self._window(ts, self._max_window_ms(base))
+        hit: tuple[int, NewsEvent, float, str, tuple[int, int]] | None = None
         for idx in range(lo, hi):
             ev = self._events[idx]
             rule = self._applicable(ev, base)
             if rule is None:
                 continue
+            start, end = block_interval(ev, rule[0])
+            if not start <= ts <= end:
+                continue
             dist = abs(ev.ts - ts)
-            if dist <= rule[0] and (hit is None or dist < hit[0]):
-                hit = (dist, ev, rule[1], rule[2])
+            if hit is None or dist < hit[0]:
+                hit = (dist, ev, rule[1], rule[2], (start, end))
         if hit is None:
             return Decision(True, RULE, self._clear_reason(pair, ts, base))
-        _, ev, hours, label = hit
+        _, ev, hours, label, (start, end) = hit
+        sched = "scheduled" if is_scheduled(ev.kind) else "unscheduled"
+        note = " ".join(ev.note.split()) or "none"
         return Decision(
             False,
             RULE,
             f"{pair} entry at {format_time_utc(ts)} is inside the +/-{hours:g}h {label} "
-            f"blackout of the {ev.impact}-impact {ev.kind} event at {format_time_utc(ev.ts)} "
-            f"(scope {ev.scope}; note: {ev.note or 'none'}).",
+            f"blackout of the {ev.impact}-impact {sched} {ev.kind} event at "
+            f"{format_time_utc(ev.ts)} (blocked {format_time_utc(start)} to "
+            f"{format_time_utc(end)}: {_timing_text(ev)}; scope {ev.scope}; note: {note}).",
         )
 
     def _clear_reason(self, pair: str, ts: int, base: str) -> str:
@@ -237,6 +361,7 @@ class NewsCalendar:
         if base == "BNB":
             extra = f" and no {self._bnb_kinds_txt} event within +/-{self._bnb_hours:g}h"
         return (
-            f"No high-impact news within +/-{self._news_hours:g}h{extra} of the {pair} entry "
-            f"at {when}."
+            f"No news blackout covers the {pair} entry at {when}: no high-impact news within "
+            f"+/-{self._news_hours:g}h{extra}, each event counted only from when it was known "
+            "(unscheduled news from the moment it happened)."
         )

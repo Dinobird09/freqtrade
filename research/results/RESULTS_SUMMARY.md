@@ -3,202 +3,238 @@
 **NO real BTC/ETH/BNB data was backtested.** The build sandbox has no network access and no
 `ccxt`, so every number below comes from `synthetic.py` worlds with a KNOWN ground truth.
 They test the methodology: does the pipeline find an edge where one was planted, and does it
-refuse to find one where there is none? They are **not evidence about real markets**, and
-no variant here may be adopted on the strength of them. The exact commands for running the
-same pipeline on real data are at the end.
+refuse to find one where there is none? They are **not evidence about real markets**, and no
+variant here can be adopted on the strength of them: every adoption record written below is
+`synthetic:<world>:<seed>` and `adoption check --stage HUMAN_REVIEW` blocks it with
+`ADOPT_provenance`. The exact commands for running the same pipeline on real data are at the
+end.
 
 No win rate is promised or targeted anywhere in this package. A win rate without its
-reward:risk is meaningless: at the mandatory 2:1 a strategy breaks even near 33% winners.
-A backtest win rate near 90% would point to curve-fitting or look-ahead. The target is
-positive expectancy (avg R per trade, net of fees and slippage) that survives the 70/30
-chronological walk-forward with controlled drawdown. Win rate appears in the reports only
-as context, labelled "context only".
+reward:risk is meaningless: at the mandatory 2:1 a strategy breaks even near 33% winners, and
+a backtest win rate near 90% points to curve-fitting or look-ahead. The target is positive
+expectancy (avg R per trade, net of fees and slippage) that survives the 70/30 chronological
+walk-forward with controlled drawdown. Win rate appears in the reports only as context.
 
-Everything here was regenerated from the current code (CONTRACT.md v2). The previous run's
-files were deleted first.
+Everything in this folder was regenerated from the current code (CONTRACT.md v3). The
+previous cycle's folders were deleted first. Every folder holds a `run.log` written by
+`run_research` itself: the exact command (argv) and the console summary.
+
+## The rules every label below uses (fixed in advance, never tuned on TEST)
+
+- **Four pre-registered candidates get one TEST look each (m = 4):** `base` (the mandate
+  config), the discovery-selected variant (highest TRAIN t-stat of 12 legal tightenings,
+  chosen before any TEST backtest), `base+ml` (logistic veto layer fitted on purged TRAIN
+  candidates) and `base+guard` (`expectancy_guard=True`). The 11 other grid variants and the
+  regime-OFF test variant are shown as `context: <label>, not judged`.
+- **ROBUST** needs all of: >= 30 trades in each window; TRAIN avg R > 0; TEST avg R > 0; and
+  a one-sided lower bound of the TEST mean at confidence 1 - 0.05/4 = **98.75%** above zero
+  for BOTH an iid bootstrap and a calendar-month block bootstrap of the TEST R (4000 seeded
+  resamples each; the more conservative bound is used). Bonferroni over the four looks keeps
+  the chance that ANY candidate is falsely called ROBUST at about 5% or less when none has an
+  edge. The block bootstrap resamples whole calendar months, so trades that cluster in one
+  regime count as one piece of evidence, not many.
+- A positive TEST mean that fails only the bound is **UNTESTED** ("positive but not
+  distinguishable from zero after multiplicity correction"). TRAIN avg R <= 0 is NO-EDGE,
+  TEST avg R <= 0 is TRAIN-ONLY.
+- **Drawdown (C5):** every result reports the realised (closed-trade) and the mark-to-market
+  (open positions at each 4H close) max drawdown. `dd_ok` = TEST MTM max drawdown <= min(20%,
+  the 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST
+  length). The adoption path needs ROBUST AND `dd_ok`.
+- **Layers (C1):** a layer can only VETO an entry that passed every mandatory rule; it never
+  approves one a rule denies. A veto (or the guard's halved risk) can free R6 budget or change
+  R9 state, which admits other rule-compliant trades the base never took. Every report counts,
+  per window: signals vetoed, base trades absent from the layer's journal, and layer trades
+  absent from the base journal (matched by pair and signal time).
 
 ## Cost assumptions used by every run below
 
-- Fee **0.10% of notional per side**, the Binance spot taker default, charged on the entry
-  AND on the exit (`--fee-rate 0.001`).
-- Slippage **0.05%** against the trade on market fills (`--slippage-pct 0.05`): entries and
-  stop exits. Take-profit limit exits get no slippage.
-- Exchange id `binance` (`--exchange-id`).
-- Cost-aware sizing (CONTRACT.md v2 A1). The planned risk is the ALL-IN loss at the stop:
-  the stop fill after slippage, plus both fees. So a clean stop is exactly -1R, and the target
-  is placed so that a take-profit nets exactly +2R (the mandate's 2:1) after fees. Only a gap
-  through the stop can lose more than 1R. At these costs, fees alone averaged 0.06R per
-  baseline trade (median stop distance 3.5-3.8% of the entry price; see each REPORT.md,
-  section 2).
-- **Coinbase Advanced Trade taker fees at low volume tiers are several times Binance's.** A
-  Coinbase run must pass the account's real tier with `--fee-rate` (a fraction per side:
-  0.006 = 0.6%) and `--exchange-id coinbase`, or every number is optimistic. How much this
-  matters, measured (not committed; the command is shown): the same planted seed-1 world at
-  a 0.6% fee (`--synthetic planted --seed 1 --fee-rate 0.006 --exchange-id coinbase`) cut the
-  baseline from ROBUST (TRAIN +0.296R, TEST +0.412R) to UNTESTED (TRAIN +0.127R, TEST
-  +0.043R, n=46). Fees alone then cost 0.25R per trade, and the verdict became "No robust
-  result found." A real edge that is smaller than this deliberately strong synthetic one would
-  not survive Coinbase low-tier fees.
+- Fee **0.10% of notional per side** (Binance spot taker, `--fee-rate 0.001`), charged on
+  entry AND exit; slippage **0.05%** on market fills (`--slippage-pct 0.05`), none on
+  take-profit limits; exchange `binance`.
+- Cost-aware sizing (CONTRACT.md v2 A1): a clean stop is exactly -1R and a take-profit nets
+  exactly +2R after fees. At these costs fees alone averaged 0.06R per baseline trade in every
+  seed-1 run (median stop distance 3.5-3.8% of the entry; REPORT.md section 2).
+- **Coinbase Advanced Trade taker fees at low tiers are several times Binance's.** A Coinbase
+  run must pass the real tier (`--fee-rate 0.006` = 0.6% per side, `--exchange-id coinbase`),
+  or every number is optimistic. Fees scale with the rate, so at 0.6% per side fees alone
+  would cost about 0.36R per trade instead of 0.06R (an estimate, not a committed run), which
+  is most of the edges measured below.
 
 ## What was run (all executed; the outputs are in this folder)
 
 | folder | command (from the repo root) | wall time (4 CPUs) |
 |---|---|---:|
-| `synthetic_null_s1/` | `python -m research.trendbot.run_research --synthetic null --seed 1 --now 2026-09-27T12:00:00Z --out-dir research/results/synthetic_null_s1` | 29 s |
-| `synthetic_planted_s1/` | the same with `--synthetic planted` | 28 s |
-| `synthetic_decay_s1/` | the same with `--synthetic decay` | 29 s |
-| `synthetic_hour_edge_s1/` | the same with `--synthetic hour_edge` | 29 s |
-| `calibration_null/` | `python -m research.trendbot.run_research --synthetic null --calibrate-seeds 20 --workers 4 --out-dir research/results/calibration_null` | 123 s |
-| `calibration_planted/` | the same with `--synthetic planted --calibrate-seeds 10` | 72 s |
-| `calibration_decay/` | the same with `--synthetic decay --calibrate-seeds 10` | 73 s |
-| `calibration_hour_edge/` | the same with `--synthetic hour_edge --calibrate-seeds 10` | 75 s |
+| `synthetic_null_s1/` | `python -m research.trendbot.run_research --synthetic null --seed 1 --now 2026-09-27T12:00:00Z --out-dir research/results/synthetic_null_s1` | 36 s |
+| `synthetic_planted_s1/` | the same with `--synthetic planted` (`--out-dir research/results/synthetic_planted_s1`) | 37 s |
+| `synthetic_decay_s1/` | the same with `--synthetic decay` | 36 s |
+| `synthetic_hour_edge_s1/` | the same with `--synthetic hour_edge` | 37 s |
+| `synthetic_zero_edge_s1/` | the same with `--synthetic zero_edge` | 35 s |
+| `calibration_zero_edge/` | `python -m research.trendbot.run_research --synthetic zero_edge --calibrate-seeds 50 --workers 4 --out-dir research/results/calibration_zero_edge` | 352 s |
+| `calibration_decay/` | the same with `--synthetic decay --calibrate-seeds 50` | 353 s |
+| `calibration_null/` | the same with `--synthetic null --calibrate-seeds 20` | 134 s |
+| `calibration_planted/` | the same with `--synthetic planted --calibrate-seeds 20` | 136 s |
+| `calibration_hour_edge/` | the same with `--synthetic hour_edge --calibrate-seeds 20` | 129 s |
+| `power_planted/` | `python -m research.trendbot.run_research --synthetic planted --calibrate-seeds 20 --power-strengths 0.15 0.3 0.45 0.6 0.75 0.9 1.05 --workers 4 --out-dir research/results/power_planted` | 923 s |
 
-Each run uses 6 years of 4H candles: 13,140 per pair for BTC/USDT, ETH/USDT and BNB/USDT.
-The split falls at 70% of the common range (2023-03-14T00:00Z), giving 9,198 TRAIN and
-3,942 TEST candles per pair. There are three pre-registered candidates:
+(The five seed-1 runs ran in parallel.) Each run uses 6 years of 4H candles (13,140 per pair
+for BTC/USDT, ETH/USDT and BNB/USDT). The split falls at 70% of the common range
+(2023-03-14T00:00Z): 9,198 TRAIN and 3,942 TEST candles per pair.
 
-- "base": the mandate config.
-- "selected": the one discovery variant picked by TRAIN t-stat from 12 legal tightenings.
-  K = 13 variants were tried, including the test-only regime-OFF variant, which can never be
-  selected.
-- "ML": the baseline plus the logistic `L_ml_filter`, fitted on purged TRAIN candidates only.
-
-The verdict considers only these three. What each seed-1 folder holds:
-
-- `REPORT.md`, the 12-section report. Every table header names its TRAIN and TEST columns.
-- `run.log`, the console output.
-- TRAIN and TEST journals and a review pack, but only for the three candidates. The other
-  12 discovery variants are one context row each in the report, so they get no journal.
-- One adoption record per candidate. The ML record carries the fitted model's sha256
-  (`model_base_plus_ml.json` is the exact JSON that is hashed).
-- `config_<variant>.json` for the non-default config of the selected variant, which
-  `adoption check --config` needs.
-
-Each calibration folder holds `CALIBRATION.md` plus `calibration_runs.csv`. The CSV has one
-row per seed, including the ML model fingerprint and its hour coefficients.
-
-`invariants.check_invariants` was run on every backtest of every run and found **0
-violations** across 30 backtests x 54 pipeline runs. Each seed-1 run repeats seed 1 of its
-calibration and reproduced it exactly, down to the ML model fingerprint (for example
-hour_edge `b38d6af2...` in both). All 12 `adoption check` commands printed in the four
-reports ran and gave the expected results. Two PASSed HUMAN_REVIEW (planted `base` and
-`rr3_vol2_rsi50-70`). The rest were BLOCKED only by `ADOPT_walk_forward`, never by a
-fingerprint mismatch.
+**Determinism.** After all runs, the five seed-1 runs and `calibration_null` were re-run with
+the same commands into the same folders and compared with a copy of the first run:
+`diff -r` found no difference in any of the 5 x 25 + 3 files (reports, journals, review
+packs, model file, adoption records with their sha256 fields, CSVs, run.log). A second check:
+the power curve's 0.15-sigma cell reproduces `calibration_zero_edge` seeds 1-20 exactly
+(zero_edge IS the planted mechanism at 0.15 sigma), base TRAIN and TEST avg R identical in
+20/20 seeds.
 
 ## Seed 1: ground truth vs what the pipeline labelled
 
-| world | ground truth predicts | base: TRAIN avg R (n) / TEST avg R (n), label | selected: TRAIN / TEST avg R (TEST n), label | ML: TRAIN avg R (in-sample) / TEST avg R (TEST n), label | verdict | matches truth? |
+TRAIN | TEST avg R (n) per pre-registered candidate. Every adoption record passes
+`adoption check --stage WALK_FORWARD` and is BLOCKED at `HUMAN_REVIEW` by `ADOPT_provenance`
+(plus `ADOPT_walk_forward` wherever the label is not ROBUST); REPORT.md section 11 prints the
+commands.
+
+| world (truth) | baseline | discovery-selected | base+ml | base+guard | verdict | right? |
 |---|---|---|---|---|---|---|
-| null | nothing ROBUST | -0.138 (98) / -0.121 (58), NO-EDGE | `rr2.5_vol2_rsi50-70` -0.086 / -0.143 (49), NO-EDGE | +0.267 / -0.294 (17), UNTESTED | No robust result found. | yes |
-| planted | base ROBUST | +0.296 (115) / **+0.412 (51), ROBUST**, TEST 90% CI [+0.059, +0.765] | `rr3_vol2_rsi50-70` +0.836 / +0.829 (35), **ROBUST** | +0.489 / +0.235 (34), UNTESTED | ROBUST: base, selected | yes |
-| decay | TRAIN-ONLY or UNTESTED, never ROBUST | +0.307 (114) / -0.143 (56), TRAIN-ONLY | `rr3_vol2_rsi50-70` +0.742 / -0.043 (46), TRAIN-ONLY | +0.590 / -0.073 (55), TRAIN-ONLY | No robust result found. | yes |
-| hour_edge | base diluted; hour-aware ML should raise TEST expectancy | -0.044 (100) / +0.050 (60), NO-EDGE | `rr3_vol2_rsi50-70` +0.203 / +0.436 (39), UNTESTED | +0.299 / **+0.295** (44), UNTESTED, TEST 90% CI [-0.045, +0.636] | No robust result found. | partly: ML raised TEST expectancy (+0.050R to +0.295R), as predicted, but a real edge exists and was not demonstrated (a false negative) |
+| null (no edge) | NO-EDGE: -0.138 (98) \| -0.121 (58) | `rr2.5_vol2_rsi50-70` NO-EDGE: -0.086 (81) \| -0.143 (49) | UNTESTED: +0.267 (45) \| -0.294 (17) | NO-EDGE: -0.183 (108) \| -0.121 (58) | No robust result | yes |
+| zero_edge (net ~0) | NO-EDGE: -0.004 (94) \| -0.050 (60) | `rr2_vol2_rsi55-70` TRAIN-ONLY: +0.048 (75) \| -0.020 (49) | UNTESTED: +0.333 (9) \| +0.500 (6) | NO-EDGE: -0.044 (102) \| -0.050 (60) | No robust result | yes |
+| decay (edge in TRAIN only) | TRAIN-ONLY: +0.307 (114) \| -0.143 (56) | `rr3_vol2_rsi50-70` TRAIN-ONLY: +0.742 (70) \| -0.043 (46) | TRAIN-ONLY: +0.590 (88) \| -0.073 (55) | TRAIN-ONLY: +0.307 (114) \| -0.143 (56) | No robust result | yes |
+| planted (edge everywhere) | UNTESTED: +0.296 (115) \| +0.412 (51) | `rr3_vol2_rsi50-70` **ROBUST**: +0.836 (73) \| +0.829 (35) | UNTESTED: +0.489 (94) \| +0.235 (34) | UNTESTED: +0.296 (115) \| +0.412 (51) | ROBUST (selected) | yes, 1 of 4 |
+| hour_edge (edge at 12-20 UTC) | NO-EDGE: -0.044 (100) \| +0.050 (60) | `rr3_vol2_rsi50-70` UNTESTED: +0.203 (72) \| +0.436 (39) | UNTESTED: +0.299 (69) \| +0.295 (44) | NO-EDGE: -0.057 (111) \| +0.082 (61) | No robust result | missed |
 
-In the null run the ML layer's in-sample TRAIN avg R was +0.267R, against -0.294R on TEST
-(n=17). This is why the report labels a fitted layer's TRAIN column "in-sample" and never
-lets it stand in for validation.
+In planted seed 1 the baseline's TEST +0.412R (n=51) has 98.75% lower bounds of -0.059R (iid)
+and -0.125R (block): a real edge, labelled UNTESTED because 51 trades cannot separate it from
+zero under the multiplicity rule (see the power curve below).
 
-## Calibration over seeds
+## Calibration: ground truth vs labels over seeds (90% Wilson intervals)
 
-Every rate carries its 90% Wilson interval, because the samples are small. Labels combine
-each candidate's TRAIN and TEST windows (`metrics.label`).
+"Verdict" = any of the 4 candidates ROBUST (the family-wise rate). The TEST gate is reached
+when TRAIN avg R > 0 and both windows hold >= 30 trades; the bootstrap bound decides from
+there.
 
-| world (seeds) | truth | verdict ROBUST (any of 3 candidates; labels use TRAIN + TEST) | base ROBUST | selected ROBUST | ML ROBUST | other labels (TRAIN + TEST) |
-|---|---|---|---|---|---|---|
-| null (20) | no edge | **false-positive rate 0/20 = 0% (90% CI 0-12%)** | 0/20 | 0/20 | 0/20 | base NO-EDGE 17, UNTESTED 3; selected NO-EDGE 8, UNTESTED 8, TRAIN-ONLY 4; ML UNTESTED 15, NO-EDGE 3, TRAIN-ONLY 2 |
-| planted (10) | real edge in TRAIN and TEST | **detection rate 8/10 = 80% (54-93%)** | 8/10 = 80% (54-93%) | 6/10 = 60% (35-81%) | 7/10 = 70% (44-87%) | seeds 6 and 10 were missed by all three (UNTESTED) |
-| decay (10) | edge only in TRAIN | **false-positive rate 1/10 = 10% (2-35%)** (seed 3) | 1/10 | 0/10 | 0/10 | base **TRAIN-ONLY 6/10 = 60% (35-81%)**, **UNTESTED 3/10 = 30% (13-56%)**, TRAIN-ONLY or UNTESTED 9/10 = 90% (65-98%); selected TRAIN-ONLY 6, UNTESTED 4; ML TRAIN-ONLY 6, UNTESTED 4 |
-| hour_edge (10) | edge only for spike candles closing 12:00-20:00 UTC | detection rate 4/10 = 40% (19-65%) | 1/10 = 10% (2-35%) | 3/10 = 30% (13-56%) | 3/10 = 30% (13-56%) | **ML TEST avg R above the base's in 9/10** |
+| world | seeds | truth | verdict ROBUST | baseline ROBUST | base reached the TEST gate | base mean avg R TRAIN \| TEST | base dd_ok |
+|---|---:|---|---|---|---|---|---|
+| null | 20 | no edge | **0/20 = 0% (0%-12%)** = FP | 0/20 (0%-12%) | 3/20 (6%-32%) | -0.107 \| -0.021 | 19/20 |
+| zero_edge | 50 | net ~0 (H0 boundary) | **1/50 = 2% (0%-8%)** = FP | 0/50 (0%-5%) | 31/50 (50%-72%) | +0.035 \| +0.027 | 46/50 |
+| decay | 50 | no edge in TEST | **0/50 = 0% (0%-5%)** = FP | 0/50 (0%-5%) | 49/50 (92%-100%) | +0.458 \| -0.095 | 9/50 |
+| planted | 20 | edge (0.7 sigma) | 10/20 = 50% (33%-67%) = detection | 8/20 = 40% (24%-58%) | 20/20 (88%-100%) | +0.442 \| +0.445 | 20/20 |
+| hour_edge | 20 | edge at 12-20 UTC only | 5/20 = 25% (13%-43%) | 0/20 (0%-12%) | 18/20 (74%-97%) | +0.198 \| +0.201 | 18/20 |
 
-Mean avg R per trade over the seeds:
+Per candidate (ROBUST all seeds; ROBUST given the TEST gate was reached):
 
-| world | base TRAIN | base TEST | selected TRAIN (selection-biased) | selected TEST | ML TRAIN (in-sample) | ML TEST | mean TEST n, base / ML |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| null | -0.107 | -0.021 | +0.022 | -0.008 | +0.002 | -0.204 | 43.9 / 23.7 |
-| planted | +0.450 | +0.460 | +0.724 | +0.603 | +0.501 | +0.442 | 48.3 / 44.6 |
-| decay | +0.424 | -0.101 | +0.683 | -0.061 | +0.500 | -0.090 | 43.7 / 43.1 |
-| hour_edge | +0.178 | +0.185 | +0.486 | +0.368 | +0.376 | +0.342 | 50.8 / 42.7 |
+| world | discovery-selected | base+ml | base+guard |
+|---|---|---|---|
+| null | 0/20; 0/8 | 0/20; 0/3 | 0/20; 0/3 |
+| zero_edge | 0/50; 0/39 | 1/50 (0%-8%); 1/32 (1%-13%) | 0/50; 0/31 |
+| decay | 0/50; 0/46 | 0/50; 0/49 | 0/50; 0/49 |
+| planted | 9/20 (28%-63%); 9/18 | 7/20 (20%-53%); 7/20 | 8/20 (24%-58%); 8/20 |
+| hour_edge | 3/20 (6%-32%); 3/16 | 5/20 (13%-43%); 5/18 | 0/20; 0/19 |
 
-### Did the ML layer help in hour_edge?
+What this shows:
 
-On TEST, yes in 9 of 10 seeds. The mean TEST avg R rose from +0.185R (base) to +0.342R
-(ML). The exception was seed 10 (+0.267R vs +0.286R). The ML layer was ROBUST in 3/10 seeds,
-against 1/10 for the base.
+- **False positives are controlled at the H0 boundary and under decay.** Zero_edge (a real
+  pre-cost edge that costs eat) produced 1 ROBUST in 50 seeds (2%, 90% CI 0-8%), and decay
+  (a TRAIN edge that vanishes at the split) produced 0 in 50 (0-5%), although decay reached
+  the TEST gate in 49/50 seeds and its baseline TEST avg R was as high as +0.50R in one seed.
+  The cycle-1 rule (a 90% two-sided iid CI per look, three looks) had a 1/10 decay false
+  positive at exactly that seed (decay seed 3: TRAIN +0.360R, TEST +0.501R, n=39); under the
+  m = 4 rule its 98.75% bounds are -0.038R (iid) and -0.013R (block), so it is UNTESTED. The one zero_edge ROBUST is `base+ml` in seed 38 (TEST +0.552R, n=58, iid bound
+  +0.138R, block +0.125R). By the world's definition it is a false positive; a filtered subset
+  of a world with a real pre-cost edge may also carry a small genuine net edge (the ML layer
+  averaged +0.060R on zero_edge TEST vs +0.027R for the base).
+- **Decay is caught:** 30/50 TRAIN-ONLY and 20/50 UNTESTED for the baseline (50/50 = 100%
+  not passed, 90% CI 95-100%). The drawdown rule catches it too: `dd_ok` failed in 41/50
+  decay seeds, because the TEST (null) drawdowns (MTM mean 10.9%) exceed what the TRAIN
+  sequences with an edge predict (limit mean 8.3%).
+- **Power is the price of that control.** The planted edge (+0.445R per trade in TEST) was
+  detected by the baseline in only 8/20 seeds; all 12 misses are UNTESTED with TEST avg R
+  +0.14 to +0.51R (never TRAIN-ONLY or NO-EDGE). The block bootstrap was the stricter bound
+  in 13/20 planted seeds, and decided the label alone (iid > 0, block <= 0) in 1 of them.
+- **Hour_edge:** the hour-blind baseline was never ROBUST (0/20); the ML layer, which can
+  learn the hour, was ROBUST in 5/20 and was the reason for all 5 verdicts.
 
-The fitted coefficients show it learned the planted hour effect rather than inventing one.
-These are standardised coefficients, fitted on TRAIN only, from the `ml_hour_sin`,
-`ml_hour_cos` and `ml_top_feature` columns of the calibration CSVs:
+## Power curve and the minimum detectable effect (`power_planted/POWER.md`)
 
-- `hour_sin` was negative in **10/10** hour_edge seeds, against 11/20 null seeds (a coin
-  flip). Candle closes at 12:00, 16:00 and 20:00 UTC have sin(2 pi h / 24) <= 0, so a
-  negative sign points at the planted hours. `hour_cos` was negative in 9/10.
-- The largest-magnitude coefficient was an hour term in 6/10 hour_edge seeds, against 5/20
-  null seeds.
-- The mean hour-term magnitude sqrt(hour_sin^2 + hour_cos^2) was 0.464 log-odds per TRAIN s.d.
-  (range 0.144-0.745) in hour_edge, against 0.149 (0.031-0.303) in null and 0.192 in planted.
+The planted mechanism at seven strengths, 20 seeds each. "True mean TEST expectancy" is the
+mean over seeds of the baseline's TEST avg R (what one run expects to see), with its 90%
+interval.
 
-Where there was nothing extra to learn, the layer cost power. In planted its TEST avg R beat
-the base in only 3/10 seeds (+0.442R vs +0.460R on average). In null it made TEST worse
-(-0.204R vs -0.021R; worse in 15/20 seeds, better in 5) while its in-sample TRAIN looked better than the
-base's (+0.002R vs -0.107R). It removed about half the TEST trades, which left it UNTESTED
-in 15/20 null seeds.
+| strength (sigma/candle) | true mean TEST expectancy, base | mean TRAIN avg R | mean TEST n | base ROBUST = detection | any of 4 ROBUST |
+|---:|---|---:|---:|---|---|
+| 0.15 | +0.066 [-0.009, +0.141] | +0.037 | 45.8 | 0/20 = 0% (0%-12%) | 0/20 (0%-12%) |
+| 0.30 | +0.145 [+0.070, +0.221] | +0.163 | 45.9 | 1/20 = 5% (1%-20%) | 1/20 (1%-20%) |
+| 0.45 | +0.252 [+0.193, +0.311] | +0.272 | 50.3 | 2/20 = 10% (3%-26%) | 4/20 (9%-38%) |
+| 0.60 | +0.351 [+0.278, +0.425] | +0.388 | 50.1 | 4/20 = 20% (9%-38%) | 7/20 (20%-53%) |
+| 0.75 | +0.422 [+0.357, +0.486] | +0.471 | 48.6 | 6/20 = 30% (16%-48%) | 11/20 (37%-72%) |
+| 0.90 | +0.582 [+0.508, +0.656] | +0.590 | 45.9 | 14/20 = 70% (52%-84%) | 17/20 (68%-94%) |
+| 1.05 | +0.628 [+0.554, +0.701] | +0.672 | 40.0 | 15/20 = 75% (57%-87%) | 16/20 (62%-91%) |
 
-## Where the methodology fails or is weak (honest list)
+- **Minimum detectable effect of the baseline at this sample size (~46-50 TEST trades):**
+  50% power at about **+0.50R** per trade (strength ~0.83 sigma, interpolated between 0.75
+  and 0.9); **80% power is not reached** at any tested strength (75% at +0.63R). Stronger
+  drift pushes RSI above 70, so R2 admits fewer signals and TEST n falls (40 at 1.05 sigma);
+  detection cannot rise much further this way (an uncommitted 4-seed pilot at 2.0 sigma had
+  a mean TEST n of 14.5, below the 30 ROBUST needs).
+- **An edge below the MDE will be labelled UNTESTED on real data however real it is.** With
+  6 years of 4H data, a 30% TEST window and the multiplicity-corrected block-bootstrapped
+  bound, an edge of +0.1 to +0.4R per trade (plausible for a real market, and far larger than
+  most) is detected in 5-30% of runs at best. UNTESTED means "not shown", never "shown to be
+  absent". More history (or a longer TEST window) is the only honest way to raise power; the
+  label rule is fixed and will not be loosened to find more.
 
-1. **One ROBUST false positive, in decay seed 3.** The baseline had TRAIN +0.360R (n=111)
-   and TEST +0.501R (n=39), with a TEST 90% CI low of +0.116. It was labelled ROBUST with a
-   passing drawdown check, although the TEST period is exactly the null world. Its adoption
-   record would pass the automated HUMAN_REVIEW gate. Null seed 3 has the same post-split
-   noise, and its baseline TEST was +0.542R (CI low +0.128). It was stopped only because its
-   TRAIN avg R was -0.124R (NO-EDGE). The lesson: once a genuine TRAIN edge exists that then
-   disappears (a regime change), the TEST CI is the only guard. A 90% two-sided bootstrap CI
-   leaves about a 5% one-sided chance per look. The measured decay false-positive rate is
-   1/10 = 10% (90% CI 2-35%). This is why a ROBUST walk-forward is followed by a human
-   review of every trade and at least 2 weeks of testnet, and why one split is never enough.
-2. **The verdict takes three looks at TEST** (base, selected, ML). Against a single
-   pre-registered look, this inflates the per-run false-positive rate by up to 3x (the
-   Bonferroni bound). The looks share one TEST window and overlapping trades, so they are
-   positively correlated and the real inflation is smaller, but it is not zero. Observed
-   verdict false positives: 0/20 in null and 1/10 in decay. The decay one came from the base
-   look alone. A stricter verdict would require a 1 - 0.10/3 CI per candidate. It is not
-   applied here, and the report states the three looks.
-3. **Power is limited by the TEST sample.** The TEST window is 1.8 years with 33-61 baseline
-   trades per seed. The per-trade standard deviation of R is about 1.5 (outcomes are mostly
-   -1 or +2). So with n near 45, the 90% CI lower bound clears zero only when the observed
-   avg R is above about +0.37R.
-   - planted: the baseline missed a real +0.46R average edge in 2/10 seeds. Seed 6 had
-     +0.354R (n=41, CI low -0.012) and seed 10 had +0.171R (n=41).
-   - hour_edge: the verdict found the real, but diluted, edge in only 4/10 seeds.
+## ML layer and expectancy guard: TRAIN | TEST side by side, vetoes and added trades
 
-   UNTESTED means "not demonstrated", not "no edge".
-4. **The calibration samples are small and paired.** 0 false positives in 20 null seeds
-   only bounds the false-positive rate below 12% (90% Wilson upper bound). Bounding it below
-   5% needs 0 false positives in at least 52 seeds. The four worlds also share the same noise
-   for a given seed (`synthetic.py`; only the planted drift differs), so decay seed k's TEST
-   window is null seed k's. Decay seeds 4, 5, 7 and 8 reproduce null's baseline TEST numbers
-   exactly. Null and decay together are therefore about 20 independent TEST draws, not 30.
-   Pairing is good for comparing worlds, and bad for counting false positives as if they
-   were independent.
-5. **Discovery can only choose among the variants' TRAIN numbers, and those are biased.** In
-   null the selected variant's TRAIN avg R (+0.022R) was higher than the base's (-0.107R),
-   which is the best-of-12 selection bias. Its TEST was no better (-0.008R vs -0.021R; it
-   beat the base in 9/20 seeds), the expected no-free-lunch result. In planted it beat the
-   base on TEST in 9/10 seeds (+0.603R vs +0.460R), yet it was ROBUST less often (6/10 vs
-   8/10). The tighter variants trade less, so their TEST CI is wider (for example decay seed
-   3's selected variant had only 29 TEST trades).
-6. **The synthetic effect is a deliberately strong positive control** (hand-calibrated in
-   `synthetic.py`). Real edges, if any exist, are likely weaker. And as the fee example above
-   shows, realistic Coinbase fees can remove an edge of this size entirely. On real data,
-   expect UNTESTED far more often than ROBUST.
-7. **The noise level of a roughly 45-trade TEST window is about +/-0.5R.** Null seed 3's
-   baseline TEST was +0.542R with no edge at all. Never read a single TEST expectancy
-   without its CI and its TRAIN column.
+Means over seeds; TRAIN of `base+ml` is in-sample (the filter was fitted on it). Counts are
+per seed, TRAIN | TEST: signals vetoed; base trades absent from the layer journal; layer
+trades absent from the base journal (the trades a veto or a halved risk ADMITTED).
 
-Apart from these power limits and the one decay false positive, no mislabelling of ground
-truth was found: 0 ROBUST in 20 null seeds, and no invariant violations. There was also no
-TRAIN-selection leak: `test_strategy_discovery.py` and `test_walkforward.py` show that
-swapping in different TEST-period candles cannot change the selection, the ML fit or the ML
-model fingerprint.
+| world | base avg R TRAIN \| TEST | base+ml avg R TRAIN \| TEST | ML vetoed | ML base-only | ML layer-only | base+guard avg R TRAIN \| TEST | guard entries at half risk | guard layer-only |
+|---|---|---|---|---|---|---|---|---|
+| null | -0.107 \| -0.021 | -0.014 \| -0.207 | 195.8 \| 90.5 | 72.2 \| 31.4 | 26.4 \| 11.0 | -0.097 \| -0.020 | 29.8 \| 0.5 | 10.2 \| 0.1 |
+| zero_edge | +0.035 \| +0.027 | +0.139 \| +0.060 | 107.0 \| 52.2 | 52.9 \| 25.6 | 27.4 \| 12.9 | +0.042 \| +0.025 | 22.4 \| 0.6 | 7.2 \| 0.1 |
+| decay | +0.458 \| -0.095 | +0.506 \| -0.081 | 11.8 \| 3.9 | 11.3 \| 4.3 | 5.8 \| 3.7 | +0.459 \| -0.097 | 3.8 \| 1.0 | 0.6 \| 0.5 |
+| planted | +0.442 \| +0.445 | +0.483 \| +0.435 | 11.1 \| 5.2 | 10.3 \| 4.8 | 5.2 \| 2.2 | +0.441 \| +0.445 | 2.1 \| 0.1 | 0.2 \| 0.0 |
+| hour_edge | +0.198 \| +0.201 | +0.420 \| +0.399 | 53.9 \| 23.2 | 43.1 \| 18.5 | 21.2 \| 8.8 | +0.207 \| +0.203 | 13.1 \| 0.8 | 2.5 \| 0.1 |
+
+- **The ML layer helps only where there is something to learn.** In hour_edge it doubled TEST
+  expectancy (+0.201 -> +0.399R, better than the base in 18/20 seeds, hour terms the largest
+  coefficient in 12/20 fits) and produced all 5 ROBUST verdicts. In null it looked better in
+  TRAIN (in-sample, -0.107 -> -0.014R) and was worse in TEST (-0.207R): the in-sample gain
+  is fitting noise. In planted, where every spike already carries the edge, it removed trades
+  without improving TEST (+0.445 -> +0.435R).
+- **Vetoes do admit other trades** (C1): in null the ML layer's journal held 26.4 TRAIN and
+  11.0 TEST trades per seed that the base never took, because each veto left R6 budget free
+  for another pair. A layer's journal is not a subset of the base's.
+- **The guard rarely binds after its warm-up:** it halves a pair's risk while that pair's
+  last 20 closed trades average below 0R, so it acts mostly in TRAIN (29.8 half-risk entries
+  per null seed, 2.1 in planted) and almost never in the 1.8-year TEST window (a fresh
+  journal needs 20 trades per pair first). The halved risk frees R6 budget, admitting extra
+  trades (10.2 per null TRAIN). Its TEST avg R equals the base's within 0.002R in every world
+  and it was never ROBUST where the base was not: there is no evidence it adds expectancy.
+
+## Where the methodology is weak (honest list)
+
+1. **Low power, by design of the rule.** See the power curve: a +0.4R edge is detected in
+   about a third of runs. On real data expect UNTESTED far more often than ROBUST.
+2. **Calibration samples are small and paired.** 0/20 in null only bounds the false-positive
+   rate below 12%; zero_edge and decay (50 seeds) bound it near 5-8%. All worlds share the
+   same noise for a given seed (only the planted drift differs), so decay seed k's TEST
+   window is null seed k's: null and decay are not independent draws.
+3. **The drawdown rule compares a MTM drawdown with a closed-trade bootstrap.** The TEST MTM
+   drawdown includes intra-trade dips that a bootstrap of closed-trade returns does not, so
+   `dd_ok` is conservative. It still passed in 20/20 planted seeds (MTM mean 5.4% vs limit
+   8.6%) and failed in 41/50 decay seeds, so in these worlds it separates a regime change
+   from a stable edge; it is only as good as the TRAIN window is representative.
+4. **The synthetic effect is a positive-control fixture** (hand-calibrated in `synthetic.py`),
+   not an estimate of any real edge. Real edges, if any, are likely weaker, and Coinbase
+   low-tier fees would remove edges of this size.
+5. **One split.** Every label rests on a single chronological 70/30 split; a ROBUST label is
+   followed by a human review of every trade and at least 2 weeks of testnet, never by
+   money.
+
+No invariant violation was found in any backtest of any run (sections 8 of every REPORT.md,
+and 0 in every calibration and power row).
 
 ## How to run this on REAL data (needs a machine with network access)
 
@@ -208,21 +244,23 @@ pip install ccxt
 python -m research.trendbot.fetch_data --exchange binance \
     --pairs BTC/USDT ETH/USDT BNB/USDT --timeframe 4h --since 2019-01-01 --out research/data
 
-# news calendar (R5): build research/data/events.csv with the header
-#   time_utc,scope,impact,kind,note
-# from a real economic calendar (high-impact macro events, scope ALL) and Binance
-# announcements (BNB burns / launchpools, scope BNB). research/trendbot/events_example.csv
-# shows the format only; it is NOT a real calendar. Without --events the report states
-# that R5 could not be exercised historically.
+# news calendar (R5), research/data/events.csv, header:
+#   time_utc,scope,impact,kind,note,known_from_utc
+# from a real economic calendar (high-impact macro, scope ALL) and Binance announcements
+# (BNB burns / launchpools, scope BNB). known_from_utc = when the event became public:
+# leave it empty for scheduled kinds (macro, unlock, bnb_burn, launchpool: known in advance)
+# and for unscheduled headlines (regulatory, legal, other: blocked only from their own time);
+# fill it when a scheduled event was announced late, e.g. a launchpool announced 12h ahead.
+# research/trendbot/events_example.csv shows the format only; it is NOT a real calendar.
 
-# Binance spot: pass YOUR fee tier (0.001 = 0.10% taker, no BNB discount) and slippage
+# Binance spot: pass YOUR fee tier (0.001 = 0.10% taker) and slippage; --now is optional
 python -m research.trendbot.run_research --data-dir research/data \
     --events research/data/events.csv \
     --fee-rate 0.001 --slippage-pct 0.05 --exchange-id binance \
     --out-dir research/results/real_binance
 
-# Coinbase Advanced Trade: low-tier taker fees are several times Binance's; pass the real
-# tier (e.g. 0.006 for 0.6% per side). BNB/USDT is not listed there.
+# Coinbase Advanced Trade: low-tier taker fees are several times Binance's (e.g. 0.006 =
+# 0.6% per side); BNB/USDT is not listed there.
 python -m research.trendbot.fetch_data --exchange coinbase \
     --pairs BTC/USDT ETH/USDT --timeframe 4h --since 2019-01-01 --out research/data/coinbase
 python -m research.trendbot.run_research --data-dir research/data/coinbase \
@@ -230,38 +268,51 @@ python -m research.trendbot.run_research --data-dir research/data/coinbase \
     --fee-rate 0.006 --slippage-pct 0.05 --exchange-id coinbase \
     --out-dir research/results/real_coinbase
 
-# adaptations the bot would apply at the end of TEST (R9 benches / halt): backtest journals
-# need --backtest-journal (exits count from the exit candle's close). REPORT.md section 9
-# prints this command with the right --equity and --now.
-python -m research.trendbot.journal_rules \
-    --journal research/results/real_binance/journals/base_test.csv \
-    --equity <TEST final equity from REPORT.md> --now <end of TEST from REPORT.md> \
-    --backtest-journal
+# the EXISTING bot's journal: write a map.json for its real column names first, e.g.
+#   {"columns": {"<its pair column>": "pair", "<its entry time>": "entry_ts",
+#                "<its exit time>": "exit_ts", "<its entry price>": "entry_price", ...},
+#    "exit_reason_values": {"<its stop label>": "SL", "<its target label>": "TP"},
+#    "time_format": "iso"}
+# (see the research/trendbot/journal.py docstring), then compare a few converted rows with
+# the bot's own figures before trusting them
+python -m research.trendbot.journal convert --in bot_trades.csv --map map.json \
+    --out research/data/bot_journal.csv --fee-rate 0.001 --slippage-pct 0.05
+python -m research.trendbot.invariants --journal research/data/bot_journal.csv \
+    --data-dir research/data --events research/data/events.csv --fee-rate 0.001
+python -m research.trendbot.journal_rules --journal research/data/bot_journal.csv \
+    --equity <the bot's current equity>
 
-# adoption gate (only ROBUST + a passing drawdown check can proceed). REPORT.md section 11
-# prints the exact command per record; a non-default config needs --config, and the ML
-# record needs the model fingerprint:
+# independent re-audit of a written journal against the candles with the SAME config the run
+# used (config_<variant>.json holds every override, costs included; the TEST journal needs
+# --start-ts = the split in ms, REPORT.md section 2)
+python -m research.trendbot.invariants \
+    --journal research/results/real_binance/journals/base_test.csv \
+    --data-dir research/data --events research/data/events.csv --start-ts <split_ms> \
+    --config research/results/real_binance/config_base.json   # only if that file exists
+
+# adoption gate: REPORT.md section 11 prints the exact command per record (with --config for
+# a non-default config and --model-fingerprint for base+ml); a real record binds the data
+# file and events hashes, so WALK_FORWARD -> HUMAN_REVIEW needs ROBUST + dd_ok and nothing
+# synthetic
 python -m research.trendbot.adoption check \
-    --record research/results/real_binance/adoption_base.json --stage HUMAN_REVIEW \
-    --config research/results/real_binance/config_base.json  # only if that file exists
+    --record research/results/real_binance/adoption_base.json --stage HUMAN_REVIEW
 python -m research.trendbot.adoption check \
     --record research/results/real_binance/adoption_base_plus_ml.json --stage HUMAN_REVIEW \
     --model-fingerprint <sha256 printed in REPORT.md section 5>
-
-# independent re-audit of the BASELINE journal with default costs (TEST journal: --start-ts
-# = the split in ms, see REPORT.md section 2). The invariants CLI assumes the default
-# StrategyConfig, so for a run with non-default --fee-rate/--slippage-pct, or for a
-# discovery variant, rely on the in-process audit in REPORT.md section 8.
-python -m research.trendbot.invariants \
-    --journal research/results/real_binance/journals/base_test.csv \
-    --data-dir research/data --events research/data/events.csv --start-ts <split_ms>
+python -m research.trendbot.adoption check \
+    --record research/results/real_binance/adoption_base_plus_guard.json --stage HUMAN_REVIEW \
+    --config research/results/real_binance/config_base_plus_guard.json
+# after a named reviewer fills in reviewer_ok (Y/N) for EVERY row of the review pack:
+python -m research.trendbot.adoption hash research/results/real_binance/review_base/trades_review.csv
 ```
 
-The adoption path is the same for real data and cannot be shortcut: backtest ->
-walk-forward (ROBUST + drawdown check) -> a named human reviews EVERY trade in the review
-pack -> at least 2 weeks on Binance testnet with zero rule violations -> live. The ML
-variant is adopted as a (config, model) pair. **Refitting the model changes its fingerprint
-and restarts the adoption path at BACKTEST.**
+The adoption path is the same for real data and cannot be shortcut: backtest -> walk-forward
+(ROBUST + drawdown check) -> a named human reviews EVERY trade in the review pack -> at least
+2 weeks on Binance testnet with zero rule violations -> live. The ML variant is adopted as a
+(config, model) pair: the live bot loads `model_base_plus_ml.json` with
+`MLFilter.from_json(text, expected_fingerprint=<the record's model_fingerprint>)`, which
+raises on any mismatch. **Refitting the model changes its fingerprint and restarts the
+adoption path at BACKTEST.**
 
 ## Risk disclaimer
 

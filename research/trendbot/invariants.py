@@ -36,31 +36,43 @@ the stop, fill at ``stop * (1 - s)``) is exactly -1R, a take-profit exactly
 +``reward_risk`` R (both within 1e-9), a gap-through stop-loss is at most -1R, and NOTHING
 else is below -1R or above +``reward_risk`` R; no data at or after ``end_ts``.
 
-Checked across trades: no pyramiding; BNB never overlaps another cluster position; open
-cluster risk never exceeds the shared budget; under a config where one full-size
-cluster position exhausts the budget (the default) no two cluster positions overlap; no
-entry inside a news blackout (R5); no entry while benched (R9, recomputed from the SL
-streaks); every bench lasts at least ``bench_hours`` of real time from the close of the
-exit candle of the stop-loss that completed the streak, i.e. the pair's next entry decision
-is at least that late (R9, A2); no entry while the 7-day realized loss halt is active (R9,
-recomputed from the closed pnl); equity curve and final equity consistent with the trades.
+Checked across trades (``cross_trade_violations``, which needs only the journal rows and
+the config, so it also audits a live / testnet journal of real fill times): no pyramiding;
+BNB never overlaps another cluster position; open cluster risk never exceeds the shared
+budget; while a cluster position that took its full R7 cap leaves less than
+``min_trade_risk_pct`` of the budget (BTC or ETH under the default config), no other
+cluster position overlaps it; no entry inside a news blackout (R5, CONTRACT v3 C2: an
+applicable event blocks ``[max(ts - w, known_from), ts + w]``, with ``known_from`` the
+event's ``known_from_ts`` or its kind default, -inf for scheduled kinds and ``ts`` for
+unscheduled ones; recomputed from the raw events, only the kind lists come from
+``news.py``); no entry while benched (R9, recomputed from the SL streaks); every bench
+lasts at least ``bench_hours`` from the moment the stop-loss that completed the streak
+was certain, i.e. the pair's next entry decision is at least that late (R9, A2); no entry
+while the 7-day realized loss halt is active (R9, recomputed from the closed pnl). The
+backtest audit adds: equity curve and final equity consistent with the trades.
 
 CLI (exit code 1 if any violation is found)::
 
     python -m research.trendbot.invariants --journal trades.csv --data-dir research/data \
-        [--events events.csv] [--start-ts MS] [--end-ts MS]
-    python -m research.trendbot.invariants --synthetic planted --seed 1 [--years 6]
+        [--events events.csv] [--start-ts MS] [--end-ts MS] \
+        [--config overrides.json] [--fee-rate F] [--slippage-pct S]
+    python -m research.trendbot.invariants --synthetic planted --seed 1 [--years 6] [--gaps]
 
 Audit a journal against the candles it was traded on (the journal must hold every trade of
 the run, since the breakers and the correlation cap are recomputed from it), or run and
-audit a backtest of a synthetic world. Both use the default ``StrategyConfig`` and the
-backtest timing convention above (a journal of the backtester, whose ``exit_ts`` is the exit
-candle open).
+audit a backtest of a synthetic world. Both use the backtest timing convention above (a
+journal of the backtester, whose ``exit_ts`` is the exit candle open). The config is the
+default ``StrategyConfig``, then the JSON overrides of ``--config`` (validated by
+``adoption.config_from_overrides``, so a loosened rule is refused), then ``--fee-rate`` /
+``--slippage-pct``: a journal written with non-default costs or by a discovery variant
+(e.g. ``{"reward_risk": 2.5}``) must be audited with the config that produced it, or its
+exact -1R / +RR outcomes and fill prices are (correctly) reported as inconsistent.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from bisect import bisect_left, bisect_right
 from collections import Counter
@@ -68,9 +80,16 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import accumulate
+from pathlib import Path
 
 from .backtester import BacktestResult, run_backtest
-from .config import MANDATE_BNB_BUFFER_RANGE, MANDATE_MAX_RISK_PCT, MANDATE_MIN_RR, StrategyConfig
+from .config import (
+    MANDATE_BNB_BUFFER_RANGE,
+    MANDATE_MAX_RISK_PCT,
+    MANDATE_MIN_RR,
+    ConfigError,
+    StrategyConfig,
+)
 from .data import load_dataset
 from .indicators import compute_features
 from .journal import read_journal
@@ -86,7 +105,7 @@ from .models import (
     Trade,
     base_of,
 )
-from .news import load_events
+from .news import UNSCHEDULED_KINDS, load_events
 from .synthetic import WORLDS, make_world
 
 
@@ -106,9 +125,25 @@ def _who(t: Trade) -> str:
     return f"trade #{t.trade_id} {t.pair} (signal {_iso(t.signal_ts)})"
 
 
-def effective_exit(t: Trade, cfg: StrategyConfig) -> int:
-    """A2: the exit candle CLOSE ``exit_ts + timeframe_ms``, when a backtest exit is certain."""
-    return t.exit_ts + cfg.timeframe_ms  # type: ignore[operator]
+def _offset(cfg: StrategyConfig, exit_time_uncertainty_ms: int | None) -> int:
+    """The A2 exit-time offset: ``None`` -> ``cfg.timeframe_ms`` (backtest journals)."""
+    if exit_time_uncertainty_ms is None:
+        return cfg.timeframe_ms
+    if isinstance(exit_time_uncertainty_ms, bool) or not isinstance(exit_time_uncertainty_ms, int):
+        raise ValueError(
+            f"exit_time_uncertainty_ms must be an int, got {exit_time_uncertainty_ms!r}"
+        )
+    if exit_time_uncertainty_ms < 0:
+        raise ValueError(f"exit_time_uncertainty_ms must be >= 0, got {exit_time_uncertainty_ms}")
+    return exit_time_uncertainty_ms
+
+
+def effective_exit(
+    t: Trade, cfg: StrategyConfig, exit_time_uncertainty_ms: int | None = None
+) -> int:
+    """A2: when the exit is certain, ``exit_ts + offset``. The default offset is the timeframe
+    (a backtest ``exit_ts`` is the exit candle OPEN); a live journal of real fills uses 0."""
+    return t.exit_ts + _offset(cfg, exit_time_uncertainty_ms)  # type: ignore[operator]
 
 
 def all_in_unit_loss(t: Trade, cfg: StrategyConfig) -> float:
@@ -117,50 +152,34 @@ def all_in_unit_loss(t: Trade, cfg: StrategyConfig) -> float:
     return (t.entry_price - stop_x) + cfg.fee_rate * t.entry_price + cfg.fee_rate * stop_x
 
 
-@dataclass(slots=True)
-class _PairData:
-    candles: list[Candle]
-    index: dict[int, int]  # candle ts -> index
-    rows: list[FeatureRow]
+def decision_time(t: Trade, cfg: StrategyConfig) -> int:
+    """When the entry was decided: the signal candle close ``signal_ts + timeframe_ms``."""
+    return t.signal_ts + cfg.timeframe_ms
 
 
-class _Audit:
-    """Everything the checks need, prepared once."""
+class _Ledger:
+    """Realized pnl ordered by the time each exit became certain (``t_e = exit_ts + offset``)."""
 
     def __init__(
         self,
-        result: BacktestResult,
-        data: Mapping[str, Sequence[Candle]],
-        events: Iterable[NewsEvent],
+        trades: Iterable[Trade],
         cfg: StrategyConfig,
+        offset: int,
+        starting_equity: float | None = None,
     ) -> None:
         self.cfg = cfg
-        self.result = result
-        self.start_ts, self.end_ts = result.window
-        self.tf = cfg.timeframe_ms
-        self.slip = cfg.slippage_pct / 100.0
-        self.trades = list(result.trades)
-        self.events = sorted(events, key=lambda e: e.ts)
-        self.event_ts = [e.ts for e in self.events]
-        self.pairs: dict[str, _PairData] = {}
-        for pair in {t.pair for t in self.trades}:
-            candles = [c for c in data.get(pair, ()) if self.end_ts is None or c.ts < self.end_ts]
-            index = {c.ts: k for k, c in enumerate(candles)}
-            self.pairs[pair] = _PairData(candles, index, compute_features(candles, cfg))
+        self.offset = offset
+        self.start = cfg.starting_capital if starting_equity is None else float(starting_equity)
         closed = sorted(
-            (t for t in self.trades if t.exit_ts is not None and t.pnl is not None),
+            (t for t in trades if t.exit_ts is not None and t.pnl is not None),
             key=lambda t: (t.exit_ts, t.trade_id),
         )
-        # Effective exit times t_e = exit_ts + tf (A2), ascending.
-        self.certain_ts = [effective_exit(t, cfg) for t in closed]
+        self.certain_ts = [t.exit_ts + offset for t in closed]  # type: ignore[operator]
         self.cum_pnl = [0.0, *accumulate(float(t.pnl) for t in closed)]  # type: ignore[arg-type]
-
-    def decision_ts(self, t: Trade) -> int:
-        return t.signal_ts + self.tf
 
     def equity_before(self, ts: int) -> float:
         """Realized equity from the trades known at ``ts`` (``t_e <= ts``)."""
-        return self.cfg.starting_capital + self.cum_pnl[bisect_right(self.certain_ts, ts)]
+        return self.start + self.cum_pnl[bisect_right(self.certain_ts, ts)]
 
     def window_pnl_before(self, ts: int) -> float:
         """Pnl of trades with ``ts - loss_window < t_e <= ts`` (known at ``ts``)."""
@@ -174,6 +193,42 @@ class _Audit:
         pnl = self.window_pnl_before(ts)
         threshold = -self.cfg.weekly_loss_limit_pct / 100.0 * self.equity_before(ts)
         return pnl < threshold - TOL * abs(threshold), pnl, threshold
+
+
+@dataclass(slots=True)
+class _PairData:
+    candles: list[Candle]
+    index: dict[int, int]  # candle ts -> index
+    rows: list[FeatureRow]
+
+
+class _Audit:
+    """Everything the per-trade checks need, prepared once (backtest timing: offset = tf)."""
+
+    def __init__(
+        self,
+        result: BacktestResult,
+        data: Mapping[str, Sequence[Candle]],
+        cfg: StrategyConfig,
+    ) -> None:
+        self.cfg = cfg
+        self.result = result
+        self.start_ts, self.end_ts = result.window
+        self.tf = cfg.timeframe_ms
+        self.slip = cfg.slippage_pct / 100.0
+        self.trades = list(result.trades)
+        self.pairs: dict[str, _PairData] = {}
+        for pair in {t.pair for t in self.trades}:
+            candles = [c for c in data.get(pair, ()) if self.end_ts is None or c.ts < self.end_ts]
+            index = {c.ts: k for k, c in enumerate(candles)}
+            self.pairs[pair] = _PairData(candles, index, compute_features(candles, cfg))
+        self.ledger = _Ledger(self.trades, cfg, self.tf)
+
+    def decision_ts(self, t: Trade) -> int:
+        return t.signal_ts + self.tf
+
+    def equity_before(self, ts: int) -> float:
+        return self.ledger.equity_before(ts)
 
 
 # ---------------------------------------------------------------------------- per trade
@@ -385,19 +440,27 @@ def _check_r_outcome(t: Trade, a: _Audit) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- portfolio
-def _full_size_blocks_cluster(cfg: StrategyConfig) -> bool:
-    """True if one full-size cluster position leaves less than the minimum trade budget."""
+def _fills_the_budget(first: Trade, cfg: StrategyConfig) -> bool:
+    """True if ``first`` open at its full R7 cap leaves less than ``min_trade_risk_pct`` of
+    the shared budget, so no other cluster position may open while it is open.
+
+    Without the expectancy guard the first cluster position of a flat book reserves
+    ``min(cap, budget)``; by induction nothing else is open alongside it. With the guard
+    its reservation can be smaller (a multiplier), so this stricter check is not applied
+    and only the budget sum below is. Exclusive bases (BNB) are handled separately.
+    """
     if cfg.expectancy_guard:
         return False
-    caps = [cfg.pair_risk[b].max_risk_pct for b in cfg.correlated_cluster if b in cfg.pair_risk]
-    return bool(caps) and all(
-        cfg.cluster_risk_budget_pct - cap < cfg.min_trade_risk_pct - 1e-12 for cap in caps
-    )
+    base = base_of(first.pair)
+    if base not in cfg.pair_risk:
+        return False
+    reserved = min(cfg.pair_risk[base].max_risk_pct, cfg.cluster_risk_budget_pct)
+    return cfg.cluster_risk_budget_pct - reserved < cfg.min_trade_risk_pct - 1e-12
 
 
-def _pair_conflict(a: Trade, b: Trade, cfg: StrategyConfig, strict: bool) -> str | None:
-    ba, bb = base_of(a.pair), base_of(b.pair)
-    both = f"trades #{a.trade_id} {a.pair} and #{b.trade_id} {b.pair}"
+def _pair_conflict(first: Trade, later: Trade, cfg: StrategyConfig) -> str | None:
+    ba, bb = base_of(first.pair), base_of(later.pair)
+    both = f"trades #{first.trade_id} {first.pair} and #{later.trade_id} {later.pair}"
     if ba == bb:
         return f"{both} overlap in the same asset (no pyramiding, R6)"
     cluster = set(cfg.correlated_cluster)
@@ -405,24 +468,26 @@ def _pair_conflict(a: Trade, b: Trade, cfg: StrategyConfig, strict: bool) -> str
         return None
     if ba in cfg.exclusive_bases or bb in cfg.exclusive_bases:
         return f"{both} overlap although BNB never stacks with another cluster position (R6)"
-    if strict:
+    if _fills_the_budget(first, cfg):
         return f"{both} overlap although one full-size position uses the whole budget (R6)"
     return None
 
 
-def _check_portfolio(a: _Audit) -> list[str]:
-    cfg = a.cfg
-    strict = _full_size_blocks_cluster(cfg)
+def _check_portfolio(trades: Sequence[Trade], cfg: StrategyConfig, offset: int) -> list[str]:
+    """R6. A position holds its budget from its decision until its exit is certain: an
+    earlier position ``o`` is still open at the decision ``d`` of ``t`` iff
+    ``o.exit_ts + offset > d`` (backtest offset = tf: ``o`` exited in a candle at or after
+    ``t``'s signal candle; exits of a candle are processed before its entry decisions). A
+    trade without an exit is open for good."""
     cluster = set(cfg.correlated_cluster)
-    trades = sorted(
-        (t for t in a.trades if t.exit_ts is not None), key=lambda t: (t.signal_ts, t.trade_id)
-    )
+    ordered = sorted(trades, key=lambda t: (decision_time(t, cfg), t.trade_id))
     out: list[str] = []
     active: list[Trade] = []
-    for t in trades:
-        active = [o for o in active if o.exit_ts > t.signal_ts]  # type: ignore[operator]
+    for t in ordered:
+        d = decision_time(t, cfg)
+        active = [o for o in active if o.exit_ts is None or o.exit_ts + offset > d]
         for o in active:
-            msg = _pair_conflict(o, t, cfg, strict)
+            msg = _pair_conflict(o, t, cfg)
             if msg is not None:
                 out.append(msg)
         active.append(t)
@@ -435,48 +500,73 @@ def _check_portfolio(a: _Audit) -> list[str]:
     return out
 
 
-def _blackout(ev: NewsEvent, base: str, ts: int, cfg: StrategyConfig) -> float | None:
-    """Blackout half-width (hours) ``ev`` imposes on ``base`` at ``ts``, if inside it."""
+def _known_from(ev: NewsEvent) -> float:
+    """C2: when ``ev`` became knowable. Explicit ``known_from_ts`` wins; else ``ev.ts`` for an
+    unscheduled kind and -inf otherwise (scheduled, and any unrecognised kind: the audit
+    applies the full window rather than risk under-reporting)."""
+    if ev.known_from_ts is not None:
+        return float(ev.known_from_ts)
+    return float(ev.ts) if ev.kind.strip().lower() in UNSCHEDULED_KINDS else -math.inf
+
+
+def _blackout(ev: NewsEvent, base: str, ts: int, cfg: StrategyConfig) -> tuple[float, str] | None:
+    """(half-width hours, interval text) of the blackout ``ev`` imposes on ``base`` if ``ts``
+    lies inside its C2 block interval ``[max(ev.ts - w, known_from), ev.ts + w]``."""
     scope = ev.scope.strip()
     _head, sep, tail = scope.partition(":")
     scope = f"EXCHANGE:{tail.strip().lower()}" if sep else scope.upper()
-    dist_h = abs(ev.ts - ts) / HOUR_MS
-    high_scopes = {"ALL", base, f"EXCHANGE:{cfg.exchange_id.lower()}"}
+    hours: float | None = None
+    high_scopes = {"ALL", base, f"EXCHANGE:{cfg.exchange_id.strip().lower()}"}
     if ev.impact.strip().lower() == "high" and scope in high_scopes:
-        if dist_h <= cfg.news_blackout_hours:
-            return cfg.news_blackout_hours
-    bnb_kinds = {k.lower() for k in cfg.bnb_event_kinds}
-    if base == "BNB" and ev.kind.strip().lower() in bnb_kinds:
-        if scope in {"ALL", "BNB", "EXCHANGE:binance"} and dist_h <= cfg.bnb_event_blackout_hours:
-            return cfg.bnb_event_blackout_hours
-    return None
+        hours = cfg.news_blackout_hours
+    bnb_kinds = {k.strip().lower() for k in cfg.bnb_event_kinds}
+    bnb_scopes = {"ALL", "BNB", "EXCHANGE:binance"}
+    if base == "BNB" and ev.kind.strip().lower() in bnb_kinds and scope in bnb_scopes:
+        hours = max(hours or 0.0, cfg.bnb_event_blackout_hours)
+    if hours is None:
+        return None
+    w = hours * HOUR_MS
+    known = _known_from(ev)
+    start, end = max(ev.ts - w, known), ev.ts + w
+    if not start <= ts <= end:
+        return None
+    if known > ev.ts - w:  # unscheduled, or announced late: blocks only once knowable
+        return hours, f"known from {_iso(round(known))}: {_iso(round(start))} .. {_iso(end)}"
+    return hours, f"+/-{hours:g}h"
 
 
-def _check_news(a: _Audit) -> list[str]:
-    cfg = a.cfg
+def _check_news(
+    trades: Sequence[Trade], events: Iterable[NewsEvent], cfg: StrategyConfig
+) -> list[str]:
+    """R5 with the C2 semantics, recomputed from the raw events (no NewsCalendar)."""
+    ordered = sorted(events, key=lambda e: e.ts)
+    times = [e.ts for e in ordered]
     widest = max(cfg.news_blackout_hours, cfg.bnb_event_blackout_hours) * HOUR_MS
     out: list[str] = []
-    for t in a.trades:
-        ts, base = a.decision_ts(t), base_of(t.pair)
-        lo, hi = bisect_left(a.event_ts, ts - widest), bisect_right(a.event_ts, ts + widest)
-        for ev in a.events[lo:hi]:
-            hours = _blackout(ev, base, ts, cfg)
-            if hours is not None:
+    for t in trades:
+        ts, base = decision_time(t, cfg), base_of(t.pair)
+        lo, hi = bisect_left(times, ts - widest), bisect_right(times, ts + widest)
+        for ev in ordered[lo:hi]:
+            hit = _blackout(ev, base, ts, cfg)
+            if hit is not None:
                 out.append(
-                    f"{_who(t)} entered at {_iso(ts)} inside the +/-{hours:g}h blackout of the "
+                    f"{_who(t)} entered at {_iso(ts)} inside the blackout ({hit[1]}) of the "
                     f"{ev.impact} {ev.kind} event at {_iso(ev.ts)} ({ev.scope}) (R5)"
                 )
                 break
     return out
 
 
-def benches(trades: Sequence[Trade], cfg: StrategyConfig) -> dict[str, list[tuple[int, int]]]:
+def benches(
+    trades: Sequence[Trade], cfg: StrategyConfig, exit_time_uncertainty_ms: int | None = None
+) -> dict[str, list[tuple[int, int]]]:
     """Recomputed R9 benches: pair -> [(start, until)] from consecutive-SL streaks.
 
-    ``start`` is the effective exit time ``t_e = exit_ts + timeframe_ms`` (the exit candle
-    close, A2) of the stop-loss that completed the streak; the bench covers
-    ``start <= ts < until = start + bench_hours``.
+    ``start`` is the effective exit time ``t_e = exit_ts + offset`` (A2; default offset the
+    timeframe, i.e. the exit candle close of a backtest) of the stop-loss that completed
+    the streak; the bench covers ``start <= ts < until = start + bench_hours``.
     """
+    offset = _offset(cfg, exit_time_uncertainty_ms)
     bench_ms = round(cfg.bench_hours * HOUR_MS)
     out: dict[str, list[tuple[int, int]]] = {}
     streak: dict[str, int] = {}
@@ -489,16 +579,20 @@ def benches(trades: Sequence[Trade], cfg: StrategyConfig) -> dict[str, list[tupl
             continue
         streak[t.pair] = streak.get(t.pair, 0) + 1
         if streak[t.pair] >= cfg.consecutive_sl_limit:
-            start = effective_exit(t, cfg)
+            start = t.exit_ts + offset  # type: ignore[operator]
             out.setdefault(t.pair, []).append((start, start + bench_ms))
             streak[t.pair] = 0
     return out
 
 
-def _check_benches(a: _Audit, all_benches: Mapping[str, list[tuple[int, int]]]) -> list[str]:
+def _check_benches(
+    trades: Sequence[Trade],
+    all_benches: Mapping[str, list[tuple[int, int]]],
+    cfg: StrategyConfig,
+) -> list[str]:
     out: list[str] = []
-    for t in a.trades:
-        ts = a.decision_ts(t)
+    for t in trades:
+        ts = decision_time(t, cfg)
         for start, until in all_benches.get(t.pair, ()):
             if start <= ts < until:
                 out.append(
@@ -508,40 +602,46 @@ def _check_benches(a: _Audit, all_benches: Mapping[str, list[tuple[int, int]]]) 
     return out
 
 
-def _check_bench_duration(a: _Audit, all_benches: Mapping[str, list[tuple[int, int]]]) -> list[str]:
+def _check_bench_duration(
+    trades: Sequence[Trade],
+    all_benches: Mapping[str, list[tuple[int, int]]],
+    cfg: StrategyConfig,
+    offset: int,
+) -> list[str]:
     """A2: after a streak-completing stop-loss, the pair's NEXT entry decision comes at least
-    ``bench_hours`` after the exit candle close, so >= 24h of real time wherever inside that
-    candle the stop filled.
+    ``bench_hours`` after the exit became certain (``start = exit_ts + offset``; in a
+    backtest the exit candle close), so >= 24h of real time wherever the stop filled.
 
-    "Next" = the first decision strictly after the exit candle OPEN ``start - timeframe``: a
-    stop-loss hit on its own fill candle was DECIDED at that open, and any other same-pair
+    "Next" = the first decision strictly after ``exit_ts = start - offset``: a stop-loss hit
+    on its own fill candle was DECIDED at that candle's open, and any other same-pair
     decision at or before it would overlap the open trade (reported as pyramiding).
     """
-    bench_ms = round(a.cfg.bench_hours * HOUR_MS)
+    bench_ms = round(cfg.bench_hours * HOUR_MS)
     out: list[str] = []
     for pair, spans in all_benches.items():
-        decisions = sorted(a.decision_ts(t) for t in a.trades if t.pair == pair)
+        decisions = sorted(decision_time(t, cfg) for t in trades if t.pair == pair)
         for start, _until in spans:
-            k = bisect_right(decisions, start - a.tf)
+            k = bisect_right(decisions, start - offset)
             if k < len(decisions) and decisions[k] - start < bench_ms:
                 out.append(
                     f"{pair} was benched too briefly: its next entry was decided at "
                     f"{_iso(decisions[k])}, {(decisions[k] - start) / HOUR_MS:g}h after the exit "
-                    f"candle close {_iso(start)} of the stop-loss that completed the streak, "
-                    f"less than the {a.cfg.bench_hours:g}h bench (R9)"
+                    f"of the stop-loss that completed the streak became certain at "
+                    f"{_iso(start)}, less than the {cfg.bench_hours:g}h bench (R9)"
                 )
     return out
 
 
-def _check_halt(a: _Audit) -> list[str]:
+def _check_halt(trades: Sequence[Trade], ledger: _Ledger) -> list[str]:
+    cfg = ledger.cfg
     out: list[str] = []
-    for t in a.trades:
-        ts = a.decision_ts(t)
-        halted, pnl, threshold = a.halted(ts)
+    for t in trades:
+        ts = decision_time(t, cfg)
+        halted, pnl, threshold = ledger.halted(ts)
         if halted:
             out.append(
                 f"{_who(t)} entered at {_iso(ts)} while the trailing "
-                f"{a.cfg.loss_window_days:g}-day realized pnl {pnl:.2f} was below the halt "
+                f"{cfg.loss_window_days:g}-day realized pnl {pnl:.2f} was below the halt "
                 f"limit {threshold:.2f} (R9)"
             )
     return out
@@ -566,12 +666,47 @@ def _check_equity(a: _Audit) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- public API
+def cross_trade_violations(
+    trades: Iterable[Trade],
+    cfg: StrategyConfig,
+    events: Iterable[NewsEvent] | None = None,
+    exit_time_uncertainty_ms: int = 0,
+    starting_equity: float | None = None,
+) -> list[str]:
+    """Rules that span trades, recomputed from the journal rows alone (no candles needed).
+
+    - R6: no pyramiding; BNB never overlaps another cluster position; open cluster risk
+      never exceeds ``cluster_risk_budget_pct``; and, when one full-size cluster position
+      exhausts the budget (the default config), no two cluster positions overlap.
+    - R9: no entry decision inside a 3-SL bench (and the pair's next decision after such a
+      stop-loss is at least ``bench_hours`` later), no entry during a 7-day loss halt.
+    - R5, only if ``events`` is given: no entry decision inside a C2 block interval.
+
+    Every exit counts from ``exit_ts + exit_time_uncertainty_ms`` (A2): 0 for a live or
+    testnet journal of real fill times (the default), ``cfg.timeframe_ms`` for a backtest
+    journal whose ``exit_ts`` is the exit candle open. Entry decisions are at
+    ``signal_ts + timeframe_ms``. The 7-day halt compares the window's realized pnl with
+    ``weekly_loss_limit_pct`` of the realized equity, starting from ``starting_equity``
+    (default ``cfg.starting_capital``). Returns one sentence per violation.
+    """
+    offset = _offset(cfg, exit_time_uncertainty_ms)
+    rows = list(trades)
+    out = _check_portfolio(rows, cfg, offset)
+    if events is not None:
+        out.extend(_check_news(rows, events, cfg))
+    all_benches = benches(rows, cfg, offset)
+    out.extend(_check_benches(rows, all_benches, cfg))
+    out.extend(_check_bench_duration(rows, all_benches, cfg, offset))
+    out.extend(_check_halt(rows, _Ledger(rows, cfg, offset, starting_equity)))
+    return out
+
+
 def blocked_open_trades(result: BacktestResult, cfg: StrategyConfig | None = None) -> list[Trade]:
     """Trades that were OPEN at a decision time while their pair was benched or all entries
     were halted (recomputed). Their exits must still be on time: see ``check_invariants``.
     """
     cfg = cfg or result.cfg
-    audit = _Audit(result, {}, (), cfg)
+    ledger = _Ledger(result.trades, cfg, cfg.timeframe_ms)
     all_benches = benches(result.trades, cfg)
     out: list[Trade] = []
     for t in result.trades:
@@ -579,7 +714,7 @@ def blocked_open_trades(result: BacktestResult, cfg: StrategyConfig | None = Non
             continue
         for ts in range(t.entry_ts + cfg.timeframe_ms, t.exit_ts + 1, cfg.timeframe_ms):
             bench = any(s <= ts < u for s, u in all_benches.get(t.pair, ()))
-            if bench or audit.halted(ts)[0]:
+            if bench or ledger.halted(ts)[0]:
                 out.append(t)
                 break
     return out
@@ -592,7 +727,7 @@ def check_invariants(
     cfg: StrategyConfig | None = None,
 ) -> list[str]:
     """One sentence per rule violation found in ``result`` (empty list = clean)."""
-    audit = _Audit(result, data, events, cfg or result.cfg)
+    audit = _Audit(result, data, cfg or result.cfg)
     out: list[str] = []
     for t in audit.trades:
         if t.pair not in audit.pairs or not audit.pairs[t.pair].candles:
@@ -608,12 +743,8 @@ def check_invariants(
             out.extend(_check_exit(t, audit))
             out.extend(_check_accounting(t, audit))
             out.extend(_check_r_outcome(t, audit))
-    out.extend(_check_portfolio(audit))
-    out.extend(_check_news(audit))
-    all_benches = benches(audit.trades, audit.cfg)
-    out.extend(_check_benches(audit, all_benches))
-    out.extend(_check_bench_duration(audit, all_benches))
-    out.extend(_check_halt(audit))
+    # Backtest timing: exit_ts is the exit candle OPEN, the exit is certain at its close.
+    out.extend(cross_trade_violations(audit.trades, audit.cfg, list(events), audit.tf))
     out.extend(_check_equity(audit))
     return out
 
@@ -647,22 +778,56 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--events", help="news calendar CSV (time_utc,scope,impact,kind,note)")
     p.add_argument("--start-ts", type=int, default=None, help="window start used by the run")
     p.add_argument("--end-ts", type=int, default=None, help="window end used by the run")
+    p.add_argument(
+        "--config",
+        help="JSON object of StrategyConfig overrides the run used (e.g. a discovery variant: "
+        '{"reward_risk": 2.5}); validated, a loosened mandatory rule is refused',
+    )
+    p.add_argument("--fee-rate", type=float, default=None, help="per-side fee the run used")
+    p.add_argument("--slippage-pct", type=float, default=None, help="slippage %% the run used")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--years", type=float, default=6.0)
+    p.add_argument("--gaps", action="store_true", help="synthetic world with open gaps")
     p.add_argument("--timeframe", default="4h")
     return p
+
+
+def load_cli_config(
+    config_path: str | None, fee_rate: float | None = None, slippage_pct: float | None = None
+) -> StrategyConfig:
+    """The config a journal was produced with: defaults, then the JSON overrides in
+    ``config_path``, then the explicit cost flags. Raises ``ConfigError`` / ``ValueError``."""
+    overrides: dict[str, object] = {}
+    if config_path:
+        loaded = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ConfigError(f"{config_path}: config overrides must be a JSON object")
+        overrides.update(loaded)
+    if fee_rate is not None:
+        overrides["fee_rate"] = fee_rate
+    if slippage_pct is not None:
+        overrides["slippage_pct"] = slippage_pct
+    if not overrides:
+        return StrategyConfig()
+    # Imported here, not at module level: adoption.py imports this module (TESTNET check).
+    from .adoption import config_from_overrides
+
+    return config_from_overrides(overrides)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    cfg = StrategyConfig()
+    try:
+        cfg = load_cli_config(args.config, args.fee_rate, args.slippage_pct)
+    except (ConfigError, ValueError, OSError) as exc:
+        parser.error(f"invalid --config / cost flags: {exc}")
     events: list[NewsEvent] = load_events(args.events) if args.events else []
     window = (args.start_ts, args.end_ts)
     if args.synthetic:
-        data, events = make_world(args.synthetic, args.seed, years=args.years)
+        data, events = make_world(args.synthetic, args.seed, years=args.years, gaps=args.gaps)
         result = run_backtest(data, cfg, events, start_ts=window[0], end_ts=window[1])
-        label = f"synthetic {args.synthetic} seed {args.seed}"
+        label = f"synthetic {args.synthetic} seed {args.seed}" + (" (gaps)" if args.gaps else "")
     else:
         if not args.data_dir:
             parser.error("--data-dir is required with --journal")
@@ -671,6 +836,10 @@ def main(argv: list[str] | None = None) -> int:
         result = result_from_journal(trades, cfg, window, bool(events))
         label = f"journal {args.journal}"
     violations = check_invariants(result, data, events, cfg)
+    print(
+        f"config: {cfg.variant_id()}, fee_rate {cfg.fee_rate:g}/side, slippage "
+        f"{cfg.slippage_pct:g}%, exchange {cfg.exchange_id}"
+    )
     print(f"{label}: {len(result.trades)} trades audited, {len(violations)} violation(s).")
     for v in violations:
         print(f"- {v}")

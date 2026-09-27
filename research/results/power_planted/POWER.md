@@ -1,0 +1,38 @@
+# Power curve: synthetic world `planted` at 7 effect strengths
+
+This report does NOT promise, target or optimise a win rate, and nothing in this package selects on one. A win rate is meaningless without the reward:risk it was earned at: with the mandatory minimum of 2:1 a strategy breaks even at about 33% winners before costs, while a 90% win rate with a 1:9 payoff still loses money. A backtest win rate near 90% is evidence of curve-fitting or look-ahead, not of skill. The target metric is POSITIVE EXPECTANCY (average R per trade, net of fees and slippage) that survives a 70/30 chronological walk-forward with controlled drawdown, with every trade planned at reward:risk >= 2:1. Win rate appears below only as context and is labelled 'context only' wherever it is shown.
+
+Each cell is 20 seeds of the full pipeline (6 years of 4H candles, 70/30 walk-forward, the 4 pre-registered candidates) with the planted drift set by `effect_strength` (sigma units per candle). ROBUST requires at least 30 trades in each window, TRAIN and TEST avg R > 0, and a one-sided 98.75% lower bound of the TEST mean above zero for BOTH an iid and a calendar-month block bootstrap (the more conservative is used): alpha 0.05 is split over the m = 4 pre-registered candidates (base, discovery-selected, base+ml, base+guard), so when none has an edge the chance that ANY is called ROBUST is at most about 5%; a positive TEST mean that fails only the bound is UNTESTED (positive but not distinguishable from zero after multiplicity correction); the rule was fixed in advance and is never tuned on TEST outcomes. **Synthetic results are verification of the methodology, not evidence about real markets.**
+
+The detection rate is the share of seeds whose BASELINE is labelled ROBUST, plotted against the true mean TEST expectancy of the baseline at that strength (the mean over seeds of each run's TEST avg R, i.e. what one run expects to see). Rates carry 90% Wilson intervals.
+
+- **Costs used in every backtest:** fee 0.100% of notional per side (the default: Binance spot taker, no discounts) (`--fee-rate 0.001`), charged on the entry AND on the exit; slippage 0.05% (`--slippage-pct 0.05`) against the trade on market fills (entries and stop exits; take-profit limit exits get none); exchange `binance` (`--exchange-id`; `EXCHANGE:binance` news events block every pair). Starting capital 10,000 per window.
+- Cost-aware sizing and targets (CONTRACT.md v2 A1): the planned risk is the ALL-IN loss at the stop (the stop fill after slippage plus both fees), so a clean stop is exactly -1R and the target is placed so that a take-profit nets exactly +2R after fees; the target's price distance is therefore more than 2x the stop distance. Only a gap through the stop loses more than 1R.
+- Coinbase Advanced Trade taker fees at low volume tiers are several times Binance's, so a Coinbase run must pass the account's real tier with `--fee-rate` (a fraction of notional per side: 0.006 = 0.6%) and `--exchange-id coinbase`; the default costs would understate them.
+
+Drawdown (CONTRACT.md v3 C5): every result reports the realised (closed-trade) and the mark-to-market (open positions valued at each 4H close) max drawdown; dd_ok = TEST mark-to-market max drawdown <= min(20%, the 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length, in percent of equity at the risk each trade took).
+
+| effect strength (sigma per candle) | seeds | true mean TEST expectancy, base (mean over seeds [90% CI]) | pooled TEST R per trade, base | mean TRAIN avg R, base | mean TEST n, base | mean TEST max DD % realised / MTM / limit, base | base dd_ok | base ROBUST = detection rate | base reached the TEST gate | ROBUST given the gate | any of the 4 candidates ROBUST |
+|---:|---:|---|---:|---:|---:|---|---|---|---|---|---|
+| 0.15 | 20 | +0.066 [-0.009, +0.141] | +0.068 | +0.037 | 45.8 | 7.73 / 8.27 / 14.21 | 20/20 = 100% (90% Wilson CI 88%-100%) | 0/20 = 0% (90% Wilson CI 0%-12%) | 11/20 = 55% (90% Wilson CI 37%-72%) | 0/11 = 0% (90% Wilson CI 0%-20%) | 0/20 = 0% (90% Wilson CI 0%-12%) |
+| 0.3 | 20 | +0.145 [+0.070, +0.221] | +0.150 | +0.163 | 45.9 | 7.07 / 7.88 / 12.21 | 16/20 = 80% (90% Wilson CI 62%-91%) | 1/20 = 5% (90% Wilson CI 1%-20%) | 18/20 = 90% (90% Wilson CI 74%-97%) | 1/18 = 6% (90% Wilson CI 1%-21%) | 1/20 = 5% (90% Wilson CI 1%-20%) |
+| 0.45 | 20 | +0.252 [+0.193, +0.311] | +0.259 | +0.272 | 50.3 | 6.08 / 6.72 / 10.87 | 18/20 = 90% (90% Wilson CI 74%-97%) | 2/20 = 10% (90% Wilson CI 3%-26%) | 20/20 = 100% (90% Wilson CI 88%-100%) | 2/20 = 10% (90% Wilson CI 3%-26%) | 4/20 = 20% (90% Wilson CI 9%-38%) |
+| 0.6 | 20 | +0.351 [+0.278, +0.425] | +0.352 | +0.388 | 50.1 | 5.36 / 5.97 / 9.25 | 19/20 = 95% (90% Wilson CI 80%-99%) | 4/20 = 20% (90% Wilson CI 9%-38%) | 20/20 = 100% (90% Wilson CI 88%-100%) | 4/20 = 20% (90% Wilson CI 9%-38%) | 7/20 = 35% (90% Wilson CI 20%-53%) |
+| 0.75 | 20 | +0.422 [+0.357, +0.486] | +0.415 | +0.471 | 48.6 | 4.76 / 5.67 / 8.26 | 18/20 = 90% (90% Wilson CI 74%-97%) | 6/20 = 30% (90% Wilson CI 16%-48%) | 20/20 = 100% (90% Wilson CI 88%-100%) | 6/20 = 30% (90% Wilson CI 16%-48%) | 11/20 = 55% (90% Wilson CI 37%-72%) |
+| 0.9 | 20 | +0.582 [+0.508, +0.656] | +0.578 | +0.590 | 45.9 | 4.07 / 4.88 / 7.11 | 18/20 = 90% (90% Wilson CI 74%-97%) | 14/20 = 70% (90% Wilson CI 52%-84%) | 20/20 = 100% (90% Wilson CI 88%-100%) | 14/20 = 70% (90% Wilson CI 52%-84%) | 17/20 = 85% (90% Wilson CI 68%-94%) |
+| 1.05 | 20 | +0.628 [+0.554, +0.701] | +0.627 | +0.672 | 40.0 | 3.50 / 4.50 / 6.32 | 17/20 = 85% (90% Wilson CI 68%-94%) | 15/20 = 75% (90% Wilson CI 57%-87%) | 20/20 = 100% (90% Wilson CI 88%-100%) | 15/20 = 75% (90% Wilson CI 57%-87%) | 16/20 = 80% (90% Wilson CI 62%-91%) |
+
+## Minimum detectable effect (baseline, this sample size)
+
+- 50% power: ~+0.502R mean TEST expectancy per trade (strength ~0.83 sigma, interpolated between 0.75 and 0.9 sigma).
+- 80% power: not reached at any tested strength (highest detection 75% at 1.05 sigma, mean TEST expectancy +0.628R).
+- Read along increasing strength with linear interpolation between tested strengths; each detection rate is itself an estimate (see its Wilson interval), so the MDE is approximate. A stronger drift also pushes RSI above 70 more often, so R2 admits fewer signals and the TEST trade count (mean TEST n column) can fall below the 30 that ROBUST needs: detection can drop again at high strengths, and the MDE holds only for TEST samples of about the size shown.
+- **An edge below the MDE will be labelled UNTESTED on real data however real it is:** with ~6 years of 4H data and a 30% TEST window the baseline takes only about the TEST trade counts shown above, and the multiplicity-corrected, block-bootstrapped lower bound cannot separate a smaller edge from zero. UNTESTED means 'not shown', never 'shown to be absent'.
+
+## Adoption path
+
+The only path to real money (enforced by `adoption.py`; no step can be skipped): BACKTEST -> WALK_FORWARD (ROBUST + drawdown check) -> HUMAN_REVIEW of EVERY trade -> >= 14 days on Binance testnet with zero rule violations -> LIVE. A synthetic result never gets past WALK_FORWARD: `adoption check` blocks every record whose provenance is `synthetic:<world>:<seed>` with `ADOPT_provenance`. A calibration writes no adoption records; it measures how often the labels are right when the truth is known.
+
+## Risk disclaimer
+
+This is a research and testing tool, not financial advice and not a recommendation to trade. Backtests and synthetic worlds are simplified models; past or simulated results do not predict future results. Crypto trading can result in the total loss of the capital used.

@@ -464,6 +464,47 @@ def test_entry_that_gaps_through_the_stop_is_skipped():
     assert rule == "R8_structure_stop" and "gapped through stop" in why
 
 
+# A gaps=True world in which both gap paths occur (found by scanning seeds 1-40 of 3-year
+# planted worlds: seeds 12, 29 and 31 have both; a fill-candle gap below the stop is rare).
+GAP_WORLD = ("planted", 29, 3.0)
+
+
+@cache
+def gapped_run():
+    world, seed, years = GAP_WORLD
+    data, events = make_world(world, seed, years=years, gaps=True)
+    return data, events, run_backtest(data, CFG, events)
+
+
+def test_gaps_world_exercises_gap_through_exits_and_the_entry_skip():
+    """End to end on synthetic.make_world(gaps=True): a stop gapped through at the open fills
+    at open * (1 - slippage) for worse than -1R, a fill candle opening below the stop skips
+    the entry (R8 "gapped through stop"), and the independent audit stays clean."""
+    data, events, res = gapped_run()
+    index = {p: {c.ts: k for k, c in enumerate(cs)} for p, cs in data.items()}
+    gap_exits = [
+        t
+        for t in res.trades
+        if t.exit_reason == EXIT_SL and data[t.pair][index[t.pair][t.exit_ts]].open <= t.stop
+    ]
+    assert gap_exits, "no stop was gapped through"
+    for t in gap_exits:
+        c = data[t.pair][index[t.pair][t.exit_ts]]
+        assert c.open != data[t.pair][index[t.pair][t.exit_ts] - 1].close  # a real gap
+        assert t.exit_price == pytest.approx(c.open * (1 - SLIP), rel=1e-15)
+        assert t.r_multiple < -1.0
+    skips = [d for d in denials(res, "R8_structure_stop") if "gapped through stop" in d[3]]
+    assert skips, "no entry was skipped for a fill below the stop"
+    for signal_ts, pair, _rule, _why in skips:
+        i = index[pair][signal_ts]
+        plan, why = find_stop(data[pair], i, pair, CFG)
+        assert plan is not None, why
+        fill = data[pair][i + 1]
+        assert fill.ts == signal_ts + TF and fill.open <= plan.stop
+        assert not any(t.pair == pair and t.signal_ts == signal_ts for t in res.trades)
+    assert check_invariants(res, data, events, CFG) == []
+
+
 @pytest.mark.parametrize("mult", [1.001, 1.2])
 def test_stop_distance_is_rechecked_against_the_actual_fill(mult):
     i = slot(0)

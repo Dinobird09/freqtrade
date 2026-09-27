@@ -2,9 +2,13 @@
   "variant": "rr3_vol2_rsi50-70",
   "config_fingerprint": "5cbe1d74d6aa0330ebefe615d16767a6e6b366aa8bebb88edf460c16059eba47",
   "model_fingerprint": null,
+  "provenance": "synthetic:planted:1",
+  "data_files": null,
+  "events_file": null,
   "backtest": {
     "report_path": "REPORT.md",
-    "completed_utc": "2026-09-27T12:00:00Z"
+    "completed_utc": "2026-09-27T12:00:00Z",
+    "report_sha256": "f8c71bd2e162024ee2a42781ab6e8c3315c4bda64983fba0a737112523a53170"
   },
   "walk_forward": {
     "label": "ROBUST",
@@ -13,7 +17,23 @@
     "train_n": 73,
     "test_n": 35,
     "test_avg_r": 0.8285714285714275,
-    "report_path": "REPORT.md"
+    "report_path": "REPORT.md",
+    "train_journal_path": "journals/rr3_vol2_rsi50-70_train.csv",
+    "train_journal_sha256": "49d90cf2b62c40f00a762bd83cb45790ec06d31e1636cfcdcfa08ae099e7a559",
+    "test_journal_path": "journals/rr3_vol2_rsi50-70_test.csv",
+    "test_journal_sha256": "84721b3fde33b2d253872f7c64608300c643dbc41de1894875856639edca925a",
+    "min_train": 30,
+    "min_test": 30,
+    "train_avg_r": 0.8356019027774563,
+    "label_params": {
+      "seed": 7,
+      "n_boot": 4000,
+      "m": 4,
+      "alpha": 0.05,
+      "max_dd_pct": 20.0,
+      "train_dd_p95_pct": 7.259497883254487,
+      "mtm_max_dd_pct": 5.361207364922934
+    }
   },
   "human_review": {
     "reviewer": null,
@@ -21,7 +41,9 @@
     "trades_reviewed": null,
     "trades_total": null,
     "approved": null,
-    "notes": null
+    "notes": null,
+    "review_path": "review_selected_rr3_vol2_rsi50-70/trades_review.csv",
+    "review_sha256": "9f2fab34c9ead8e18fc34d794073efee626cdb4eb837f5e2da1d6624e3d012b8"
   },
   "testnet": {
     "exchange": null,
@@ -30,7 +52,9 @@
     "trades": null,
     "rule_violations": null,
     "journal_path": null,
-    "notes": null
+    "notes": null,
+    "events_path": null,
+    "events_sha256": null
   },
   "live": {
     "enabled_utc": null

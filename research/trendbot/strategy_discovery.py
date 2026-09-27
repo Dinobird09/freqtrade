@@ -35,9 +35,11 @@ from .config import StrategyConfig
 from .models import Candle, NewsEvent
 from .walkforward import (
     DEFAULT_MAX_DD_PCT,
+    DEFAULT_STATS,
     MIN_TEST,
     MIN_TRAIN,
     TRAIN_FRAC,
+    Stats,
     TrainPhase,
     WalkForwardResult,
     run_test,
@@ -104,6 +106,14 @@ class DiscoveryResult:
             if r.variant == variant:
                 return r
         raise KeyError(variant)
+
+    def judged(self, variant: str) -> bool:
+        """True only for the selected variant: the one pre-registered TEST look of discovery.
+
+        Every other grid variant and the regime-OFF test variant are reported as
+        ``context: <label>, not judged``.
+        """
+        return variant == self.selection.variant
 
     def selected(self) -> WalkForwardResult | None:
         """The walk-forward result of the selected variant, or None if nothing was eligible."""
@@ -172,11 +182,14 @@ def discover(
     max_dd_pct: float = DEFAULT_MAX_DD_PCT,
     min_test: int = MIN_TEST,
     split: int | None = None,
+    stats: Stats = DEFAULT_STATS,
 ) -> DiscoveryResult:
     """Run the grid (+ the regime-OFF test variant) through TRAIN, select, then TEST.
 
     ``grid`` defaults to :func:`default_grid`; test-only configs in a custom grid are
     reported but never selectable. See the module docstring for the order of operations.
+    Only the SELECTED variant is a pre-registered candidate (one of the ``stats.m`` TEST
+    looks of the multiplicity rule); every other variant's label is context, not judged.
     """
     if base.is_test_only:
         raise ValueError("discover() needs a production base config (regime filter ON)")
@@ -190,7 +203,7 @@ def discover(
     log: list[str] = []
 
     # ---- 1. TRAIN only: nothing at or after the split is read.
-    phases = [run_train(data, v, evs, s, variant=v.variant_id()) for v in variants]
+    phases = [run_train(data, v, evs, s, variant=v.variant_id(), stats=stats) for v in variants]
     log.append(f"TRAIN backtests: {len(phases)} variants, candles before the split only")
 
     # ---- 2. Selection, recorded before any TEST backtest exists.
