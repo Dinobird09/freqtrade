@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 import time
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import cache
 
 import pytest
@@ -551,6 +553,96 @@ def test_exit_model_primitives():
     assert simulate_exit(path, 0, 100.0, 80.0, 115.0, CFG, last_idx=0) is None
     with pytest.raises(ValueError):
         simulate_exit(path, 0, 100.0, 101.0, 115.0, CFG)
+
+
+# ---------------------------------------------------------------------------- D4 stop-fill stress
+def test_wick_parameter_of_the_exit_primitive():
+    c = Candle(0, 100.0, 112.0, 89.0, 105.0, 1.0)
+    for k in (0.0, 0.5, 1.0):
+        # A non-gap stop fills a share k of the way from the stop down to the candle low.
+        assert exit_on_candle(c, 95.0, 110.0, 0.001, k) == ((95.0 - k * 6.0) * 0.999, EXIT_SL)
+        assert exit_on_candle(c, 101.0, 110.0, 0.001, k) == (100.0 * 0.999, EXIT_SL)  # gap
+        assert exit_on_candle(c, 88.0, 110.0, 0.001, k) == (110.0, EXIT_TP)  # TP untouched
+    assert exit_on_candle(c, 95.0, 110.0, 0.001, 0.0) == exit_on_candle(c, 95.0, 110.0, 0.001)
+
+
+@pytest.mark.parametrize("k", [0.5, 1.0])
+def test_stop_fill_stress_moves_only_the_non_gap_stop_fill(k):
+    """D4: with stop_fill_wick_k = k a clean stop fills at (S - k(S - low)) * (1 - s), so it
+    loses MORE than the planned 1R; entry, size, stop and target are unchanged, gap-through
+    stops and take-profits are unchanged, and the ML labels use the same model."""
+    cfg = CFG.with_changes(stop_fill_wick_k=k)
+    assert cfg.is_test_only  # a stress config can never be adopted (D1)
+    i = slot(0)
+    s = Scenario().spike(i)
+    stop = s.stop(i, CFG)
+    low = stop * 0.99
+    s.low(i + 2, low)
+    base, stressed = _one_trade(s), _one_trade(s, cfg)
+    assert (stressed.entry_price, stressed.qty, stressed.stop, stressed.target) == (
+        base.entry_price,
+        base.qty,
+        base.stop,
+        base.target,
+    )
+    assert base.exit_price == pytest.approx(stop * (1 - SLIP), rel=1e-15)
+    fill = (stop - k * (stop - low)) * (1 - SLIP)
+    assert (stressed.exit_reason, stressed.exit_ts) == (EXIT_SL, ts(i + 2))
+    assert stressed.exit_price == pytest.approx(fill, rel=1e-15)
+    lu = unit_loss(stressed.entry_price, stop, CFG)
+    by_hand = -((stressed.entry_price - fill) + FEE * (stressed.entry_price + fill)) / lu
+    assert stressed.r_multiple == pytest.approx(by_hand, rel=1e-12)
+    assert base.r_multiple == pytest.approx(-1.0, abs=1e-12) and stressed.r_multiple < -1.0
+    [cand] = enumerate_candidates(data_of(s), cfg)
+    assert cand.r_multiple == pytest.approx(stressed.r_multiple, rel=1e-12)
+    # A gap through the stop and a take-profit are the same trade under the stress.
+    gap = Scenario().spike(i).gap_open(i + 3, stop * 0.97)
+    tp = Scenario().spike(i).take_profit(i, CFG, j=i + 3)
+    for scn in (gap, tp):
+        assert _one_trade(scn, cfg) == _one_trade(scn)
+
+
+# The default (k = 0) engine must stay byte-identical. These digests were computed from the
+# committed engine BEFORE the D4 stress / D5 live-adapter changes (cycle-3 baseline); a
+# legitimate model change elsewhere (indicators, sizing, news, breakers, synthetic worlds)
+# changes them too and must then be re-pinned deliberately.
+DEFAULT_RUN_DIGESTS = {
+    ("planted", 1, 6.0, False): (
+        166,
+        "c9cf97880fe04c0dc09f756b5f176814311abaf0c498c8295d55301ade1cade4",
+        "4bde8937443b4af7e0d9554ff78e52d27379907ba1258e8697c53bf8431ce53d",
+        16736.4283577954,
+    ),
+    ("zero_edge", 2, 3.0, True): (
+        74,
+        "f4dade9cc333bcefa2ba12088d703a5e626c4f45b54d977758661a44ffa5a7a6",
+        "9934cd5a046faa1154dacedc4fec7c7792f4c93e091007bd49698f23672b7aef",
+        10395.177984134729,
+    ),
+}
+
+
+def _digest(rows) -> str:
+    blob = json.dumps([asdict(r) for r in rows], sort_keys=True, allow_nan=False)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("key", sorted(DEFAULT_RUN_DIGESTS))
+def test_default_run_is_byte_identical_to_the_pinned_digest(key):
+    world, seed, years, gaps = key
+    n, trades_sha, candidates_sha, final_equity = DEFAULT_RUN_DIGESTS[key]
+    assert StrategyConfig(stop_fill_wick_k=0.0) == CFG  # k = 0 IS the default config
+    data, events = make_world(world, seed, years=years, gaps=gaps)
+    res = run_backtest(data, CFG, events)
+    assert (len(res.trades), _digest(res.trades), res.final_equity) == (
+        n,
+        trades_sha,
+        final_equity,
+    )
+    assert _digest(enumerate_candidates(data, CFG, events)) == candidates_sha
+    if years <= 3:  # ... and the stress really is a different model on the same world
+        stressed = run_backtest(data, CFG.with_changes(stop_fill_wick_k=0.5), events)
+        assert len(stressed.trades) > 30 and _digest(stressed.trades) != trades_sha
 
 
 # ---------------------------------------------------------------------------- plumbing

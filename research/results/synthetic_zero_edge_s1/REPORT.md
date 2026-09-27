@@ -12,17 +12,18 @@ This report does NOT promise, target or optimise a win rate, and nothing in this
 - Qualifying triggers planted per pair (before / after the 70% split): BTC/USDT 344 / 143, ETH/USDT 336 / 129, BNB/USDT 317 / 114.
 - **Synthetic results are verification of the methodology, not evidence about real markets.** No real BTC/ETH/BNB data was used in this run.
 - News calendar loaded: yes (synthetic, 273 events: high macro 147, high regulatory 24, high unlock 6, medium bnb_burn 24, medium launchpool 72). The events have no price impact; they exercise R5 only.
-- Walk-forward split: 2023-03-14T00:00:00Z = 70% of the common time range of all pairs (TRAIN = signal candles before it, TEST = at or after it, up to 2024-12-30T00:00:00Z). TEST starts with fresh equity and fresh circuit breakers; indicators warm up on earlier candles only.
-- Statistics (CONTRACT.md v3 C4/C5): 4000 bootstrap resamples (seed 7) for the iid and the calendar-month block bootstrap; m = 4 pre-registered candidates, alpha 0.05. ROBUST requires at least 30 trades in each window, TRAIN and TEST avg R > 0, and a one-sided 98.75% lower bound of the TEST mean above zero for BOTH an iid and a calendar-month block bootstrap (the more conservative is used): alpha 0.05 is split over the m = 4 pre-registered candidates (base, discovery-selected, base+ml, base+guard), so when none has an edge the chance that ANY is called ROBUST is at most about 5%; a positive TEST mean that fails only the bound is UNTESTED (positive but not distinguishable from zero after multiplicity correction); the rule was fixed in advance and is never tuned on TEST outcomes.
+- Walk-forward split: 2023-03-14T00:00:00Z = 70% of the common time range of all pairs (TRAIN = candles that CLOSED by it, TEST = signal candles at or after it, up to 2024-12-30T00:00:00Z). TEST starts with fresh equity and fresh circuit breakers; indicators warm up on earlier candles only.
+- Statistics (CONTRACT.md v3 C4/C5, v4 D1/D7): 4000 bootstrap resamples (seed 7) for the iid and the calendar-month block bootstrap; m = 4 pre-registered candidates, alpha 0.05. ROBUST requires at least 30 trades in each window, TRAIN and TEST avg R > 0, and a one-sided 98.75% lower bound of the TEST mean above zero for BOTH an iid and a calendar-month block bootstrap (the more conservative is used): alpha 0.05 is split over the m = 4 pre-registered candidates (base, discovery-selected, base+ml, base+guard), so when none has an edge the chance that ANY is called ROBUST is at most about 5%; a positive TEST mean that fails only the bound is UNTESTED (positive but not distinguishable from zero after multiplicity correction); the rule was fixed in advance and is never tuned on TEST outcomes.
+- Drawdown (CONTRACT.md v3 C5, cap revised by v4 D7): every result reports the realised (closed-trade) and the mark-to-market (open positions valued at each 4H close) max drawdown; dd_ok = TEST mark-to-market max drawdown <= min(15%, the 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length, in percent of equity at the risk each trade took). Why the cap: the 15% cap is about 15 consecutive full-size losses at the mandated 1% cluster risk budget; at the 2:1 break-even win probability p* = 1/3 such a streak has probability (2/3)^15 = 0.23%, so a TEST drawdown beyond it is inconsistent with even a break-even strategy at the mandated risk (the TRAIN-bootstrap p95 usually binds first; the 3% weekly-loss halt limits how fast a drawdown accrues, not how deep it goes).
 
-| pair | candles | TRAIN candles (before the split) | TEST candles (from the split) | first candle (UTC) | last candle (UTC) | gaps |
+| pair | candles | TRAIN candles (closed by the split) | TEST candles (from the split) | first candle (UTC) | last candle (UTC) | gaps |
 |---|---:|---:|---:|---|---|---|
 | BTC/USDT | 13140 | 9198 | 3942 | 2019-01-01T00:00:00Z | 2024-12-29T20:00:00Z | 0 |
 | ETH/USDT | 13140 | 9198 | 3942 | 2019-01-01T00:00:00Z | 2024-12-29T20:00:00Z | 0 |
 | BNB/USDT | 13140 | 9198 | 3942 | 2019-01-01T00:00:00Z | 2024-12-29T20:00:00Z | 0 |
 
 - **Costs used in every backtest:** fee 0.100% of notional per side (the default: Binance spot taker, no discounts) (`--fee-rate 0.001`), charged on the entry AND on the exit; slippage 0.05% (`--slippage-pct 0.05`) against the trade on market fills (entries and stop exits; take-profit limit exits get none); exchange `binance` (`--exchange-id`; `EXCHANGE:binance` news events block every pair). Starting capital 10,000 per window.
-- Cost-aware sizing and targets (CONTRACT.md v2 A1): the planned risk is the ALL-IN loss at the stop (the stop fill after slippage plus both fees), so a clean stop is exactly -1R and the target is placed so that a take-profit nets exactly +2R after fees; the target's price distance is therefore more than 2x the stop distance. Only a gap through the stop loses more than 1R.
+- Cost-aware sizing and targets (CONTRACT.md v2 A1): the planned risk is the ALL-IN loss at the stop (the stop fill after slippage plus both fees), so a clean stop is exactly -1R and the target is placed so that a take-profit nets exactly +2R after fees; the target's price distance is therefore more than 2x the stop distance. Only a gap through the stop loses more than 1R under the touch fill model.
 - Coinbase Advanced Trade taker fees at low volume tiers are several times Binance's, so a Coinbase run must pass the account's real tier with `--fee-rate` (a fraction of notional per side: 0.006 = 0.6%) and `--exchange-id coinbase`; the default costs would understate them.
 - Measured on the baseline's TRAIN and TEST trades: fees alone cost 0.06R per trade on average (median stop distance 3.79% of the entry price), so the expectancy below is only as good as the fee rate above.
 
@@ -50,7 +51,7 @@ Default mandate config `rr2_vol1.5_rsi50-70` (variant `base`). TRAIN window star
 
 **Label: NO-EDGE.** Train expectancy is -0.004R over 94 trades, so there is no edge to validate.
 
-Drawdown check (CONTRACT v3 C5; dd_ok = TEST mark-to-market max drawdown <= min(20%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length)): **passed**. Test mark-to-market max drawdown 10.79% (realised closed-trade 10.27% (11.00R)) is within the limit 16.63% = min(20%, 95th percentile 16.63% of max drawdown over TRAIN trade sequences bootstrapped at the TEST length of 60). For comparison, TRAIN max drawdown: realised 5.50%, mark-to-market 6.44%.
+Drawdown check (CONTRACT v3 C5 / v4 D7; dd_ok = TEST mark-to-market max drawdown <= min(15%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length); the 15% cap is about 15 consecutive full-size losses, a streak of probability (2/3)^15 = 0.23% at the 2:1 break-even win probability p* = 1/3): **passed**. Test mark-to-market max drawdown 10.79% (realised closed-trade 10.27% (11.00R)) is within the limit 15.00% = min(15%, 95th percentile 16.63% of max drawdown over TRAIN trade sequences bootstrapped at the TEST length of 60). For comparison, TRAIN max drawdown: realised 5.50%, mark-to-market 6.44%.
 
 ## 4. Strategy discovery: TRAIN vs TEST
 
@@ -58,9 +59,9 @@ K = 13 variants tried: 12 legal tightenings (reward:risk {2, 2.5, 3} x volume mu
 
 Selection rule: highest TRAIN t-stat among selectable variants with >= 30 TRAIN trades. rr2_vol2_rsi55-70 has the highest TRAIN t-stat (+0.29, avg +0.048R over 75 trades) among 12 eligible variants; chosen on TRAIN only, before any TEST backtest was run.
 
-Order of operations actually run: TRAIN backtests: 13 variants, candles before the split only -> selection recorded: rr2_vol2_rsi55-70 -> TEST backtests: 13 variants, reported side by side only.
+Order of operations actually run: TRAIN backtests: 13 variants, candles closed by the split only -> selection recorded: rr2_vol2_rsi55-70 -> TEST backtests: 13 variants, reported side by side only.
 
-Only the selected variant is a pre-registered candidate (one of the m TEST looks of section 6). Every other row, including the regime-OFF test variant, is shown as `context: <label>, not judged`: picking one of them because of its TEST numbers would be selection on TEST.
+Only the selected variant is a pre-registered candidate (one of the m TEST looks of section 6). Every other row, including the regime-OFF test variant, is shown as `context: <label>, not judged`: picking one of them because of its TEST numbers would be selection on TEST. Context variants are not adoptable: they get no adoption record and no holdout-ledger line.
 
 | variant | status | TRAIN n | TRAIN avg R | TRAIN 90% CI | TRAIN t | TEST n | TEST avg R | TEST 90% CI | TEST adjusted LB | TEST max DD % realised / MTM | label |
 |---|---|---:|---:|---|---:|---:|---:|---|---:|---|---|
@@ -84,13 +85,15 @@ The TRAIN column of the selected variant `rr2_vol2_rsi55-70` is biased upward by
 
 **Label: TRAIN-ONLY.** Train expectancy +0.048R (n=75) did not hold out of sample: test expectancy is -0.020R (n=49), which suggests curve-fitting.
 
-Drawdown check (CONTRACT v3 C5; dd_ok = TEST mark-to-market max drawdown <= min(20%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length)): **passed**. Test mark-to-market max drawdown 7.05% (realised closed-trade 6.81% (7.00R)) is within the limit 15.76% = min(20%, 95th percentile 15.76% of max drawdown over TRAIN trade sequences bootstrapped at the TEST length of 49). For comparison, TRAIN max drawdown: realised 5.92%, mark-to-market 6.48%.
+Drawdown check (CONTRACT v3 C5 / v4 D7; dd_ok = TEST mark-to-market max drawdown <= min(15%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length); the 15% cap is about 15 consecutive full-size losses, a streak of probability (2/3)^15 = 0.23% at the 2:1 break-even win probability p* = 1/3): **passed**. Test mark-to-market max drawdown 7.05% (realised closed-trade 6.81% (7.00R)) is within the limit 15.00% = min(15%, 95th percentile 15.76% of max drawdown over TRAIN trade sequences bootstrapped at the TEST length of 49). For comparison, TRAIN max drawdown: realised 5.92%, mark-to-market 6.48%.
 
 ## 5. Entry layers (ML filter, expectancy guard): TRAIN vs TEST
 
-Two pre-registered layers on the baseline rules. `base+ml` adds `L_ml_filter`, a logistic regression on 6 features (rsi, vol_ratio, ema_gap_pct, dist_regime_pct, hour_sin, hour_cos), fitted ONLY on purged TRAIN candidates and applied unchanged to TEST, so its TRAIN numbers are IN-SAMPLE. `base+guard` switches on `L_expectancy_guard` (`expectancy_guard=True`: a pair's risk is multiplied by 0.5 while its last 20 closed trades average below 0R); it is a fixed rule over the journal, nothing is fitted, and it needs the same walk-forward evidence as any other variant.
+Two pre-registered layers on the baseline rules. `base+ml` adds `L_ml_filter`, a logistic regression on 6 features (rsi, vol_ratio, ema_gap_pct, dist_regime_pct, hour_sin, hour_cos), fitted ONLY on purged TRAIN candidates and applied unchanged to TEST, so its full-TRAIN numbers are IN-SAMPLE. `base+guard` switches on `L_expectancy_guard` (`expectancy_guard=True`: a pair's risk is multiplied by 0.5 while its last 20 closed trades average below 0R); it is a fixed rule over the journal, nothing is fitted, and it needs the same walk-forward evidence as any other variant.
 
 An entry layer can only VETO an entry that passed every mandatory rule; it never approves an entry a rule denies. A veto can free R6 budget or change R9 state, admitting other rule-compliant trades, so a layer's journal is not a subset of the base journal: both directions are counted below, matched by (pair, signal time).
+
+A fitted layer's TRAIN gate is out of sample (CONTRACT v4 D8): its purged TRAIN candidates are split 70/30 in time order, the layer is fitted on the first 70% (purged at the inner boundary) and that inner filter is backtested on the rest of TRAIN. That out-of-sample TRAIN window is what the label judges (NO-EDGE gate, trade counts, the TRAIN drawdown bootstrap) and what the adoption record binds as the TRAIN journal; the in-sample full-TRAIN figure is context only. The model applied to TEST is still fitted on ALL purged TRAIN candidates.
 
 | layer | window (TRAIN / TEST) | signals vetoed | entries at reduced risk (guard x < 1) | base trades absent from the layer journal | layer trades absent from the base journal | trades in both | base trades | layer trades |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -99,12 +102,13 @@ An entry layer can only VETO an entry that passed every mandatory rule; it never
 | `base+guard` | TRAIN | 0 | 21 | 1 | 9 | 93 | 94 | 102 |
 | `base+guard` | TEST | 0 | 3 | 0 | 0 | 60 | 60 | 60 |
 
-- `base+ml` vs `base`: TRAIN avg R -0.004 -> +0.333 (n 94 -> 9, in-sample) | TEST avg R -0.050 -> +0.500 (n 60 -> 6).
+- `base+ml` vs `base`: TRAIN avg R -0.004 -> +0.333 (n 94 -> 9, in-sample; out-of-sample gate +0.000 (n 0)) | TEST avg R -0.050 -> +0.500 (n 60 -> 6).
 - `base+guard` vs `base`: TRAIN avg R -0.004 -> -0.044 (n 94 -> 102) | TEST avg R -0.050 -> -0.050 (n 60 -> 60).
 
 Logistic filter (l2=1) fitted on 371 TRAIN candidates (TRAIN base win rate 24.0%, context only) vetoes every rule-passing signal whose predicted win probability is at or below the break-even 0.333.
 
-- TRAIN candidates enumerated (purged: outcome resolved before the split): 371; used for the fit: 371 (0 skipped for missing features); TRAIN candidate win share 24.0% (context only).
+- TRAIN candidates enumerated (purged: outcome resolved by the split): 371; used for the final fit: 371 (0 skipped for missing features); TRAIN candidate win share 24.0% (context only).
+- **Out-of-sample TRAIN gate (CONTRACT v4 D8):** the 371 purged TRAIN candidates were split 70/30 in time order at 2022-02-05T04:00:00Z; the inner model was fitted on 255 candidates (3 purged: signalled before the inner boundary but resolved after it); inner model fingerprint `dde9aa45f51becf2`, and backtested from 2022-02-05T04:00:00Z to the split: n=0, avg +0.000R. That window is the TRAIN the label judges and the TRAIN journal the adoption record binds; the in-sample full-TRAIN figure (n=9, avg +0.333R) is context only.
 - Threshold p* = break-even win probability from the TRAIN avg win +2.00R and avg loss -1.00R: p* = 0.333 (no threshold search).
 - L2 penalty 1 (fixed, not tuned); intercept -1.172.
 - Model fingerprint (sha256 of the canonical JSON of features, TRAIN means/stds, intercept, coefficients, threshold and l2): `80c90c198bdf1de2a14c0f73a2f55df74c1ecf18088fa0f3c80aefbc97c70fe5`. It is pinned in the ML adoption record (section 11); `MLFilter.from_json` re-verifies it when the live bot loads the model file.
@@ -118,54 +122,62 @@ Logistic filter (l2=1) fitted on 371 TRAIN candidates (TRAIN base win rate 24.0%
 | `hour_sin` | -0.034 |
 | `hour_cos` | +0.001 |
 
-| metric | base TRAIN | base+ml TRAIN (in-sample) | base+guard TRAIN | base TEST | base+ml TEST | base+guard TEST |
-|---|---:|---:|---:|---:|---:|---:|
-| trades (n) | 94 | 9 | 102 | 60 | 6 | 60 |
-| avg R (expectancy, the target metric) | -0.004 | +0.333 | -0.044 | -0.050 | +0.500 | -0.050 |
-| iid bootstrap 90% CI of avg R | [-0.234, +0.245] | [-0.333, +1.000] | [-0.268, +0.185] | [-0.350, +0.250] | [-0.500, +1.500] | [-0.350, +0.250] |
-| calendar-month block bootstrap 90% CI of avg R | [-0.162, +0.157] (44 months) | [-0.625, +1.182] (8 months) | [-0.194, +0.110] (44 months) | [-0.290, +0.212] (20 months) | [-0.500, +1.500] (6 months) | [-0.290, +0.212] (20 months) |
-| one-sided lower bound of avg R at 1 - alpha/m, iid / block | -0.311 / -0.227 (98.75%) | -0.667 / -1.000 (98.75%) | -0.345 / -0.251 (98.75%) | -0.450 / -0.364 (98.75%) | -1.000 / -1.000 (98.75%) | -0.450 / -0.364 (98.75%) |
-| adjusted lower bound used by the label (the smaller) | -0.311 | -1.000 | -0.345 | -0.450 | -1.000 | -0.450 |
-| t-stat of avg R | -0.03 | +0.63 | -0.32 | -0.28 | +0.75 | -0.28 |
-| total R | -0.40 | +3.00 | -4.53 | -3.00 | +3.00 | -3.00 |
-| profit factor | 1.01 | 1.49 | 0.91 | 0.86 | 2.37 | 0.86 |
-| max drawdown % realised (closed trades) | 5.50% | 2.98% | 7.87% | 10.27% | 1.50% | 10.22% |
-| max drawdown % mark-to-market (4H closes) | 6.44% | 3.19% | 8.69% | 10.79% | 1.62% | 10.79% |
-| max drawdown R (closed trades) | 7.00 | 3.00 | 10.00 | 11.00 | 2.00 | 11.00 |
-| win rate (context only, never a target) | 33.0% | 44.4% | 31.4% | 31.7% | 50.0% | 31.7% |
-| exits SL / TP / END | 62 / 31 / 1 | 5 / 4 / 0 | 68 / 32 / 2 | 41 / 19 / 0 | 3 / 3 / 0 | 41 / 19 / 0 |
-| avg hold (h) | 171.0 | 97.8 | 163.2 | 112.0 | 63.3 | 112.0 |
+| metric | base TRAIN | base+ml TRAIN (in-sample) | base+ml TRAIN (out-of-sample inner split) | base+guard TRAIN | base TEST | base+ml TEST | base+guard TEST |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| trades (n) | 94 | 9 | 0 | 102 | 60 | 6 | 60 |
+| avg R (expectancy, the target metric) | -0.004 | +0.333 | +0.000 | -0.044 | -0.050 | +0.500 | -0.050 |
+| iid bootstrap 90% CI of avg R | [-0.234, +0.245] | [-0.333, +1.000] | n/a | [-0.268, +0.185] | [-0.350, +0.250] | [-0.500, +1.500] | [-0.350, +0.250] |
+| calendar-month block bootstrap 90% CI of avg R | [-0.162, +0.157] (44 months) | [-0.625, +1.182] (8 months) | n/a | [-0.194, +0.110] (44 months) | [-0.290, +0.212] (20 months) | [-0.500, +1.500] (6 months) | [-0.290, +0.212] (20 months) |
+| one-sided lower bound of avg R at 1 - alpha/m, iid / block | -0.311 / -0.227 (98.75%) | -0.667 / -1.000 (98.75%) | n/a | -0.345 / -0.251 (98.75%) | -0.450 / -0.364 (98.75%) | -1.000 / -1.000 (98.75%) | -0.450 / -0.364 (98.75%) |
+| adjusted lower bound used by the label (the smaller) | -0.311 | -1.000 | +0.000 | -0.345 | -0.450 | -1.000 | -0.450 |
+| t-stat of avg R | -0.03 | +0.63 | +0.00 | -0.32 | -0.28 | +0.75 | -0.28 |
+| total R | -0.40 | +3.00 | +0.00 | -4.53 | -3.00 | +3.00 | -3.00 |
+| profit factor | 1.01 | 1.49 | n/a (no losses) | 0.91 | 0.86 | 2.37 | 0.86 |
+| max drawdown % realised (closed trades) | 5.50% | 2.98% | 0.00% | 7.87% | 10.27% | 1.50% | 10.22% |
+| max drawdown % mark-to-market (4H closes) | 6.44% | 3.19% | 0.00% | 8.69% | 10.79% | 1.62% | 10.79% |
+| max drawdown R (closed trades) | 7.00 | 3.00 | 0.00 | 10.00 | 11.00 | 2.00 | 11.00 |
+| win rate (context only, never a target) | 33.0% | 44.4% | n/a | 31.4% | 31.7% | 50.0% | 31.7% |
+| exits SL / TP / END | 62 / 31 / 1 | 5 / 4 / 0 | 0 / 0 / 0 | 68 / 32 / 2 | 41 / 19 / 0 | 3 / 3 / 0 | 41 / 19 / 0 |
+| avg hold (h) | 171.0 | 97.8 | 0.0 | 163.2 | 112.0 | 63.3 | 112.0 |
 
 `base+ml`:
 
-**Label: UNTESTED.** Too few trades to judge: train n=9 (need 30) and test n=6 (need 30).
+**Label: UNTESTED.** TRAIN here is the out-of-sample inner split (CONTRACT v4 D8: the layer refitted on 255 of the first 70% of the 371 purged TRAIN candidates, purged at the inner boundary 2022-02-05T04:00:00Z, and backtested from there to the split; the in-sample full-TRAIN figure is context only). Too few trades to judge: train n=0 (need 30) and test n=6 (need 30).
 
-Drawdown check (CONTRACT v3 C5; dd_ok = TEST mark-to-market max drawdown <= min(20%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length)): **passed**. Test mark-to-market max drawdown 1.62% (realised closed-trade 1.50% (2.00R)) is within the limit 3.94% = min(20%, 95th percentile 3.94% of max drawdown over TRAIN trade sequences bootstrapped at the TEST length of 6). For comparison, TRAIN max drawdown: realised 2.98%, mark-to-market 3.19%.
+Drawdown check (CONTRACT v3 C5 / v4 D7; dd_ok = TEST mark-to-market max drawdown <= min(15%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length); the 15% cap is about 15 consecutive full-size losses, a streak of probability (2/3)^15 = 0.23% at the 2:1 break-even win probability p* = 1/3): **passed**. Test mark-to-market max drawdown 1.62% (realised closed-trade 1.50% (2.00R)) is within the limit 15.00% (min of 15% and 15%). For comparison, out-of-sample gate max drawdown: realised 0.00%, mark-to-market 0.00% (in-sample TRAIN max drawdown: realised 2.98%, mark-to-market 3.19%).
 
 `base+guard`:
 
 **Label: NO-EDGE.** Train expectancy is -0.044R over 102 trades, so there is no edge to validate.
 
-Drawdown check (CONTRACT v3 C5; dd_ok = TEST mark-to-market max drawdown <= min(20%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length)): **passed**. Test mark-to-market max drawdown 10.79% (realised closed-trade 10.22% (11.00R)) is within the limit 16.84% = min(20%, 95th percentile 16.84% of max drawdown over TRAIN trade sequences bootstrapped at the TEST length of 60). For comparison, TRAIN max drawdown: realised 7.87%, mark-to-market 8.69%.
+Drawdown check (CONTRACT v3 C5 / v4 D7; dd_ok = TEST mark-to-market max drawdown <= min(15%, 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at the TEST length); the 15% cap is about 15 consecutive full-size losses, a streak of probability (2/3)^15 = 0.23% at the 2:1 break-even win probability p* = 1/3): **passed**. Test mark-to-market max drawdown 10.79% (realised closed-trade 10.22% (11.00R)) is within the limit 15.00% = min(15%, 95th percentile 16.84% of max drawdown over TRAIN trade sequences bootstrapped at the TEST length of 60). For comparison, TRAIN max drawdown: realised 7.87%, mark-to-market 8.69%.
 
 LightGBM, other gradient boosting and neural networks are NOT justified at this sample size (371 TRAIN candidates, 6 features): a flexible model would memorise noise, so only a fixed-penalty logistic regression with a break-even threshold is allowed.
 
 ## 6. Verdict
 
-Candidates judged (pre-registered, one TEST look each, m = 4): baseline `base`, discovery-selected `rr2_vol2_rsi55-70`, ML layer `base+ml`, expectancy guard `base+guard`. Other grid variants are excluded because choosing among them by TEST numbers would be selection on TEST. ROBUST requires at least 30 trades in each window, TRAIN and TEST avg R > 0, and a one-sided 98.75% lower bound of the TEST mean above zero for BOTH an iid and a calendar-month block bootstrap (the more conservative is used): alpha 0.05 is split over the m = 4 pre-registered candidates (base, discovery-selected, base+ml, base+guard), so when none has an edge the chance that ANY is called ROBUST is at most about 5%; a positive TEST mean that fails only the bound is UNTESTED (positive but not distinguishable from zero after multiplicity correction); the rule was fixed in advance and is never tuned on TEST outcomes. The TEST gate is reached when TRAIN avg R > 0 and both windows hold >= 30 trades; the drawdown check is reported beside the label.
+Candidates judged (pre-registered, one TEST look each, m = 4): baseline `base`, discovery-selected `rr2_vol2_rsi55-70`, ML layer `base+ml`, expectancy guard `base+guard`. Other grid variants are excluded because choosing among them by TEST numbers would be selection on TEST. ROBUST requires at least 30 trades in each window, TRAIN and TEST avg R > 0, and a one-sided 98.75% lower bound of the TEST mean above zero for BOTH an iid and a calendar-month block bootstrap (the more conservative is used): alpha 0.05 is split over the m = 4 pre-registered candidates (base, discovery-selected, base+ml, base+guard), so when none has an edge the chance that ANY is called ROBUST is at most about 5%; a positive TEST mean that fails only the bound is UNTESTED (positive but not distinguishable from zero after multiplicity correction); the rule was fixed in advance and is never tuned on TEST outcomes. The TEST gate is reached when the judged TRAIN avg R > 0 and both windows hold >= 30 trades; the drawdown check is reported beside the label. The judged TRAIN of `base+ml` is its out-of-sample gate (CONTRACT v4 D8, section 5).
 
-| candidate | TRAIN n | TRAIN avg R | TEST n | TEST avg R | TEST iid / block LB (1 - alpha/m) | reached the TEST gate | label | TEST MTM max DD vs limit | dd_ok |
+| candidate | TRAIN n (judged) | TRAIN avg R (judged) | TEST n | TEST avg R | TEST iid / block LB (1 - alpha/m) | reached the TEST gate | label | TEST MTM max DD vs limit | dd_ok |
 |---|---:|---:|---:|---:|---|---|---|---|---|
-| baseline `base` | 94 | -0.004 | 60 | -0.050 | -0.450 / -0.364 | no | NO-EDGE | 10.79% vs 16.63% | yes |
-| discovery-selected `rr2_vol2_rsi55-70` | 75 | +0.048 | 49 | -0.020 | -0.449 / -0.385 | yes | TRAIN-ONLY | 7.05% vs 15.76% | yes |
-| ML layer `base+ml` | 9 | +0.333 | 6 | +0.500 | -1.000 / -1.000 | no | UNTESTED | 1.62% vs 3.94% | yes |
-| expectancy guard `base+guard` | 102 | -0.044 | 60 | -0.050 | -0.450 / -0.364 | no | NO-EDGE | 10.79% vs 16.84% | yes |
+| baseline `base` | 94 | -0.004 | 60 | -0.050 | -0.450 / -0.364 | no | NO-EDGE | 10.79% vs 15.00% | yes |
+| discovery-selected `rr2_vol2_rsi55-70` | 75 | +0.048 | 49 | -0.020 | -0.449 / -0.385 | yes | TRAIN-ONLY | 7.05% vs 15.00% | yes |
+| ML layer `base+ml` | 0 | +0.000 | 6 | +0.500 | -1.000 / -1.000 | no | UNTESTED | 1.62% vs 15.00% | yes |
+| expectancy guard `base+guard` | 102 | -0.044 | 60 | -0.050 | -0.450 / -0.364 | no | NO-EDGE | 10.79% vs 15.00% | yes |
 
-No robust result found. Pre-registered candidates, TRAIN | TEST: baseline `base` NO-EDGE (TRAIN -0.004R n=94 | TEST -0.050R n=60); discovery-selected `rr2_vol2_rsi55-70` TRAIN-ONLY (TRAIN +0.048R n=75 | TEST -0.020R n=49); ML layer `base+ml` UNTESTED (TRAIN +0.333R n=9 | TEST +0.500R n=6); expectancy guard `base+guard` NO-EDGE (TRAIN -0.044R n=102 | TEST -0.050R n=60).
+No robust result found. Pre-registered candidates, TRAIN | TEST: baseline `base` NO-EDGE (TRAIN -0.004R n=94 | TEST -0.050R n=60); discovery-selected `rr2_vol2_rsi55-70` TRAIN-ONLY (TRAIN +0.048R n=75 | TEST -0.020R n=49); ML layer `base+ml` UNTESTED (TRAIN +0.000R n=0 | TEST +0.500R n=6); expectancy guard `base+guard` NO-EDGE (TRAIN -0.044R n=102 | TEST -0.050R n=60).
+
+Holdout ledger (CONTRACT v4 D3): `test_looks.jsonl` (append-only JSON lines). This run appended 4 line(s), one per adoptable pre-registered candidate that got a TEST backtest (context discovery variants and test-only configs are never recorded). A look is a DISTINCT (config fingerprint, model fingerprint), so re-running identical candidates is not a new look. `adoption check` blocks (`ADOPT_holdout`) from HUMAN_REVIEW on when a pair's count exceeds m = 4. After a reviewer N or any other revision, a variant needs a TEST window starting at or after the latest test_end_ts of every earlier look; it is never re-run on the same TEST window.
+
+| pair | TRAIN window (UTC) | TEST window (UTC) | cumulative distinct TEST looks on this TEST window | limit m | status |
+|---|---|---|---:|---:|---|
+| BNB/USDT | start .. 2023-03-14T00:00:00Z | 2023-03-14T00:00:00Z .. 2024-12-30T00:00:00Z | 4 | 4 | within the limit |
+| BTC/USDT | start .. 2023-03-14T00:00:00Z | 2023-03-14T00:00:00Z .. 2024-12-30T00:00:00Z | 4 | 4 | within the limit |
+| ETH/USDT | start .. 2023-03-14T00:00:00Z | 2023-03-14T00:00:00Z .. 2024-12-30T00:00:00Z | 4 | 4 | within the limit |
 
 ## 7. Why signals were rejected (decision counts per rule)
 
-Signal candles denied per rule (the FIRST failing rule is counted, so the R1-R4 rows include every candle that was simply not a signal). Exits are never gated.
+Signal candles denied per rule (the FIRST failing rule is counted, so the R1-R4 rows include every candle that was simply not a signal). Exits are never gated. TRAIN is the full TRAIN backtest (in-sample for the ML layer).
 
 | rule | base TRAIN | base TEST | rr2_vol2_rsi55-70 TRAIN | rr2_vol2_rsi55-70 TEST | base+ml TRAIN | base+ml TEST | base+guard TRAIN | base+guard TEST | meaning |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -186,7 +198,7 @@ Signal candles denied per rule (the FIRST failing rule is counted, so the R1-R4 
 
 ## 8. Invariant audit of every backtest
 
-`invariants.check_invariants` independently re-derives every mandatory rule (R1-R9, 2:1 minimum, sizing from the stop, exits on the first touch, no data after the window) from each trade list and the candles.
+`invariants.check_invariants` independently re-derives every mandatory rule (R1-R9, 2:1 minimum, sizing from the stop, exits on the first touch, no data after the window) from each trade list and the candles. A fitted layer's TRAIN column also covers its D8 out-of-sample gate backtest.
 
 | backtest | TRAIN violations | TEST violations |
 |---|---:|---:|
@@ -207,7 +219,7 @@ Signal candles denied per rule (the FIRST failing rule is counted, so the R1-R4 
 | `base+ml` | 0 | 0 |
 | `base+guard` | 0 | 0 |
 
-Result: CLEAN. 0 violations in 32 backtests.
+Result: CLEAN. 0 violations in 33 backtests.
 
 ## 9. Journal rules at the end of TRAIN and at the end of TEST
 
@@ -231,7 +243,7 @@ Result: CLEAN. 0 violations in 32 backtests.
 
 | window (TRAIN journal at the split, TEST journal at the end) | rule | scope | action | explanation | evidence (journal trade ids) |
 |---|---|---|---|---|---|
-| TRAIN at 2023-03-14T00:00:00Z (equity 10,195.18) | - | - | none | No active adaptations. | - |
+| TRAIN at 2023-03-14T00:00:00Z (equity 10,000.00) | - | - | none | No active adaptations. | - |
 | TEST at 2024-12-30T00:00:00Z (equity 10,348.90) | - | - | none | No active adaptations. | - |
 
 **expectancy guard `base+guard`:**
@@ -247,14 +259,14 @@ Reproduce the baseline TEST row with `python -m research.trendbot.journal_rules 
 
 ## 10. Journals and human review packs
 
-Trade journals (`journal.write_journal`, one CSV per window) for the 4 pre-registered candidates that ran, the variants whose TRAIN and TEST columns this report shows in full. The other discovery variants appear only as one context row each in section 4, so no journal is kept for them (the same command regenerates them). TEST trade ids are offset past the TRAIN ids, so ids are unique across a variant's two journals and its review pack.
+Trade journals (`journal.write_journal`, one CSV per window) for the 4 pre-registered candidates that ran, the variants whose TRAIN and TEST columns this report shows in full. The other discovery variants appear only as one context row each in section 4, so no journal is kept for them (the same command regenerates them). TEST trade ids are offset past the TRAIN ids, so ids are unique across a variant's two journals and its review pack. The TRAIN journal is the judged TRAIN window (for a fitted layer its D8 out-of-sample gate; its in-sample full-TRAIN journal is kept as context and bound by no record).
 
-| variant | TRAIN journal | TEST journal |
-|---|---|---|
-| `base` | [journals/base_train.csv](journals/base_train.csv) | [journals/base_test.csv](journals/base_test.csv) |
-| `rr2_vol2_rsi55-70` | [journals/rr2_vol2_rsi55-70_train.csv](journals/rr2_vol2_rsi55-70_train.csv) | [journals/rr2_vol2_rsi55-70_test.csv](journals/rr2_vol2_rsi55-70_test.csv) |
-| `base+ml` | [journals/base_plus_ml_train.csv](journals/base_plus_ml_train.csv) | [journals/base_plus_ml_test.csv](journals/base_plus_ml_test.csv) |
-| `base+guard` | [journals/base_plus_guard_train.csv](journals/base_plus_guard_train.csv) | [journals/base_plus_guard_test.csv](journals/base_plus_guard_test.csv) |
+| variant | TRAIN journal (judged) | TEST journal | in-sample full-TRAIN journal (context) |
+|---|---|---|---|
+| `base` | [journals/base_train.csv](journals/base_train.csv) | [journals/base_test.csv](journals/base_test.csv) | - |
+| `rr2_vol2_rsi55-70` | [journals/rr2_vol2_rsi55-70_train.csv](journals/rr2_vol2_rsi55-70_train.csv) | [journals/rr2_vol2_rsi55-70_test.csv](journals/rr2_vol2_rsi55-70_test.csv) | - |
+| `base+ml` | [journals/base_plus_ml_train.csv](journals/base_plus_ml_train.csv) | [journals/base_plus_ml_test.csv](journals/base_plus_ml_test.csv) | [journals/base_plus_ml_train_insample.csv](journals/base_plus_ml_train_insample.csv) |
+| `base+guard` | [journals/base_plus_guard_train.csv](journals/base_plus_guard_train.csv) | [journals/base_plus_guard_test.csv](journals/base_plus_guard_test.csv) | - |
 
 Human review packs (`review_sheet.write_review_pack`, TRAIN and TEST):
 
@@ -273,14 +285,14 @@ Stages: BACKTEST -> WALK_FORWARD -> HUMAN_REVIEW -> TESTNET -> LIVE. Stage reach
 
 **This run used SYNTHETIC data: its records only demonstrate the mechanism. A synthetic result can never justify adopting a variant: `adoption check --stage HUMAN_REVIEW` is BLOCKED by `ADOPT_provenance` for every record below, whatever its label.**
 
-Every record is bound to its evidence (CONTRACT.md v3 C3): `provenance`, `data_files` (sha256 per candle file) and `events_file`; `backtest.report_sha256` (this REPORT.md, the record being rewritten after the report so the hash matches); both walk-forward journals with their sha256, `min_train` / `min_test`, `train_avg_r` and `label_params` (m, alpha, n_boot, seed, and the C5 drawdown inputs `max_dd_pct`, `train_dd_p95_pct` and `mtm_max_dd_pct`, which need the candles and are recorded as measured), from which `adoption check` recomputes the label, n, avg R and dd_ok; and `human_review.review_path` / `review_sha256` (the blank review pack; after filling in `reviewer_ok`, re-hash it with `python -m research.trendbot.adoption hash`). The check status below was computed on the records as written.
+Every record is bound to its evidence (CONTRACT.md v3 C3, v4 D1-D3): `provenance` (`real` only with a hash-matching `manifest.json`, else `unverified-csv`; synthetic `synthetic:<world>:<seed>`), `data_files` (sha256 per candle file), the manifest path and sha256, `events_file`; `backtest.report_sha256` (this REPORT.md, the record being rewritten after the report so the hash matches); both walk-forward journals with their sha256, `min_train` / `min_test`, `train_avg_r` and `label_params` (the closed D1 schema: seed, n_boot, m = 4, alpha, max_dd_pct, train_dd_p95_pct, mtm_max_dd_pct), from which `adoption check` recomputes the label, n, avg R and dd_ok; `ledger_path` (the D3 holdout ledger, section 6); and `human_review.review_path` / `review_sha256` (the blank review pack; after filling in `reviewer_ok`, re-hash it with `python -m research.trendbot.adoption hash`). The check status below was computed on the records as written.
 
-| variant | walk-forward label (TRAIN + TEST) | TRAIN n | TRAIN avg R | TEST n | TEST avg R | dd_ok | provenance | config sha256 (first 16) | ML model sha256 (first 16) | `check --stage WALK_FORWARD` | `check --stage HUMAN_REVIEW` |
+| variant | walk-forward label (TRAIN + TEST) | TRAIN n (judged) | TRAIN avg R (judged) | TEST n | TEST avg R | dd_ok | provenance | config sha256 (first 16) | ML model sha256 (first 16) | `check --stage WALK_FORWARD` | `check --stage HUMAN_REVIEW` |
 |---|---|---:|---:|---:|---:|---|---|---|---|---|---|
-| `base` | NO-EDGE | 94 | -0.004 | 60 | -0.050 | yes | `synthetic:zero_edge:1` | `9be9d6da6ad86d85` | `none (no ML layer)` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
-| `rr2_vol2_rsi55-70` | TRAIN-ONLY | 75 | +0.048 | 49 | -0.020 | yes | `synthetic:zero_edge:1` | `e6bf999c94f1d730` | `none (no ML layer)` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
-| `base+ml` | UNTESTED | 9 | +0.333 | 6 | +0.500 | yes | `synthetic:zero_edge:1` | `9be9d6da6ad86d85` | `80c90c198bdf1de2` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
-| `base+guard` | NO-EDGE | 102 | -0.044 | 60 | -0.050 | yes | `synthetic:zero_edge:1` | `2c5274264328eeee` | `none (no ML layer)` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
+| `base` | NO-EDGE | 94 | -0.004 | 60 | -0.050 | yes | `synthetic:zero_edge:1` | `a6e40080a9bd0464` | `none (no ML layer)` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
+| `rr2_vol2_rsi55-70` | TRAIN-ONLY | 75 | +0.048 | 49 | -0.020 | yes | `synthetic:zero_edge:1` | `ee36bac25ed82018` | `none (no ML layer)` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
+| `base+ml` | UNTESTED | 0 | +0.000 | 6 | +0.500 | yes | `synthetic:zero_edge:1` | `a6e40080a9bd0464` | `80c90c198bdf1de2` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
+| `base+guard` | NO-EDGE | 102 | -0.044 | 60 | -0.050 | yes | `synthetic:zero_edge:1` | `a26d34e08fb602cc` | `none (no ML layer)` | PASS | BLOCKED by ADOPT_provenance, ADOPT_walk_forward |
 
 - `base`: record [adoption_base.json](adoption_base.json).
   - `--stage WALK_FORWARD`: PASS
@@ -295,7 +307,7 @@ Every record is bound to its evidence (CONTRACT.md v3 C3): `provenance`, `data_f
 - `base+ml`: record [adoption_base_plus_ml.json](adoption_base_plus_ml.json), [model_base_plus_ml.json](model_base_plus_ml.json).
   - `--stage WALK_FORWARD`: PASS
     Check: `python -m research.trendbot.adoption check --record research/results/synthetic_zero_edge_s1/adoption_base_plus_ml.json --stage WALK_FORWARD --model-fingerprint 80c90c198bdf1de2a14c0f73a2f55df74c1ecf18088fa0f3c80aefbc97c70fe5`
-  - `--stage HUMAN_REVIEW`: BLOCKED: [ADOPT_provenance] provenance is 'synthetic:zero_edge:1': a synthetic world only verifies the harness and is never evidence about real markets, so it may not go past WALK_FORWARD. [ADOPT_provenance] data_files is missing or empty, so the market data behind the backtest is not bound to this record by sha256. [ADOPT_walk_forward] walk_forward.label is 'UNTESTED' (too few trades, or a test expectancy not distinguishable from zero), and only ROBUST may proceed.
+  - `--stage HUMAN_REVIEW`: BLOCKED: [ADOPT_provenance] provenance is 'synthetic:zero_edge:1': a synthetic world only verifies the harness and is never evidence about real markets, so it may not go past WALK_FORWARD. [ADOPT_provenance] data_files is missing or empty, so the market data behind the backtest is not bound to this record by sha256. [ADOPT_walk_forward] walk_forward.label is 'UNTESTED' (too few trades, or a test expectancy not distinguishable from zero), and only ROBUST may proceed. [ADOPT_walk_forward] walk_forward.train_n must be a positive trade count (got 0). [ADOPT_walk_forward] walk_forward.label_params.train_dd_p95_pct must be a number >= 0 (percent), required from HUMAN_REVIEW on (got None) (CONTRACT v4 D1).
     Check: `python -m research.trendbot.adoption check --record research/results/synthetic_zero_edge_s1/adoption_base_plus_ml.json --stage HUMAN_REVIEW --model-fingerprint 80c90c198bdf1de2a14c0f73a2f55df74c1ecf18088fa0f3c80aefbc97c70fe5`
 - `base+guard`: record [adoption_base_plus_guard.json](adoption_base_plus_guard.json), [config_base_plus_guard.json](config_base_plus_guard.json).
   - `--stage WALK_FORWARD`: PASS
@@ -303,7 +315,7 @@ Every record is bound to its evidence (CONTRACT.md v3 C3): `provenance`, `data_f
   - `--stage HUMAN_REVIEW`: BLOCKED: [ADOPT_provenance] provenance is 'synthetic:zero_edge:1': a synthetic world only verifies the harness and is never evidence about real markets, so it may not go past WALK_FORWARD. [ADOPT_provenance] data_files is missing or empty, so the market data behind the backtest is not bound to this record by sha256. [ADOPT_walk_forward] walk_forward.label is 'NO-EDGE' (the train window showed no positive expectancy to validate), and only ROBUST may proceed. [ADOPT_walk_forward] walk_forward.test_avg_r must be a positive out-of-sample expectancy in R (got -0.05000000000000083).
     Check: `python -m research.trendbot.adoption check --record research/results/synthetic_zero_edge_s1/adoption_base_plus_guard.json --stage HUMAN_REVIEW --config research/results/synthetic_zero_edge_s1/config_base_plus_guard.json`
 
-The ML layer `base+ml` is adopted as a (config, model) pair: its record pins the config fingerprint AND the fitted model's fingerprint `80c90c198bdf1de2a14c0f73a2f55df74c1ecf18088fa0f3c80aefbc97c70fe5` (`MLFilter.fingerprint()`). The model itself is [model_base_plus_ml.json](model_base_plus_ml.json) (`MLFilter.to_json()`), which the live bot loads with `MLFilter.from_json(text, expected_fingerprint=<the record's model_fingerprint>)`: loading raises if the file does not hash to that fingerprint. **Refitting the model (new TRAIN data, a later split, a different l2) changes the fingerprint, so a refitted model is a NEW candidate and restarts the adoption path at BACKTEST.** `adoption check` blocks (`ADOPT_fingerprint`) a model whose fingerprint differs from the recorded one, and any `+ml` record without one.
+The ML layer `base+ml` is adopted as a (config, model) pair: its record pins the config fingerprint AND the fitted model's fingerprint `80c90c198bdf1de2a14c0f73a2f55df74c1ecf18088fa0f3c80aefbc97c70fe5` (`MLFilter.fingerprint()`). The model itself is [model_base_plus_ml.json](model_base_plus_ml.json) (`MLFilter.to_json()`), which the live bot loads with `MLFilter.from_json(text, expected_fingerprint=<the record's model_fingerprint>)`: loading raises if the file does not hash to that fingerprint. **Refitting the model (new TRAIN data, a later split, a different l2) changes the fingerprint, so a refitted model is a NEW candidate and restarts the adoption path at BACKTEST.** `adoption check` blocks (`ADOPT_fingerprint`) a model whose fingerprint differs from the recorded one, and any `+ml` record without one. Its record's TRAIN journal is the D8 out-of-sample gate window.
 
 A `config_<variant>.json` file (the `StrategyConfig` overrides versus the defaults, e.g. costs, discovery parameters or `expectancy_guard`) is written whenever the tested config is not the default one; the check needs it as `--config`. The regime-OFF variant is test-only and can never be adopted.
 

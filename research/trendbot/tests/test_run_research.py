@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from research.trendbot import journal_rules
+from research.trendbot import journal_rules, report_calibration, report_evidence, report_tables
 from research.trendbot import report as rp
 from research.trendbot import run_research as rr
 from research.trendbot.adoption import (
@@ -31,7 +31,9 @@ from research.trendbot.adoption import main as adoption_main
 from research.trendbot.backtester import enumerate_candidates
 from research.trendbot.config import PairRisk, StrategyConfig
 from research.trendbot.data import save_candles_csv
+from research.trendbot.fetch_data import manifest_entry, write_manifest
 from research.trendbot.journal import iso_to_ms, ms_to_iso, read_journal
+from research.trendbot.ledger import read_ledger, series_sha256
 from research.trendbot.ml_filter import MLFilter
 from research.trendbot.models import EXIT_SL, EXIT_TP, HOUR_MS, Trade
 from research.trendbot.synthetic import make_world
@@ -172,14 +174,18 @@ def test_every_result_reports_both_drawdowns_and_the_rule(null_run, null_researc
     base = _body(text, 3)
     assert "max drawdown % realised (closed trades)" in base
     assert "max drawdown % mark-to-market (4H closes)" in base
-    rule = "dd_ok = TEST mark-to-market max drawdown <= min(20%, 95th percentile"
+    rule = "dd_ok = TEST mark-to-market max drawdown <= min(15%, 95th percentile"
     assert rule in base and rule in _body(text, 4) and _body(text, 5).count(rule) == 2
+    # D7: the cap and its rationale are stated in the report's DD rule text
+    assert rp.DD_RULE in _body(text, 2) and "(2/3)^15 = 0.23%" in rp.DD_RULE
+    assert "15 consecutive full-size losses" in base and "(2/3)^15 = 0.23%" in base
     r = null_research.base
     assert f"mark-to-market max drawdown {r.test_mtm_dd_pct:.2f}%" in base
     assert f"realised closed-trade {r.test_summary.max_dd_pct:.2f}%" in base
-    assert f"the limit {r.dd_limit_pct:.2f}%" in base
+    assert f"the limit {r.dd_limit_pct:.2f}%" in base and r.dd_limit_pct <= 15.0
     assert f"TRAIN max drawdown: realised {r.train_summary.max_dd_pct:.2f}%" in base
     assert "TEST max DD % realised / MTM" in _body(text, 4)
+    assert "20%" not in base
 
 
 def test_provenance_prints_default_costs(null_run) -> None:
@@ -194,7 +200,7 @@ def test_provenance_prints_default_costs(null_run) -> None:
     assert re.search(r"fees alone cost \d\.\d\dR per trade", prov)
     assert "WARNING" not in prov
     table = _tables(prov)[0]
-    assert "TRAIN candles (before the split)" in table[0] and len(table) == 2 + 3
+    assert "TRAIN candles (closed by the split)" in table[0] and len(table) == 2 + 3
     for row in table[2:]:
         total, n_train, n_test = (int(c) for c in row.split("|")[2:5])
         assert n_train + n_test == total and n_train > 2 * n_test
@@ -244,7 +250,10 @@ def test_layer_counts_are_recomputed_from_the_written_journals(null_run, null_re
         layer_r = null_research.ml if variant == rr.ML_VARIANT else null_research.guard
         for window, suffix in (("TRAIN", "train"), ("TEST", "test")):
             base_keys = trade_keys(read_journal(out / "journals" / f"base_{suffix}.csv"))
-            lay_keys = trade_keys(read_journal(out / "journals" / f"{safe}_{suffix}.csv"))
+            # C1 compares full-TRAIN journals: the ML layer's is its in-sample context journal
+            ml_train = variant == rr.ML_VARIANT and window == "TRAIN"
+            name = f"{safe}_train_insample.csv" if ml_train else f"{safe}_{suffix}.csv"
+            lay_keys = trade_keys(read_journal(out / "journals" / name))
             cells = rows[(variant, window)]
             bt = layer_r.train if window == "TRAIN" else layer_r.test
             rule = "L_ml_filter" if variant == rr.ML_VARIANT else "L_expectancy_guard"
@@ -257,9 +266,12 @@ def test_layer_counts_are_recomputed_from_the_written_journals(null_run, null_re
     assert int(ml_train[2]) > 0  # the fitted filter did veto rule-passing signals
 
 
-def test_invariants_clean_and_journal_audit_present(null_run) -> None:
+def test_invariants_clean_and_journal_audit_present(null_run, null_research) -> None:
     _out, _code, text = null_run
-    assert "Result: CLEAN. 0 violations in 32 backtests." in _body(text, 8)
+    gate = null_research.ml.gate
+    n = 32 + (1 if gate is not None and gate.ran else 0)  # 16 variants x 2 (+ the D8 gate)
+    assert rp.n_backtests(null_research) == n
+    assert f"Result: CLEAN. 0 violations in {n} backtests." in _body(text, 8)
     audit = _body(text, 9)
     assert "journal_rules.audit" in audit and "baseline `base`" in audit
     assert "expectancy guard `base+guard`" in audit
@@ -319,10 +331,12 @@ def test_journal_audits_count_exits_from_the_candle_close() -> None:
     end = split + 60 * tf
     last_exit = end - tf  # exit filled somewhere inside the last candle
     test_trades = [_sl(1, last_exit - 8 * tf), _sl(2, last_exit - 4 * tf), _sl(3, last_exit)]
+    train = SimpleNamespace(trades=[], final_equity=10_000.0)
     fake = SimpleNamespace(
         cfg=cfg,
         split_ts=split,
-        train=SimpleNamespace(trades=[], final_equity=10_000.0),
+        train=train,
+        label_train=train,
         test=SimpleNamespace(trades=test_trades, final_equity=9_993.1),
     )
     (w1, at1, _eq1, train_acts), (w2, at2, eq2, test_acts) = rp.journal_audits(fake, end)  # type: ignore[arg-type]
@@ -357,6 +371,7 @@ def test_results_stay_lean_journals_only_for_the_candidates(null_run) -> None:
     selected = _selected(text)
     safe = [*CANDIDATE_SAFE, selected]
     expected = {f"{v}_{w}.csv" for v in safe for w in ("train", "test")}
+    expected.add("base_plus_ml_train_insample.csv")  # D8: the in-sample context journal
     assert {p.name for p in (out / "journals").iterdir()} == expected
     assert sorted(p.name for p in out.glob("review_*")) == sorted(
         [
@@ -389,13 +404,16 @@ def test_adoption_records_are_bound_to_their_evidence(null_run, null_research) -
             assert getattr(wf, f"{window}_journal_sha256") == sha256_file(jpath)
         assert (wf.min_train, wf.min_test) == (30, 30)
         assert wf.label_params == r.label_params()
+        # TRAIN = the judged window (the D8 out-of-sample gate for base+ml)
+        judged = r.label_train_summary
         assert (wf.label, wf.dd_ok, wf.train_n, wf.test_n) == (
             r.label,
             r.dd_ok,
-            r.train_summary.n,
+            judged.n,
             r.test_summary.n,
         )
-        assert (wf.train_avg_r, wf.test_avg_r) == (r.train_summary.avg_r, r.test_summary.avg_r)
+        assert (wf.train_avg_r, wf.test_avg_r) == (judged.avg_r, r.test_summary.avg_r)
+        assert len(read_journal(out / wf.train_journal_path)) == judged.n
         hr = rec.human_review
         assert hr.review_sha256 == sha256_file(out / hr.review_path)
         assert hr.review_path.endswith("trades_review.csv")
@@ -618,20 +636,30 @@ def test_data_dir_without_events_flags_r5_and_costs_reach_every_trade(
     assert rec.config_fingerprint == config_fingerprint(cfg)
     assert rec.config_fingerprint != config_fingerprint(StrategyConfig())
     assert "--config" in _body(text, 11)
-    # real provenance: every candle file is hash-bound, relative to the record's directory
-    assert rec.provenance == "real" and rec.events_file is None
+    # D2: no manifest.json next to the files, so the provenance is "unverified-csv" and the
+    # records are blocked past WALK_FORWARD; every candle file is still hash-bound
+    assert rec.provenance == "unverified-csv" and rec.events_file is None
+    assert "**`unverified-csv`**" in prov and "no manifest.json" in prov
+    assert "cannot authenticate an exchange download" in prov
     assert rec.data_files is not None and len(rec.data_files) == 3
     for path, sha in rec.data_files.items():
         assert not Path(path).is_absolute() and sha256_file(out / path) == sha
     blocked = check_promotion(rec, HUMAN_REVIEW, cfg, iso_to_ms(NOW), out)
-    assert "ADOPT_provenance" not in {d.rule for d in blocked}
+    assert "ADOPT_provenance" in {d.rule for d in blocked}
     assert check_promotion(rec, WALK_FORWARD, cfg, iso_to_ms(NOW), out) == []
+    # D3: the real-data ledger defaults to <data-dir>/.test_looks.jsonl
+    looks = read_ledger(d / ".test_looks.jsonl")
+    records = sorted(out.glob("adoption_*.json"))
+    assert len(looks) == len(records) >= 3  # one line per adoptable candidate with a TEST look
+    shas = {sha256_file(d / f"{p.replace('/', '_')}-4h.csv") for p in rr.PAIRS}
+    assert all({w.file_sha256 for w in look.pairs} == shas for look in looks)
+    assert not (out / "test_looks.jsonl").exists()
 
 
 def test_data_dir_with_events_binds_the_calendar(tmp_path: Path) -> None:
     d = _write_files(tmp_path)
     ds = rr.load_files(d, events_path=EVENTS_EXAMPLE)
-    assert ds.kind == "files" and ds.events and ds.provenance_id == "real"
+    assert ds.kind == "files" and ds.events and ds.provenance_id == "unverified-csv"
     assert any("News calendar loaded: yes" in line for line in ds.provenance)
     files, events = rr._data_evidence(ds, tmp_path / "out")
     assert files is not None and len(files) == 3
@@ -760,13 +788,15 @@ def test_calibration_row_describes_every_candidate(null_run, null_research) -> N
     coefs = dict(ml.explain())
     assert row["ml_hour_sin"] == round(coefs["hour_sin"], 4)
     assert row["ml_top_feature"] == max(coefs, key=lambda k: abs(coefs[k]))
-    assert row["ml_train_avg_r"] == round(research.ml.train_summary.avg_r, 4)
+    assert row["ml_train_avg_r"] == round(research.ml.label_train_summary.avg_r, 4)  # D8 gate
+    assert row["ml_train_insample_avg_r"] == round(research.ml.train_summary.avg_r, 4)
+    assert row["ml_train_insample_n"] == research.ml.train_summary.n
     assert row["guard_test_n"] == research.guard.test_summary.n
     assert row["base_reached_gate"] == research.base.reached_test_gate
     diffs = {d.window: d for d in research.layer_diffs()[rr.ML_VARIANT]}
     assert row["ml_train_vetoed"] == diffs["TRAIN"].vetoed
     assert row["ml_test_layer_only"] == diffs["TEST"].layer_only
-    line = rp._ml_hour_line([row])
+    line = rp.ml_hour_line([row])
     assert line is not None and "1 fitted seeds" in line
     assert math.isfinite(float(line.split("= ")[-1].split()[0]))
 
@@ -801,6 +831,9 @@ def test_power_curve_cli_writes_power_md(tmp_path: Path) -> None:
     assert "## Minimum detectable effect" in text and "50% power:" in text
     assert "80% power:" in text and "labelled UNTESTED on real data however real it is" in text
     assert rp.DD_RULE in text and "realised / MTM / limit, base" in text
+    # wording: an average of observed estimates, never "the true" expectancy
+    assert "mean observed TEST avg R over seeds" in text and "true mean" not in text.lower()
+    assert "every strength ran seed 1" in text
     table = next(t for t in _tables(text) if "effect strength" in t[0])
     assert "TRAIN" in table[0] and "TEST" in table[0] and len(table) == 2 + 2
     assert _sections(text)[-2:] == ["Adoption path", "Risk disclaimer"]
@@ -842,6 +875,12 @@ def test_help_prints_and_exits_zero(flag: str, capsys) -> None:
         ["--synthetic", "null", "--calibrate-seeds", "2", "--fee-rate", "0", "--out-dir", "o"],
         ["--synthetic", "planted", "--power-strengths", "0.3", "0.6", "--out-dir", "o"],
         ["--synthetic", "planted", "--effect-strength", "0.3", "--out-dir", "o"],
+        ["--synthetic", "null", "--seed-offset", "5", "--out-dir", "o"],  # single run
+        ["--synthetic", "null", "--calibrate-seeds", "2", "--seed-offset", "-1", "--out-dir", "o"],
+        ["--synthetic", "null", "--stop-fill-wick-k", "0", "--out-dir", "o"],  # 0 = no stress
+        ["--synthetic", "null", "--stop-fill-wick-k", "1.5", "--out-dir", "o"],
+        ["--synthetic", "null", "--stop-fill-wick-k", "nan", "--out-dir", "o"],
+        ["--synthetic", "null", "--calibrate-seeds", "2", "--ledger", "x", "--out-dir", "o"],
         [
             "--synthetic",
             "planted",
@@ -877,3 +916,239 @@ def test_missing_data_dir_is_a_clean_error(tmp_path: Path, capsys) -> None:
     code = rr.main(["--data-dir", str(tmp_path / "none"), "--out-dir", str(tmp_path / "o")])
     assert code == 2
     assert "fetch_data" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------- D3 holdout ledger
+def test_synthetic_run_appends_one_ledger_line_per_adoptable_look(null_run, null_research) -> None:
+    out, _code, text = null_run
+    looks = read_ledger(out / "test_looks.jsonl")  # D3 default for synthetic data
+    targets = rr.adoption_targets(null_research)
+    assert [look.variant for look in looks] == [r.variant for r in targets]
+    assert len(looks) == len(list(out.glob("adoption_*.json"))) == 4
+    ds = rr.load_synthetic("null", 1, 3.0)
+    tf = StrategyConfig().timeframe_ms
+    for look, r in zip(looks, targets, strict=True):
+        ml = rp.fitted_model(r)
+        assert look.config_fingerprint == config_fingerprint(r.cfg)
+        assert look.model_fingerprint == (ml.fingerprint() if ml is not None else None)
+        assert look.split_utc == ms_to_iso(null_research.split) and look.run_utc == NOW
+        assert list(look.argv) == [*NULL_ARGV, "--out-dir", str(out)]
+        assert [w.pair for w in look.pairs] == sorted(rr.PAIRS)
+        for w in look.pairs:
+            assert w.file_sha256 == series_sha256(ds.data[w.pair])
+            assert (w.test_start_ts, w.test_end_ts) == (
+                null_research.split,
+                ds.data[w.pair][-1].ts + tf,
+            )
+    # context discovery variants never get a line
+    context = {r.variant for r in null_research.discovery.results} - {r.variant for r in targets}
+    assert context and not context & {look.variant for look in looks}
+    verdict = _body(text, 6)
+    assert "Holdout ledger (CONTRACT v4 D3): `test_looks.jsonl`" in verdict
+    table = next(t for t in _tables(verdict) if "distinct TEST looks" in t[0])
+    assert len(table) == 2 + 3
+    for row in table[2:]:
+        cells = _cells(row)
+        assert (cells[3], cells[4], cells[5]) == ("4", "4", "within the limit")
+    log = (out / rr.RUN_LOG).read_text(encoding="utf-8")
+    assert "holdout ledger " in log and "BTC/USDT 4, ETH/USDT 4" in log
+
+
+def test_records_carry_the_ledger_path(null_run) -> None:
+    out, _code, _text = null_run
+    for path in out.glob("adoption_*.json"):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["ledger_path"] == "test_looks.jsonl", path  # relative to the record
+        assert raw["manifest"] is None  # synthetic data has no manifest
+        assert load_record(path).ledger_path == "test_looks.jsonl"
+    ds = rr.load_synthetic("null", 1, 1.0)
+    assert rr.evidence_fields(ds, out, out / "test_looks.jsonl") == {
+        "ledger_path": "test_looks.jsonl",
+        "manifest": None,
+    }
+
+
+def test_rerun_is_not_a_new_look_but_a_revision_is(tmp_path: Path, capsys) -> None:
+    ledger = tmp_path / "shared.jsonl"
+    argv = ["--synthetic", "null", "--seed", "2", "--years", "1.5", "--now", NOW]
+    argv += ["--ledger", str(ledger)]
+
+    def run(name: str, *extra: str) -> tuple[str, str]:
+        assert rr.main([*argv, *extra, "--out-dir", str(tmp_path / name)]) == 0
+        text = (tmp_path / name / rr.REPORT_NAME).read_text(encoding="utf-8")
+        return _body(text, 6), capsys.readouterr().out
+
+    verdict, _ = run("a")
+    first = len(read_ledger(ledger))
+    assert first >= 2 and not (tmp_path / "a" / "test_looks.jsonl").exists()
+    assert f"| {first} | 4 | within the limit |" in verdict
+    verdict, _ = run("b")  # identical candidates: lines appended, not a new look
+    assert len(read_ledger(ledger)) == 2 * first
+    assert f"| {first} | 4 | within the limit |" in verdict
+    # new costs = new config fingerprints = new candidates on the SAME TEST window
+    run("c", "--fee-rate", "0.002")
+    verdict, printed = run("d", "--fee-rate", "0.003")
+    n = 3 * first
+    assert (
+        len({(look.config_fingerprint, look.model_fingerprint) for look in read_ledger(ledger)})
+        == n
+    )
+    assert n > 4 and f"| {n} | 4 | **OVER the limit (blocked)** |" in verdict
+    assert "OVER the limit" in printed
+
+
+# ---------------------------------------------------------------------------- D2 provenance
+def test_manifest_verified_data_dir_is_real(tmp_path: Path) -> None:
+    data, _events = make_world("planted", 4, years=1.5)
+    d = tmp_path / "data"
+    entries = []
+    run = {
+        "exchange_id": "binance",
+        "ccxt_version": "4.3.0",
+        "timeframe": "4h",
+        "since_ms": 0,
+        "until_ms": None,
+        "fetched_at_utc": "2026-01-01T00:00:00Z",
+    }
+    for pair, candles in data.items():
+        path = d / f"{pair.replace('/', '_')}-4h.csv"
+        save_candles_csv(candles, path)
+        entries.append(manifest_entry(path, pair, candles, "4h", run))
+    manifest = write_manifest(d, run, list(data), entries)
+    ds = rr.load_files(d)
+    assert ds.provenance_id == "real"
+    assert ds.manifest_path == manifest and ds.manifest_sha256 == sha256_file(manifest)
+    assert any("**`real`**" in line and "matching sha256" in line for line in ds.provenance)
+    out = tmp_path / "out"
+    assert rr.main(["--data-dir", str(d), "--out-dir", str(out), "--now", NOW]) == 0
+    for path in out.glob("adoption_*.json"):
+        rec = load_record(path)
+        assert rec.provenance == "real"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        ref = raw["manifest"]  # D2: the manifest path and sha256 are bound into every record
+        assert sha256_file(out / ref["path"]) == ref["sha256"] == ds.manifest_sha256
+        assert (out / raw["ledger_path"]).resolve() == (d / ".test_looks.jsonl").resolve()
+    # tampering with one file after download makes the directory unverified
+    btc = d / "BTC_USDT-4h.csv"
+    btc.write_text(btc.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert rr.load_files(d).provenance_id == "unverified-csv"
+
+
+# ---------------------------------------------------------------------------- D4 stress
+def test_stop_fill_stress_run_is_test_only_with_the_k0_reference(tmp_path: Path, capsys) -> None:
+    out = tmp_path / "stress"
+    argv = ["--synthetic", "planted", "--seed", "3", "--years", "2", "--now", NOW]
+    assert rr.main([*argv, "--stop-fill-wick-k", "0.5", "--out-dir", str(out)]) == 0
+    capsys.readouterr()
+    text = (out / rr.REPORT_NAME).read_text(encoding="utf-8")
+    assert text.startswith("# Walk-forward research report: synthetic world `planted` seed 3, ")
+    assert "STOP-FILL STRESS k = 0.5 (test-only)" in text.splitlines()[0]
+    assert _sections(text) == list(rp.SECTION_TITLES)
+    assert "Stop-fill STRESS model (CONTRACT v4 D4), k = 0.5" in _body(text, 2)
+    assert list(out.glob("adoption_*.json")) == []  # test-only: no promotable record
+    assert "No adoption record was written" in _body(text, 11)
+    # ... and no human review pack (HUMAN_REVIEW is unreachable), but every journal is kept
+    assert list(out.glob("review_*")) == []
+    assert list((out / "journals").glob("base_*.csv"))
+    assert "no pack for `base`" in _body(text, 10) and "ADOPT_test_only" in _body(text, 10)
+    verdict = _body(text, 6)
+    table = next(t for t in _tables(verdict) if "label changed" in t[0])
+    assert "TRAIN" in table[0] and "TEST" in table[0] and len(table) == 2 + 4
+    for row in table[2:]:
+        cells = _cells(row)
+        changed = "yes" if cells[9] != cells[10] else "no"
+        assert cells[-1] in ("yes", "no") and cells[-1] == changed
+        assert cells[2] in ("yes", "no", "-")
+    # the k = 0 reference is a real TEST look of the adoptable candidates, so it is ledgered;
+    # the stressed configs never are
+    looks = read_ledger(out / "test_looks.jsonl")
+    assert looks and all("wick" not in look.variant for look in looks)
+    stressed = config_fingerprint(StrategyConfig(stop_fill_wick_k=0.5))
+    assert stressed not in {look.config_fingerprint for look in looks}
+    assert config_fingerprint(StrategyConfig()) in {look.config_fingerprint for look in looks}
+    base_row = _cells(table[2])
+    assert base_row[2] == "yes"  # the baseline is one config under two fill models
+    for shift_col in (5, 8):  # judged TRAIN and TEST R shift = stressed - touch fill
+        assert math.isclose(
+            float(base_row[shift_col]),
+            float(base_row[shift_col - 1].split()[0]) - float(base_row[shift_col - 2].split()[0]),
+            abs_tol=2e-3,
+        )
+
+
+def test_stress_flag_reaches_the_config() -> None:
+    args = rr._parser().parse_args(["--synthetic", "null", "--out-dir", "o"])
+    assert rr.config_from_args(args).stop_fill_wick_k == 0.0
+    args = rr._parser().parse_args(
+        ["--synthetic", "null", "--out-dir", "o", "--stop-fill-wick-k", "1"]
+    )
+    cfg = rr.config_from_args(args)
+    assert cfg.stop_fill_wick_k == 1.0 and cfg.is_test_only
+    assert rr.cost_overrides(cfg) == (("stop_fill_wick_k", 1.0),)  # calibrations carry it
+
+
+# ---------------------------------------------------------------------------- seeds
+def test_seed_offset_runs_a_disjoint_seed_range(tmp_path: Path) -> None:
+    assert list(rr.calibration_seeds(3, 10)) == [11, 12, 13]
+    assert list(rr.calibration_seeds(2)) == [1, 2]
+    with pytest.raises(ValueError):
+        rr.calibration_seeds(0)
+    out = tmp_path / "cal"
+    argv = ["--synthetic", "decay", "--calibrate-seeds", "1", "--years", "1.0"]
+    argv += ["--seed-offset", "100", "--workers", "1", "--out-dir", str(out)]
+    assert rr.main(argv) == 0
+    with (out / rr.CALIBRATION_CSV).open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["seed"] for r in rows] == ["101"]
+    text = (out / rr.CALIBRATION_NAME).read_text(encoding="utf-8")
+    assert text.startswith("# Calibration: synthetic world `decay`, seed 101")
+    assert rp.SEED_NOTE in text
+    assert rp.seed_range([{"seed": 3}, {"seed": 1}, {"seed": 2}]) == "seeds 1-3"
+    assert rp.seed_range([{"seed": 1}, {"seed": 5}]) == "seeds 1, 5"
+
+
+# ---------------------------------------------------------------------------- D8 in the report
+def test_ml_layer_is_reported_and_recorded_on_its_out_of_sample_gate(
+    null_run, null_research
+) -> None:
+    out, _code, text = null_run
+    ml = null_research.ml
+    gate = ml.gate
+    assert gate is not None
+    layers = _body(text, 5)
+    assert rp.GATE_WORDING in layers
+    table = next(t for t in _tables(layers) if t[0].startswith("| metric |"))
+    assert "base+ml TRAIN (in-sample)" in table[0]
+    assert "base+ml TRAIN (out-of-sample inner split)" in table[0]
+    if gate.ran:
+        assert "**Out-of-sample TRAIN gate (CONTRACT v4 D8):** the" in layers
+    else:
+        assert "Out-of-sample TRAIN gate (CONTRACT v4 D8): not evaluable" in layers
+    # the record's TRAIN journal and review pack hold the gate trades, TEST offset past them
+    train = read_journal(out / "journals" / "base_plus_ml_train.csv")
+    insample = read_journal(out / "journals" / "base_plus_ml_train_insample.csv")
+    assert [t.signal_ts for t in train] == [t.signal_ts for t in ml.label_train.trades]
+    assert [t.signal_ts for t in insample] == [t.signal_ts for t in ml.train.trades]
+    with (out / "review_base_plus_ml" / "trades_review.csv").open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == ml.label_train_summary.n + ml.test_summary.n
+    assert "in-sample full-TRAIN journal (context)" in _body(text, 10)
+    assert "_train_insample.csv" in _body(text, 10)
+    # section 6 judges the gate
+    cand = next(t for t in _tables(_body(text, 6)) if "TRAIN n (judged)" in t[0])
+    ml_row = next(_cells(r) for r in cand[2:] if "base+ml" in r)
+    assert int(ml_row[1]) == ml.label_train_summary.n
+
+
+# ---------------------------------------------------------------------------- report split
+def test_report_is_split_with_re_exports() -> None:
+    for name in rp.__all__:
+        assert hasattr(rp, name), name
+    assert rp.render_calibration is report_calibration.render_calibration
+    assert rp.render_power is report_calibration.render_power
+    assert rp.metric_table is report_tables.metric_table and rp.DD_RULE is report_tables.DD_RULE
+    assert rr.verdict_line is rp.verdict_line
+    assert rp.section_adoption is report_evidence.section_adoption
+    for module in (rp, report_calibration, report_evidence, report_tables):
+        lines = Path(module.__file__).read_text(encoding="utf-8").count("\n")
+        assert lines < 1000, (module.__name__, lines)

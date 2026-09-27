@@ -1,14 +1,16 @@
 {
   "variant": "base",
-  "config_fingerprint": "9be9d6da6ad86d8579570ae32c09984ac335bda8ac8a52bbb11751042e1e03b9",
+  "config_fingerprint": "a6e40080a9bd046422119e3402bd64631f269192e04a581cfa2ce35b2eeaeff7",
   "model_fingerprint": null,
   "provenance": "synthetic:null:1",
   "data_files": null,
   "events_file": null,
+  "manifest": null,
+  "ledger_path": "test_looks.jsonl",
   "backtest": {
     "report_path": "REPORT.md",
     "completed_utc": "2026-09-27T12:00:00Z",
-    "report_sha256": "a99b5bba981eecea6bb04bfe90b10af60b66686f86f21e6b4532569ea2b342c4"
+    "report_sha256": "113bc5c26e7fc303af065695c0cc3d0b19c9ebf044100d59ad20c9c4ffd54c4d"
   },
   "walk_forward": {
     "label": "NO-EDGE",
@@ -30,7 +32,7 @@
       "n_boot": 4000,
       "m": 4,
       "alpha": 0.05,
-      "max_dd_pct": 20.0,
+      "max_dd_pct": 15.0,
       "train_dd_p95_pct": 21.528043470537312,
       "mtm_max_dd_pct": 13.759902797513984
     }
@@ -43,7 +45,7 @@
     "approved": null,
     "notes": null,
     "review_path": "review_base/trades_review.csv",
-    "review_sha256": "26d689565259373ff4bd4d46b531056453f0f3c80b4146d1e5730053b41b5005"
+    "review_sha256": "516f193216ea17fcb45b09565cd09b5a3a0e38970857ad6f0ac777cf14c0c0b8"
   },
   "testnet": {
     "exchange": null,
@@ -54,7 +56,12 @@
     "journal_path": null,
     "notes": null,
     "events_path": null,
-    "events_sha256": null
+    "events_sha256": null,
+    "journal_sha256": null,
+    "decisions_path": null,
+    "decisions_sha256": null,
+    "candles": null,
+    "starting_equity": null
   },
   "live": {
     "enabled_utc": null

@@ -1,0 +1,69 @@
+{
+  "variant": "rr2_vol2_rsi55-70",
+  "config_fingerprint": "14fa19115cdaa91bd2c3854715532ee23817c69d7456672eb7388a6af735335b",
+  "model_fingerprint": null,
+  "provenance": "synthetic:planted:1",
+  "data_files": null,
+  "events_file": null,
+  "manifest": null,
+  "ledger_path": "test_looks.jsonl",
+  "backtest": {
+    "report_path": "REPORT.md",
+    "completed_utc": "2026-09-27T12:00:00Z",
+    "report_sha256": "0ae0846ae817033924edb6abae40143ba6dfd2e78d777fb0276979cae9c68f0b"
+  },
+  "walk_forward": {
+    "label": "UNTESTED",
+    "dd_ok": true,
+    "split_utc": "2023-03-14T00:00:00Z",
+    "train_n": 75,
+    "test_n": 33,
+    "test_avg_r": 0.3636363636363642,
+    "report_path": "REPORT.md",
+    "train_journal_path": "journals/rr2_vol2_rsi55-70_train.csv",
+    "train_journal_sha256": "96c913cdefd157c5a89296eabd46826daaff10b30b047ea828b85709c467e946",
+    "test_journal_path": "journals/rr2_vol2_rsi55-70_test.csv",
+    "test_journal_sha256": "d2cffcd12f99c140708d05633a4413b70eb9fc72b5650549b046265d344c1a01",
+    "min_train": 30,
+    "min_test": 30,
+    "train_avg_r": 0.4231063115623026,
+    "label_params": {
+      "seed": 7,
+      "n_boot": 4000,
+      "m": 4,
+      "alpha": 0.05,
+      "max_dd_pct": 15.0,
+      "train_dd_p95_pct": 7.755265161705727,
+      "mtm_max_dd_pct": 5.111798724054879
+    }
+  },
+  "human_review": {
+    "reviewer": null,
+    "date_utc": null,
+    "trades_reviewed": null,
+    "trades_total": null,
+    "approved": null,
+    "notes": null,
+    "review_path": "review_selected_rr2_vol2_rsi55-70/trades_review.csv",
+    "review_sha256": "444a2d0d7c907b873405b0de366b4dbd59536922ae417183cb908bd9e9b9504d"
+  },
+  "testnet": {
+    "exchange": null,
+    "start_utc": null,
+    "end_utc": null,
+    "trades": null,
+    "rule_violations": null,
+    "journal_path": null,
+    "notes": null,
+    "events_path": null,
+    "events_sha256": null,
+    "journal_sha256": null,
+    "decisions_path": null,
+    "decisions_sha256": null,
+    "candles": null,
+    "starting_equity": null
+  },
+  "live": {
+    "enabled_utc": null
+  }
+}

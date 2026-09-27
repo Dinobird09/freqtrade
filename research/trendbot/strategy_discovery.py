@@ -9,14 +9,20 @@ loosening), plus exactly ONE explicit test-only variant with the R4 regime filte
 regime-OFF variant is backtested and reported side by side, but it is NEVER eligible for
 selection or adoption (``StrategyConfig.is_test_only``).
 
+Stop-fill stress runs (CONTRACT v4 D4, ``cfg.stop_fill_wick_k > 0``): the stress is an
+execution assumption applied to EVERY variant of the grid, not a variant, so selection runs
+among the stressed grid exactly as it does unstressed (only the regime-OFF variant is never
+selectable). Every config of a stress run is ``is_test_only``, so nothing it selects can be
+adopted; the run exists to measure how the labels move under a harsher fill model.
+
 Order of operations in :func:`discover` (the order is the whole point):
 
-1. TRAIN phase for every variant (``walkforward.run_train``): no candle at or after the
-   split is read.
+1. TRAIN phase for every variant (``walkforward.run_train``): no candle that closes after
+   the split is read.
 2. SELECTION (:func:`select_on_train`), from TRAIN summaries only: the eligible variant
-   (not test-only, at least ``min_train`` TRAIN trades) with the highest TRAIN t-stat of
-   its R-multiples; ties go to the earlier grid entry. The :class:`Selection` is frozen and
-   recorded here, BEFORE any TEST backtest has been run.
+   (not the regime-OFF test variant, at least ``min_train`` TRAIN trades) with the highest
+   TRAIN t-stat of its R-multiples; ties go to the earlier grid entry. The
+   :class:`Selection` is frozen and recorded here, BEFORE any TEST backtest has been run.
 3. TEST phase for every variant (``walkforward.run_test``), for side-by-side reporting only.
    Nothing computed in this phase can reach the selection. Re-selecting on these TEST
    numbers would turn TEST into TRAIN, so the report must not (and does not) do that.
@@ -84,7 +90,7 @@ class Selection:
     eligible: tuple[str, ...]  # variants that could be selected (grid order)
     ineligible: tuple[tuple[str, str], ...]  # (variant, why not)
     k_tried: int  # every variant backtested, including the test-only one
-    k_eligible_by_design: int  # variants allowed to compete (not test-only)
+    k_eligible_by_design: int  # variants allowed to compete (all but regime OFF)
     min_train: int
 
 
@@ -93,7 +99,7 @@ class DiscoveryResult:
     split_ts: int
     selection: Selection
     results: list[WalkForwardResult]  # grid order, the test-only variant last
-    test_only: tuple[str, ...]  # variant ids that are test-only (never selectable)
+    test_only: tuple[str, ...]  # the explicit test variant ids (regime OFF, never selectable)
     stage_log: list[str] = field(default_factory=list)  # phases in the order they ran
     note: str = TEST_BECOMES_TRAIN
 
@@ -122,8 +128,13 @@ class DiscoveryResult:
         return self.result(self.selection.variant)
 
 
+def never_selectable(cfg: StrategyConfig) -> bool:
+    """The explicit test variant: the R4 regime filter switched OFF (never selectable)."""
+    return not cfg.regime_filter
+
+
 def _ineligibility(phase: TrainPhase, min_train: int) -> str | None:
-    if phase.cfg.is_test_only:
+    if never_selectable(phase.cfg):
         return "explicit test-only variant (R4 regime filter OFF): never selectable"
     if phase.train_summary.n < min_train:
         return f"only {phase.train_summary.n} TRAIN trades (need {min_train})"
@@ -133,7 +144,7 @@ def _ineligibility(phase: TrainPhase, min_train: int) -> str | None:
 def select_on_train(phases: Sequence[TrainPhase], min_train: int = MIN_TRAIN) -> Selection:
     """Pick the eligible variant with the highest TRAIN t-stat (ties: earliest in order).
 
-    Uses ONLY ``phase.train_summary`` and ``phase.cfg.is_test_only``: there is no TEST
+    Uses ONLY ``phase.train_summary`` and ``phase.cfg.regime_filter``: there is no TEST
     information in a :class:`TrainPhase`.
     """
     eligible: list[TrainPhase] = []
@@ -144,7 +155,7 @@ def select_on_train(phases: Sequence[TrainPhase], min_train: int = MIN_TRAIN) ->
             eligible.append(phase)
         else:
             ineligible.append((phase.variant, why))
-    k_design = sum(1 for p in phases if not p.cfg.is_test_only)
+    k_design = sum(1 for p in phases if not never_selectable(p.cfg))
     common = {
         "eligible": tuple(p.variant for p in eligible),
         "ineligible": tuple(ineligible),
@@ -186,13 +197,15 @@ def discover(
 ) -> DiscoveryResult:
     """Run the grid (+ the regime-OFF test variant) through TRAIN, select, then TEST.
 
-    ``grid`` defaults to :func:`default_grid`; test-only configs in a custom grid are
-    reported but never selectable. See the module docstring for the order of operations.
-    Only the SELECTED variant is a pre-registered candidate (one of the ``stats.m`` TEST
-    looks of the multiplicity rule); every other variant's label is context, not judged.
+    ``grid`` defaults to :func:`default_grid`; regime-OFF configs in a custom grid are
+    reported but never selectable. A stop-fill stress base (``stop_fill_wick_k > 0``) is
+    allowed: the stress applies to the whole grid (module docstring). See the module
+    docstring for the order of operations. Only the SELECTED variant is a pre-registered
+    candidate (one of the ``stats.m`` TEST looks of the multiplicity rule); every other
+    variant's label is context, not judged.
     """
-    if base.is_test_only:
-        raise ValueError("discover() needs a production base config (regime filter ON)")
+    if never_selectable(base):
+        raise ValueError("discover() needs a base config with the R4 regime filter ON")
     evs = list(events)
     s = split if split is not None else split_ts(data, train_frac, base.timeframe_ms)
     variants = list(grid) if grid is not None else default_grid(base)
@@ -204,7 +217,7 @@ def discover(
 
     # ---- 1. TRAIN only: nothing at or after the split is read.
     phases = [run_train(data, v, evs, s, variant=v.variant_id(), stats=stats) for v in variants]
-    log.append(f"TRAIN backtests: {len(phases)} variants, candles before the split only")
+    log.append(f"TRAIN backtests: {len(phases)} variants, candles closed by the split only")
 
     # ---- 2. Selection, recorded before any TEST backtest exists.
     selection = select_on_train(phases, min_train)
@@ -218,6 +231,6 @@ def discover(
         split_ts=s,
         selection=selection,
         results=results,
-        test_only=tuple(v.variant_id() for v in variants if v.is_test_only),
+        test_only=tuple(v.variant_id() for v in variants if never_selectable(v)),
         stage_log=log,
     )

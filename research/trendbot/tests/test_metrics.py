@@ -8,7 +8,12 @@ from dataclasses import replace
 
 import pytest
 
+from research.trendbot import metrics
 from research.trendbot.metrics import (
+    BREAKEVEN_WIN_P,
+    DD_CAP_PCT,
+    DD_CAP_RATIONALE,
+    DD_CAP_STREAK_P,
     LABELS,
     N_BOOT,
     NOT_DISTINGUISHABLE,
@@ -423,24 +428,39 @@ def test_mark_to_market_realises_exits_and_carries_the_last_close() -> None:
 
 
 def test_dd_check() -> None:
-    """C5: the TEST MTM drawdown against min(20%, the TRAIN bootstrap p95)."""
+    """C5 as revised by D7: the TEST MTM drawdown against min(15%, the TRAIN bootstrap p95)."""
     s = _s(40, 0.2, dd=4.0)
-    assert dd_limit() == 20.0 and dd_limit(25.0) == 20.0 and dd_limit(20.0, 7.5) == 7.5
-    ok, reason = dd_check(s, 20.0, train_dd_p95_pct=9.0, mtm_max_dd_pct=8.5)
+    assert DD_CAP_PCT == 15.0
+    assert dd_limit() == 15.0 and dd_limit(25.0) == 15.0 and dd_limit(20.0, 7.5) == 7.5
+    assert dd_limit(10.0) == 10.0  # max_dd_pct may tighten the cap, never loosen it
+    ok, reason = dd_check(s, 15.0, train_dd_p95_pct=9.0, mtm_max_dd_pct=8.5)
     assert ok and "mark-to-market max drawdown 8.50%" in reason and "9.00%" in reason
     assert "realised closed-trade 4.00%" in reason and "TEST length of 40" in reason
-    bad, reason = dd_check(s, 20.0, train_dd_p95_pct=8.0, mtm_max_dd_pct=8.5)
+    assert "min(15%, 95th percentile" in reason
+    bad, reason = dd_check(s, 15.0, train_dd_p95_pct=8.0, mtm_max_dd_pct=8.5)
     assert not bad and "exceeds" in reason
-    assert dd_check(s, 20.0, 30.0, 20.0)[0] and not dd_check(s, 20.0, 30.0, 20.01)[0]
-    assert dd_check(s, 20.0, 8.5, 8.5)[0]  # the boundary is allowed
+    assert dd_check(s, 15.0, 30.0, 15.0)[0] and not dd_check(s, 15.0, 30.0, 15.01)[0]
+    assert not dd_check(s, 20.0, 30.0, 15.01)[0]  # a 20% request is still capped at 15%
+    assert dd_check(s, 15.0, 8.5, 8.5)[0]  # the boundary is allowed
     # no MTM value (journals only): the realised drawdown is used and the reason says so
-    ok, reason = dd_check(_s(40, 0.2, dd=12.5), 20.0)
+    ok, reason = dd_check(_s(40, 0.2, dd=12.5), 15.0)
     assert ok and "12.50%" in reason and "no mark-to-market value" in reason
-    assert not dd_check(_s(40, 0.2, dd=25.0), 20.0)[0]
-    empty_ok, reason = dd_check(summarize([], EQ0), 20.0)
+    assert not dd_check(_s(40, 0.2, dd=15.5), 15.0)[0]
+    empty_ok, reason = dd_check(summarize([], EQ0), 15.0)
     assert empty_ok and "No test trades" in reason
-    for _ok, text in (dd_check(s, 20.0, 9.0, 8.5), dd_check(s, 20.0, 8.0, 8.5)):
+    for _ok, text in (dd_check(s, 15.0, 9.0, 8.5), dd_check(s, 15.0, 8.0, 8.5)):
         assert text.endswith(".") and ". " not in text
+
+
+def test_dd_cap_rationale_is_stated() -> None:
+    """D7: 15% ~ 15 full-size 1% losses; (2/3)^15 = 0.23% at the 2:1 break-even p* = 1/3."""
+    assert BREAKEVEN_WIN_P == pytest.approx(1 / 3)
+    assert DD_CAP_STREAK_P == pytest.approx((2 / 3) ** 15) and f"{DD_CAP_STREAK_P:.2%}" == "0.23%"
+    for needle in ("15%", "15 consecutive full-size losses", "1% cluster risk", "p* = 1/3"):
+        assert needle in DD_CAP_RATIONALE, needle
+    assert "(2/3)^15 = 0.23%" in DD_CAP_RATIONALE and "weekly-loss halt" in DD_CAP_RATIONALE
+    doc = metrics.__doc__ or ""
+    assert "DD_CAP_PCT = 15 %" in doc and "(2/3)^15 = 0.23 %" in doc
 
 
 def test_summary_is_frozen() -> None:

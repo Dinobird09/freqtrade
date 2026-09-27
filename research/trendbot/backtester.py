@@ -33,6 +33,13 @@ Execution model (shared with :func:`enumerate_candidates` through :func:`simulat
       low <= stop -> SL at stop * (1 - slip) (also when the same candle reaches the target:
       the stop is conservatively assumed to fill first); high >= target -> TP at target
       (resting limit order, no slippage).
+    - Stop-fill stress (CONTRACT v4 D4, research only): with ``cfg.stop_fill_wick_k = k > 0``
+      a NON-gap stop fills at ``(stop - k * (stop - low)) * (1 - slip)``, i.e. a share ``k``
+      of the way from the stop down to the exit candle's low, then slippage (k = 1: at the
+      low). Gap-through stops are unchanged. Sizing still plans the loss at
+      ``stop * (1 - slip)``, so a stressed stop loses MORE than 1R. ``k = 0`` (the default)
+      is the touch model above, byte-identical to the unstressed engine (pinned by a hash
+      test). Such configs are ``is_test_only`` and can never be adopted.
     - Forced close (EXIT_END) is a market sell: close * (1 - slip).
     - Fees: ``fee_rate`` of the notional on BOTH legs. ``pnl`` is net of fees and slippage;
       ``r_multiple = pnl / risk_amount`` with ``risk_amount`` the PLANNED all-in loss. So a
@@ -58,7 +65,15 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from .config import StrategyConfig
-from .gatekeeper import CAPITAL, EntryDecision, FillPlan, Gatekeeper
+from .gatekeeper import (
+    CAPITAL,
+    EntryDecision,
+    FillPlan,
+    Gatekeeper,
+    close_trade,
+    open_trade,
+    settle,
+)
 from .indicators import compute_features
 from .models import (
     EXIT_END,
@@ -104,12 +119,20 @@ class _Position:
 
 
 # ---------------------------------------------------------------------------- exit model
-def exit_on_candle(c: Candle, stop: float, target: float, slip: float) -> tuple[float, str] | None:
-    """Exit price and reason if candle ``c`` closes a long with this stop/target, else None."""
+def exit_on_candle(
+    c: Candle, stop: float, target: float, slip: float, wick_k: float = 0.0
+) -> tuple[float, str] | None:
+    """Exit price and reason if candle ``c`` closes a long with this stop/target, else None.
+
+    ``wick_k`` (D4 stop-fill stress, ``cfg.stop_fill_wick_k``): a non-gap stop fills at
+    ``stop - wick_k * (stop - c.low)`` before slippage; 0 is the touch model.
+    """
     if c.open <= stop:
         return c.open * (1.0 - slip), EXIT_SL  # gapped through the stop
     if c.low <= stop:
-        return stop * (1.0 - slip), EXIT_SL  # stop first, even if the target was also hit
+        # Stop first, even if the target was also hit.
+        fill = stop - wick_k * (stop - c.low) if wick_k else stop
+        return fill * (1.0 - slip), EXIT_SL
     if c.high >= target:
         return target, EXIT_TP  # resting limit: no slippage
     return None
@@ -134,16 +157,10 @@ def simulate_exit(
     slip = cfg.slippage_pct / 100.0
     last = len(candles) - 1 if last_idx is None else min(last_idx, len(candles) - 1)
     for j in range(fill_idx, last + 1):
-        hit = exit_on_candle(candles[j], stop, target, slip)
+        hit = exit_on_candle(candles[j], stop, target, slip, cfg.stop_fill_wick_k)
         if hit is not None:
             return j, hit[0], hit[1]
     return None
-
-
-def settle(qty: float, entry: float, exit_price: float, fee_rate: float) -> tuple[float, float]:
-    """``(fees, net pnl)`` of a long: fee_rate on both notional legs."""
-    fees = fee_rate * qty * entry + fee_rate * qty * exit_price
-    return fees, qty * (exit_price - entry) - fees
 
 
 # ---------------------------------------------------------------------------- preparation
@@ -165,17 +182,23 @@ def _prepare(
     return out
 
 
-def _fill_candle(s: _Series, i: int, decision_ts: int) -> tuple[int | None, str]:
+def fill_candle_index(
+    candles: Sequence[Candle], i: int, decision_ts: int
+) -> tuple[int | None, str]:
     """Index of the fill candle for signal ``i`` or None with the reason (X_capital)."""
     j = i + 1
-    if j >= len(s.candles):
+    if j >= len(candles):
         return None, "no fill candle: the data (or the evaluation window) ends at the signal close"
-    if s.candles[j].ts != decision_ts:
+    if candles[j].ts != decision_ts:
         return None, (
             f"no fill candle at the decision time {decision_ts}: data gap until "
-            f"{s.candles[j].ts}, so no order could be placed when the signal closed"
+            f"{candles[j].ts}, so no order could be placed when the signal closed"
         )
     return j, ""
+
+
+def _fill_candle(s: _Series, i: int, decision_ts: int) -> tuple[int | None, str]:
+    return fill_candle_index(s.candles, i, decision_ts)
 
 
 # ---------------------------------------------------------------------------- simulation
@@ -210,7 +233,7 @@ class _Simulation:
             return
         t = pos.trade
         c = s.candles[j]
-        hit = exit_on_candle(c, t.stop, t.target, self.slip)
+        hit = exit_on_candle(c, t.stop, t.target, self.slip, self.cfg.stop_fill_wick_k)
         if hit is not None:
             self._close(pair, c.ts, hit[0], hit[1])
         elif j == len(s.candles) - 1:
@@ -218,11 +241,8 @@ class _Simulation:
 
     def _close(self, pair: str, exit_ts: int, price: float, reason: str) -> None:
         pos = self.open.pop(pair)
-        t = pos.trade
-        t.exit_ts, t.exit_price, t.exit_reason = exit_ts, price, reason
-        t.fees, t.pnl = settle(t.qty, t.entry_price, price, self.cfg.fee_rate)
-        t.r_multiple = t.pnl / t.risk_amount
-        self.equity += t.pnl
+        t = close_trade(pos.trade, exit_ts, price, reason, self.cfg.fee_rate)
+        self.equity += t.pnl  # type: ignore[operator]
         self.trades.append(t)
         self.curve.append((exit_ts, self.equity))
         for msg in self.gk.on_trade_closed(t, equity=self.equity):
@@ -260,35 +280,12 @@ class _Simulation:
     def _open(
         self, pair: str, s: _Series, i: int, j: int, dec: EntryDecision, fill: FillPlan
     ) -> None:
-        plan, sizing = dec.stop_plan, fill.sizing
-        if plan is None or sizing is None:
-            raise ValueError("an opened position needs a stop plan and a size")
-        note = (
-            f"reserved {dec.risk_pct:g}% (cap {dec.pair_cap:g}%, R6 {dec.correlation_allowed:g}%,"
-            f" guard x{dec.guard_mult:g}); stop {plan.method} {plan.structure_level:.8g} "
-            f"-{plan.buffer_pct:g}%"
-        )
-        if sizing.capped_by:
-            note += f"; size capped by {sizing.capped_by}"
-        trade = Trade(
-            trade_id=self.next_id,
-            pair=pair,
-            variant=self.variant,
-            signal_ts=s.candles[i].ts,
-            entry_ts=s.candles[j].ts,
-            entry_price=fill.entry,
-            stop=plan.stop,
-            target=fill.target,
-            qty=sizing.qty,
-            risk_amount=sizing.risk_amount,
-            risk_pct=sizing.risk_pct,
-            stop_method=plan.method,
-            features=s.rows[i].ml_features() or {},
-            ml_prob=dec.ml_prob,
-            notes=note,
+        features = s.rows[i].ml_features() or {}
+        trade = open_trade(
+            self.next_id, pair, self.variant, s.candles[i].ts, s.candles[j].ts, dec, fill, features
         )
         self.next_id += 1
-        cost = sizing.notional * (1.0 + self.cfg.fee_rate)
+        cost = fill.sizing.notional * (1.0 + self.cfg.fee_rate)  # type: ignore[union-attr]
         self.open[pair] = _Position(trade, j, dec.risk_pct, cost)
 
 

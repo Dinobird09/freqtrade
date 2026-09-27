@@ -11,6 +11,7 @@
 - Config: `rr2_vol1.5_rsi50-70`, reward:risk 2.00 (net of costs), risk caps BNB 0.50%, BTC 1.00%, ETH 1.00%
 - Costs: fee 0.1000% per side, slippage 0.0500% on market fills (entry and stop), exchange `binance`. Risk is the ALL-IN loss at the stop, so a clean stop-out is -1R and a TP is +reward:risk R; `RR price` is the chart-distance ratio, `RR net` what a TP earns after both fees.
 - Row key: (window, trade_id), unique in this pack; `trades_review.csv` is matched against the TRAIN and TEST journals by this key
+- Candle context: unavailable (no candles supplied, see the trade context section)
 
 ## Summary per window
 
@@ -189,6 +190,10 @@ avg R is the expectancy per closed trade (the target metric), net of fees and sl
 - **#94** BTC/USDT (TRAIN, entry 2023-03-10T12:00:00Z): window_end: window-end forced exit (window-boundary artifact, not an SL/TP outcome)
 - **#110** ETH/USDT (TEST, entry 2023-09-07T12:00:00Z): zero_hold: hold time 0h, exit in the fill candle (intrabar order assumed, check the chart)
 - **#114** BNB/USDT (TEST, entry 2023-10-17T16:00:00Z): zero_hold: hold time 0h, exit in the fill candle (intrabar order assumed, check the chart)
+
+## Trade context (candles)
+
+Candle context unavailable: no candles were supplied (`write_review_pack(..., data=...)`, or the CLI's `--data-dir` / `--synthetic`), so the MAE, MFE, stop-structure and wick columns of `trades_review.csv` are blank and no `context/` files were written. Judge each trade on a chart of its pair from 30 candles before the entry through the exit, and check the stop against the swing low it claims to sit behind.
 
 ## Rule denials
 

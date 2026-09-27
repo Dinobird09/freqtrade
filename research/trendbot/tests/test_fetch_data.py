@@ -1,14 +1,24 @@
-"""fetch_data against a FAKE exchange (no ccxt, no network)."""
+"""fetch_data against a FAKE exchange (no ccxt, no network), incl. the D2 manifest."""
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 import types
 
 import pytest
 
 from research.trendbot import fetch_data
-from research.trendbot.data import load_candles_csv, load_dataset
+from research.trendbot.data import (
+    MANIFEST_FORMAT,
+    MANIFEST_NAME,
+    file_sha256,
+    load_candles_csv,
+    load_dataset,
+    save_candles_csv,
+    verify_manifest,
+)
 from research.trendbot.fetch_data import fetch_ohlcv, parse_utc_date, plan_timeframe
 from research.trendbot.models import HOUR_MS
 
@@ -161,8 +171,12 @@ def test_main_rejects_bad_dates_before_importing_ccxt(capsys):
     assert "error" in capsys.readouterr().err
 
 
+FAKE_CCXT_VERSION = "4.9.9-fake"
+
+
 def _fake_ccxt(monkeypatch, factory) -> None:
     module = types.ModuleType("ccxt")
+    module.__version__ = FAKE_CCXT_VERSION
     module.binance = factory
     module.coinbase = factory
     module.kraken = factory
@@ -222,3 +236,88 @@ def test_main_coinbase_aggregates_2h_into_4h(monkeypatch, tmp_path, capsys):
     first = candles[0]
     assert (first.ts, first.open, first.close) == (T0, data[0][1], data[1][4])
     assert first.high == max(data[0][2], data[1][2]) and first.volume == data[0][5] + data[1][5]
+
+
+# ---------------------------------------------------------------------------- D2 manifest
+def _kraken(monkeypatch, n: int = 60, data=None):
+    markets = {"BTC/USDT": {}, "ETH/USDT": {}}
+    data = data if data is not None else rows(n)
+
+    def factory(config):
+        ex = FakeExchange(data, now=T0 + n * TF, markets=markets)
+        ex.id = "kraken"
+        return ex
+
+    _fake_ccxt(monkeypatch, factory)
+
+
+def test_main_writes_a_manifest_that_verifies_as_real(monkeypatch, tmp_path, capsys):
+    _kraken(monkeypatch)
+    argv = ["--exchange", "kraken", "--since", "2019-01-01", "--out", str(tmp_path)]
+    assert fetch_data.main([*argv, "--pairs", "BTC/USDT", "ETH/USDT"]) == 0
+    assert "manifest: 2 file(s) recorded" in capsys.readouterr().out
+    manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+    assert manifest["format"] == MANIFEST_FORMAT
+    assert (manifest["exchange_id"], manifest["ccxt_version"], manifest["timeframe"]) == (
+        "kraken",
+        FAKE_CCXT_VERSION,
+        "4h",
+    )
+    assert (manifest["since_ms"], manifest["since_utc"]) == (T0, "2019-01-01T00:00:00Z")
+    assert manifest["until_ms"] is None and manifest["symbols"] == ["BTC/USDT", "ETH/USDT"]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", manifest["fetched_at_utc"])
+    by_name = {e["name"]: e for e in manifest["files"]}
+    assert sorted(by_name) == ["BTC_USDT-4h.csv", "ETH_USDT-4h.csv"]
+    for name, entry in by_name.items():
+        candles = load_candles_csv(tmp_path / name, "4h")
+        assert entry["sha256"] == file_sha256(tmp_path / name)
+        assert (entry["rows"], entry["first_ts"], entry["last_ts"]) == (
+            len(candles),
+            candles[0].ts,
+            candles[-1].ts,
+        )
+        assert (entry["exchange_id"], entry["fetch_timeframe"], entry["symbol"]) == (
+            "kraken",
+            "4h",
+            name.replace("-4h.csv", "").replace("_", "/"),
+        )
+    provenance, details = verify_manifest(tmp_path, ["BTC/USDT", "ETH/USDT"])
+    assert provenance == "real", details["problems"]
+    assert details["ccxt_version"] == FAKE_CCXT_VERSION
+    # A hand-written CSV next to them is not in the manifest ...
+    save_candles_csv(load_candles_csv(tmp_path / "BTC_USDT-4h.csv"), tmp_path / "BNB_USDT-4h.csv")
+    provenance, details = verify_manifest(tmp_path, ["BTC/USDT", "ETH/USDT", "BNB/USDT"])
+    assert provenance == "unverified-csv"
+    assert details["problems"] == ["BNB_USDT-4h.csv: not listed in manifest.json"]
+    # ... and a downloaded file edited afterwards no longer matches its hash.
+    eth = tmp_path / "ETH_USDT-4h.csv"
+    eth.write_text(eth.read_text().replace(",10.0\n", ",10.5\n", 1))
+    provenance, details = verify_manifest(tmp_path, ["BTC/USDT", "ETH/USDT"])
+    assert provenance == "unverified-csv"
+    assert len(details["problems"]) == 1 and "ETH_USDT-4h.csv: sha256" in details["problems"][0]
+    assert load_dataset(tmp_path, ["ETH/USDT"])  # still a valid candle file: only unverified
+
+
+def test_refetching_one_pair_keeps_the_other_entries(monkeypatch, tmp_path):
+    _kraken(monkeypatch)
+    base = ["--exchange", "kraken", "--out", str(tmp_path)]
+    assert fetch_data.main([*base, "--pairs", "BTC/USDT", "ETH/USDT"]) == 0
+    first = json.loads((tmp_path / MANIFEST_NAME).read_text())
+    assert fetch_data.main([*base, "--pairs", "ETH/USDT", "--until", "2019-01-05"]) == 0
+    second = json.loads((tmp_path / MANIFEST_NAME).read_text())
+    assert second["symbols"] == ["ETH/USDT"] and second["until_utc"] == "2019-01-05T00:00:00Z"
+    by_name = {e["name"]: e for e in second["files"]}
+    assert by_name["BTC_USDT-4h.csv"] == next(
+        e for e in first["files"] if e["name"] == "BTC_USDT-4h.csv"
+    )
+    assert by_name["ETH_USDT-4h.csv"]["rows"] == 24 and by_name["ETH_USDT-4h.csv"]["until_ms"]
+    assert verify_manifest(tmp_path, ["BTC/USDT", "ETH/USDT"])[0] == "real"
+
+
+def test_misaligned_exchange_candles_are_never_saved(monkeypatch, tmp_path, capsys):
+    _kraken(monkeypatch, data=rows(60, start=T0 + HOUR_MS))  # a venue with shifted 4h bars
+    argv = ["--exchange", "kraken", "--pairs", "BTC/USDT", "--out", str(tmp_path)]
+    assert fetch_data.main(argv) == 1
+    assert "not epoch-aligned" in capsys.readouterr().err
+    assert not (tmp_path / "BTC_USDT-4h.csv").exists()
+    assert not (tmp_path / MANIFEST_NAME).exists()

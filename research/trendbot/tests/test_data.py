@@ -1,13 +1,20 @@
-"""data.py: candle CSV round-trip, strict validation with line numbers, gaps, resampling."""
+"""data.py: candle CSV round-trip, strict validation with line numbers, epoch alignment,
+gaps, resampling, and manifest-backed provenance (CONTRACT v4 D2)."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from research.trendbot.data import (
     CSV_COLUMNS,
+    MANIFEST_FORMAT,
+    MANIFEST_NAME,
+    alignment_offset,
+    file_sha256,
     gap_report,
     load_candles_csv,
     load_dataset,
@@ -18,8 +25,9 @@ from research.trendbot.data import (
     timeframe_to_ms,
     ts_to_iso,
     validate_candles,
+    verify_manifest,
 )
-from research.trendbot.models import HOUR_MS, Candle
+from research.trendbot.models import DAY_MS, HOUR_MS, Candle
 
 
 TF = 4 * HOUR_MS
@@ -236,3 +244,162 @@ def test_resample_keeps_only_complete_buckets():
     assert first.volume == pytest.approx(sum(c.volume for c in src))
     with pytest.raises(ValueError):
         resample_candles(hourly, 3 * HOUR_MS, TF)
+
+
+# ---------------------------------------------------------------------------- D2 alignment
+def test_a_shifted_4h_file_is_refused_as_not_epoch_aligned(tmp_path):
+    """+1h shifted 4H candles (a local-time export): correctly spaced, but every candle
+    opens at 01:00, 05:00, ... so every decision time would be an hour off."""
+    shifted = make(10, start=T0 + HOUR_MS)
+    path = tmp_path / "BTC_USDT-4h.csv"
+    save_candles_csv(shifted, path)
+    msg = rf"line 2: ts {T0 + HOUR_MS} \(2024-01-01T01:00:00Z\) is not epoch-aligned.*1h past"
+    with pytest.raises(ValueError, match=msg):
+        load_dataset(tmp_path, ["BTC/USDT"])
+    with pytest.raises(ValueError, match=r"BTC_USDT-4h\.csv: line 2: .*not epoch-aligned"):
+        load_candles_csv(path, "4h")
+    with pytest.raises(ValueError, match="not epoch-aligned"):
+        load_candles_csv(path, TF)
+    assert load_candles_csv(path) == shifted  # timeframe unknown: nothing to align against
+    # Any uniform shift keeps the 4h spacing, so only the alignment check can refuse it.
+    save_candles_csv(make(10, start=T0 + 60_000), path)
+    with pytest.raises(ValueError, match=r"line 2: .*not epoch-aligned.*1m past"):
+        load_dataset(tmp_path, ["BTC/USDT"])
+
+
+def test_alignment_rule():
+    assert alignment_offset(T0, TF) == 0 and alignment_offset(T0 + HOUR_MS, TF) == HOUR_MS
+    assert alignment_offset(T0 + TF - 1, TF) == TF - 1
+    # Weekly candles open on Monday 00:00 UTC (the exchange convention; 1970-01-01 was a
+    # Thursday). 2024-01-01 is a Monday.
+    week = 7 * DAY_MS
+    assert alignment_offset(T0, week) == 0 and alignment_offset(0, week) == 3 * DAY_MS
+    validate_candles(make(5), TF)
+    with pytest.raises(ValueError, match=r"candle #0 .*not epoch-aligned"):
+        validate_candles(make(5, start=T0 + HOUR_MS), TF)
+    validate_candles(make(5, start=T0 + HOUR_MS))  # no timeframe: alignment not checked
+
+
+def test_weekly_files_align_to_monday(tmp_path):
+    save_candles_csv(make(6, step=7 * DAY_MS), tmp_path / "BTC_USDT-1w.csv")
+    assert len(load_dataset(tmp_path, ["BTC/USDT"], "1w")["BTC/USDT"]) == 6
+    save_candles_csv(make(6, start=T0 + 3 * DAY_MS, step=7 * DAY_MS), tmp_path / "BTC_USDT-1w.csv")
+    with pytest.raises(ValueError, match="not epoch-aligned"):
+        load_dataset(tmp_path, ["BTC/USDT"], "1w")  # Thursday-open weeks
+
+
+# ---------------------------------------------------------------------------- D2 manifest
+PAIRS = ["BTC/USDT", "ETH/USDT"]
+
+
+def _manifest_dir(root: Path) -> Path:
+    """Two candle files plus the manifest fetch_data would have written for them."""
+    files = []
+    for pair, n in zip(PAIRS, (30, 25), strict=True):
+        candles = make(n)
+        path = root / pair_filename(pair)
+        save_candles_csv(candles, path)
+        files.append(
+            {
+                "name": path.name,
+                "symbol": pair,
+                "exchange_id": "binance",
+                "timeframe": "4h",
+                "rows": n,
+                "first_ts": candles[0].ts,
+                "last_ts": candles[-1].ts,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    manifest = {
+        "format": MANIFEST_FORMAT,
+        "exchange_id": "binance",
+        "ccxt_version": "4.0.0",
+        "timeframe": "4h",
+        "fetched_at_utc": "2026-09-01T00:00:00Z",
+        "files": files,
+    }
+    (root / MANIFEST_NAME).write_text(json.dumps(manifest))
+    return root
+
+
+def test_verify_manifest_accepts_only_hash_matching_listed_files(tmp_path):
+    root = _manifest_dir(tmp_path)
+    provenance, details = verify_manifest(root, PAIRS)
+    assert provenance == "real" and details["problems"] == []
+    assert details["manifest_sha256"] == file_sha256(root / MANIFEST_NAME)
+    assert details["manifest_path"] == str(root / MANIFEST_NAME)
+    assert details["exchange_id"] == "binance" and details["exchange_ids"] == ["binance"]
+    assert all(f["verified"] and f["listed"] for f in details["files"].values())
+    assert "cannot authenticate" in details["note"]
+    assert verify_manifest(root, ["BTC/USDT"])[0] == "real"  # a subset is fine
+
+
+@pytest.mark.parametrize(
+    ("tamper", "problem"),
+    [
+        (lambda r: (r / MANIFEST_NAME).unlink(), "no manifest.json"),
+        (lambda r: (r / MANIFEST_NAME).write_text("{not json"), "not valid JSON"),
+        (lambda r: _edit_manifest(r, format="other/1"), "format is"),
+        (lambda r: _edit_manifest(r, ccxt_version=""), "ccxt_version"),
+        (lambda r: _edit_entry(r, 1, None), "not listed"),
+        (lambda r: _edit_entry(r, 1, sha256="0" * 64), "does not match"),
+        (lambda r: _edit_entry(r, 1, symbol="BNB/USDT"), "expected ETH/USDT 4h"),
+        (lambda r: _edit_entry(r, 1, rows=24), "manifest says"),
+        (lambda r: _edit_entry(r, 1, first_ts=T0 - TF), "manifest says"),
+        (lambda r: _append_row(r / "ETH_USDT-4h.csv"), "does not match"),
+        (lambda r: (r / "ETH_USDT-4h.csv").unlink(), "file not found"),
+    ],
+    ids=[
+        "no-manifest",
+        "bad-json",
+        "format",
+        "no-ccxt-version",
+        "unlisted-file",
+        "wrong-hash",
+        "wrong-symbol",
+        "wrong-rows",
+        "wrong-first-ts",
+        "tampered-csv",
+        "missing-file",
+    ],
+)
+def test_verify_manifest_otherwise_says_unverified(tmp_path, tamper, problem):
+    root = _manifest_dir(tmp_path)
+    tamper(root)
+    provenance, details = verify_manifest(root, PAIRS)
+    assert provenance == "unverified-csv"
+    assert any(problem in p for p in details["problems"]), details["problems"]
+
+
+def test_a_hand_written_csv_is_unverified(tmp_path):
+    save_candles_csv(make(20), tmp_path / "BTC_USDT-4h.csv")
+    provenance, details = verify_manifest(tmp_path, ["BTC/USDT"])
+    assert provenance == "unverified-csv" and details["manifest_sha256"] is None
+    assert details["files"]["BTC_USDT-4h.csv"]["sha256"] == file_sha256(
+        tmp_path / "BTC_USDT-4h.csv"
+    )
+    assert verify_manifest(_manifest_dir(tmp_path / "m"), [])[0] == "unverified-csv"
+
+
+def _edit_manifest(root: Path, **changes) -> None:
+    path = root / MANIFEST_NAME
+    manifest = json.loads(path.read_text())
+    manifest.update(changes)
+    path.write_text(json.dumps(manifest))
+
+
+def _edit_entry(root: Path, k: int, entry=..., **changes) -> None:
+    path = root / MANIFEST_NAME
+    manifest = json.loads(path.read_text())
+    if entry is None:
+        del manifest["files"][k]
+    else:
+        manifest["files"][k].update(changes)
+    path.write_text(json.dumps(manifest))
+
+
+def _append_row(path: Path) -> None:
+    candles = load_candles_csv(path)
+    last = candles[-1]
+    save_candles_csv([*candles, Candle(last.ts + TF, 1.0, 2.0, 0.5, 1.5, 1.0)], path)

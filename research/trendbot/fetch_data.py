@@ -19,19 +19,39 @@ Exchange notes:
   only (``data.resample_candles``).
 
 Files are written as ``<out>/<BASE>_<QUOTE>-<timeframe>.csv`` (see ``data.pair_filename``),
-the format ``data.load_dataset`` reads.
+the format ``data.load_dataset`` reads. Every candle must be epoch-aligned to the timeframe
+(``ts % timeframe_ms == 0``, CONTRACT v4 D2); a download that is not is refused, not saved.
+
+Provenance (CONTRACT v4 D2): after each file is saved, ``<out>/manifest.json`` is (re)written
+atomically. It records the run (``exchange_id``, ``ccxt_version``, ``symbols``, ``timeframe``,
+``since_ms``/``since_utc``, ``until_ms``/``until_utc``, ``fetched_at_utc``) and, under
+``files``, one entry per candle file: ``name``, ``symbol``, ``exchange_id``, ``ccxt_version``,
+``timeframe``, ``fetch_timeframe`` (e.g. 2h when 4h was aggregated), ``since_ms``,
+``until_ms``, ``fetched_at_utc``, ``rows``, ``first_ts``/``first_utc``,
+``last_ts``/``last_utc`` and ``sha256`` of the file bytes. Entries of files this run did not
+rewrite are kept (each entry carries its own provenance), so re-fetching one failed pair keeps
+the others listed. ``data.verify_manifest`` accepts a data directory as ``"real"`` only when
+every file it loads is listed with a matching sha256. That is NOT authentication of the
+exchange download (nothing offline can be): it makes replacing or editing a CSV after the
+download a deliberate act (the manifest must be rewritten too) instead of an accident.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .data import (
+    MANIFEST_FORMAT,
+    MANIFEST_NAME,
+    MANIFEST_NOTE,
+    file_sha256,
     gap_report,
     pair_filename,
     parse_iso_utc,
@@ -157,15 +177,92 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _download_pair(exchange: Any, pair: str, args: argparse.Namespace) -> int:
-    """Fetch, validate and save one pair. Returns 0 on success, 1 on a per-pair failure."""
+def _utc_now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_record(exchange: Any, args: argparse.Namespace, ccxt_version: str) -> dict[str, Any]:
+    """Run-level manifest fields (also copied into each file entry written by this run)."""
+    until = args.until_ms
+    return {
+        "exchange_id": str(getattr(exchange, "id", args.exchange)),
+        "ccxt_version": ccxt_version,
+        "timeframe": args.timeframe,
+        "since_ms": args.since_ms,
+        "since_utc": ts_to_iso(args.since_ms),
+        "until_ms": until,
+        "until_utc": None if until is None else ts_to_iso(until),
+        "fetched_at_utc": _utc_now(),
+    }
+
+
+def manifest_entry(
+    path: Path, pair: str, candles: Sequence[Candle], fetch_tf: str, run: dict[str, Any]
+) -> dict[str, Any]:
+    """The manifest record of one saved candle file (hash of the bytes on disk)."""
+    return {
+        "name": path.name,
+        "symbol": pair,
+        "exchange_id": run["exchange_id"],
+        "ccxt_version": run["ccxt_version"],
+        "timeframe": run["timeframe"],
+        "fetch_timeframe": fetch_tf,
+        "since_ms": run["since_ms"],
+        "until_ms": run["until_ms"],
+        "fetched_at_utc": _utc_now(),
+        "rows": len(candles),
+        "first_ts": candles[0].ts,
+        "first_utc": ts_to_iso(candles[0].ts),
+        "last_ts": candles[-1].ts,
+        "last_utc": ts_to_iso(candles[-1].ts),
+        "sha256": file_sha256(path),
+    }
+
+
+def write_manifest(
+    out_dir: str | Path, run: dict[str, Any], symbols: Sequence[str], entries: Sequence[dict]
+) -> Path:
+    """(Re)write ``<out_dir>/manifest.json`` atomically.
+
+    ``entries`` (this run's files) replace any earlier entry of the same file name; entries of
+    other files from an earlier manifest are kept as they were. An unreadable earlier manifest
+    is replaced (with a warning), never trusted.
+    """
+    path = Path(out_dir) / MANIFEST_NAME
+    kept: dict[str, dict] = {}
+    if path.is_file():
+        try:
+            old = json.loads(path.read_text(encoding="utf-8"))
+            kept = {str(e["name"]): e for e in old["files"] if isinstance(e, dict) and "name" in e}
+        except (ValueError, KeyError, TypeError) as exc:
+            print(f"warning: replacing unreadable {path} ({exc})", file=sys.stderr)
+    for entry in entries:
+        kept[entry["name"]] = entry
+    manifest = {
+        "format": MANIFEST_FORMAT,
+        "note": MANIFEST_NOTE,
+        **run,
+        "symbols": list(symbols),
+        "files": [kept[name] for name in sorted(kept)],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def _download_pair(
+    exchange: Any, pair: str, args: argparse.Namespace, run: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Fetch, validate and save one pair. Returns its manifest entry, or None on failure."""
     name = getattr(exchange, "id", args.exchange)
     markets = getattr(exchange, "markets", None) or {}
     if markets and pair not in markets:
         is_bnb = pair.upper().startswith("BNB/") and name != "binance"
         hint = " (BNB is a Binance pair)" if is_bnb else ""
         print(f"{pair}: not listed on {name}{hint}; skipped", file=sys.stderr)
-        return 1
+        return None
     tf_ms = timeframe_to_ms(args.timeframe)
     try:
         fetch_tf = plan_timeframe(exchange, args.timeframe)
@@ -174,13 +271,13 @@ def _download_pair(exchange: Any, pair: str, args: argparse.Namespace) -> int:
         if fetch_tf != args.timeframe:
             print(f"{pair}: {name} has no {args.timeframe} candles; aggregating {fetch_tf}")
             candles = resample_candles(candles, timeframe_to_ms(fetch_tf), tf_ms)
-        validate_candles(candles)
+        validate_candles(candles, tf_ms)  # also refuses candles off the epoch grid (D2)
     except Exception as exc:  # network / exchange / data errors: report, continue
         print(f"{pair}: download failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
+        return None
     if not candles:
         print(f"{pair}: no closed candles in the requested window", file=sys.stderr)
-        return 1
+        return None
     path = Path(args.out) / pair_filename(pair, args.timeframe)
     save_candles_csv(candles, path)
     gaps = gap_report(candles, tf_ms)
@@ -188,7 +285,7 @@ def _download_pair(exchange: Any, pair: str, args: argparse.Namespace) -> int:
     print(f"{pair}: {len(candles)} candles {first} .. {last} -> {path}; {len(gaps)} gap(s)")
     for a, b in gaps[:10]:
         print(f"  gap: {ts_to_iso(a)} -> {ts_to_iso(b)}")
-    return 0
+    return manifest_entry(path, pair, candles, fetch_tf, run)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -219,7 +316,19 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"error: cannot load {args.exchange} markets: {exc}", file=sys.stderr)
         return 1
-    return max((_download_pair(exchange, pair, args) for pair in args.pairs), default=0)
+    run = _run_record(exchange, args, str(getattr(ccxt, "__version__", None) or "unknown"))
+    entries: list[dict[str, Any]] = []
+    rc = 0
+    for pair in args.pairs:
+        entry = _download_pair(exchange, pair, args, run)
+        if entry is None:
+            rc = 1
+            continue
+        entries.append(entry)
+        path = write_manifest(args.out, run, args.pairs, entries)  # after EVERY saved file
+    if entries:
+        print(f"manifest: {len(entries)} file(s) recorded in {path} (sha256 per file)")
+    return rc
 
 
 if __name__ == "__main__":

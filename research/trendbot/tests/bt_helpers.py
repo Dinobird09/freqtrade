@@ -11,14 +11,24 @@ an earlier signal (``find_stop`` reads candles up to the signal only).
 Levels follow CONTRACT.md v2 A1 and are computed here from the formulas, independently of
 ``sizing.py``: :meth:`Scenario.unit_loss` is the all-in loss per unit at the stop and
 :meth:`Scenario.target` the take-profit whose net win is ``reward_risk`` times it.
+
+:func:`drive_live_session` plays the EXCHANGE for a ``gatekeeper.LiveSession`` candle by
+candle (CONTRACT v4 D5 parity), handing it only :class:`Prefix` views that raise
+``IndexError`` beyond the candle that just closed.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
+from research.trendbot.backtester import exit_on_candle, fill_candle_index
 from research.trendbot.config import StrategyConfig
-from research.trendbot.models import HOUR_MS, Candle, NewsEvent
+from research.trendbot.gatekeeper import DecisionRecord, LiveSession
+from research.trendbot.indicators import compute_features
+from research.trendbot.journal import read_journal, write_journal
+from research.trendbot.models import EXIT_END, HOUR_MS, Candle, EntryFilter, NewsEvent, Trade
 from research.trendbot.structure import find_stop
 
 
@@ -128,3 +138,170 @@ def news(i: int, offset_h: float, scope: str = "ALL", kind: str = "macro", impac
 
 def data_of(*scenarios: Scenario) -> dict[str, list[Candle]]:
     return {s.pair: s.candles for s in scenarios}
+
+
+# ---------------------------------------------------------------------------- live driver
+class Prefix(Sequence):
+    """Read-only view of ``seq[:n]``. Any index at or beyond ``n`` raises ``IndexError`` (and
+    slices are clipped at ``n``), so whoever holds it cannot read a later candle."""
+
+    __slots__ = ("_n", "_seq")
+
+    def __init__(self, seq: Sequence, n: int) -> None:
+        if not 0 <= n <= len(seq):
+            raise ValueError(f"prefix length {n} outside [0, {len(seq)}]")
+        self._seq, self._n = seq, n
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx):  # type: ignore[override]
+        if isinstance(idx, slice):
+            return [self._seq[k] for k in range(*idx.indices(self._n))]
+        k = idx + self._n if idx < 0 else idx
+        if not 0 <= k < self._n:
+            raise IndexError(f"index {idx} is beyond the {self._n} closed candles")
+        return self._seq[k]
+
+
+@dataclass
+class LiveRun:
+    trades: list[Trade]  # closed trades in close order (final session)
+    decision_log: list[DecisionRecord]  # every session's log, concatenated
+    breaker_log: list[tuple[int, str]]
+    equity_curve: list[tuple[int, float]]
+    final_equity: float
+    session: LiveSession  # the last session
+    # (timestamp after which the session was rebuilt from its journal, trades open then)
+    restarts: list[tuple[int, list[Trade]]] = field(default_factory=list)
+
+    def denials(self) -> list[tuple[int, str, str, str]]:
+        """Denied signals as ``BacktestResult.decision_log`` rows (ts, pair, rule, reason)."""
+        return [(d.signal_ts, d.pair, d.rule, d.reason) for d in self.decision_log if not d.allowed]
+
+
+class _Exchange:
+    """The simulated exchange + bot loop around one LiveSession (see drive_live_session)."""
+
+    def __init__(
+        self,
+        data: Mapping[str, Sequence[Candle]],
+        cfg: StrategyConfig,
+        events: list[NewsEvent],
+        offset: int,
+        exit_fill_ms: int,
+        entry_filter: EntryFilter | None,
+    ) -> None:
+        self.cfg, self.events, self.offset = cfg, events, offset
+        self.exit_fill_ms, self.entry_filter = exit_fill_ms, entry_filter
+        self.slip = cfg.slippage_pct / 100.0
+        self.series = {p: list(data[p]) for p in sorted(data)}
+        self.rows = {p: compute_features(c, cfg) for p, c in self.series.items()}
+        self.session = self.new_session()
+        self.decisions: list[DecisionRecord] = []
+        self.breaker_log: list[tuple[int, str]] = []
+
+    def new_session(self, journal: Sequence[Trade] = ()) -> LiveSession:
+        return LiveSession(
+            self.cfg,
+            self.events,
+            journal,
+            exit_time_uncertainty_ms=self.offset,
+            entry_filter=self.entry_filter,
+        )
+
+    def exits(self, current: Mapping[str, int]) -> None:
+        session = self.session
+        for p in sorted(session.open_positions):
+            if p not in current:
+                continue
+            k, t = current[p], session.open_positions[p]
+            c = self.series[p][k]
+            if c.ts < t.entry_ts:
+                continue
+            hit = exit_on_candle(c, t.stop, t.target, self.slip, self.cfg.stop_fill_wick_k)
+            exit_ts = c.ts + self.exit_fill_ms
+            if hit is not None:
+                session.on_exit(t.trade_id, exit_ts, hit[0], hit[1])
+            elif k == len(self.series[p]) - 1:
+                session.on_exit(t.trade_id, exit_ts, c.close * (1 - self.slip), EXIT_END)
+
+    def entries(self, current: Mapping[str, int]) -> None:
+        session = self.session
+        for p, k in current.items():
+            candles = self.series[p]
+            dec = session.on_candle_close(p, Prefix(candles, k + 1), Prefix(self.rows[p], k + 1))
+            if not dec.allowed:
+                continue
+            j, why = fill_candle_index(candles, k, dec.decision_ts)
+            if j is None:
+                session.on_fill_skipped(p, dec, why)
+                continue
+            market = candles[j].open
+            session.on_fill(p, dec, market, market * (1 + self.slip))
+
+    def restart(self, journal_path: Path) -> list[Trade]:
+        """Write the journal, then REBUILD the session from the file alone."""
+        self.decisions.extend(self.session.decision_log)
+        self.breaker_log.extend(self.session.breaker_log)
+        still_open = list(self.session.open_positions.values())
+        write_journal(self.session.journal_trades(), journal_path)
+        self.session = self.new_session(read_journal(journal_path))
+        return still_open
+
+
+def drive_live_session(
+    data: Mapping[str, Sequence[Candle]],
+    cfg: StrategyConfig,
+    events: Iterable[NewsEvent] = (),
+    *,
+    exit_time_uncertainty_ms: int,
+    exit_fill_ms: int = 0,
+    restarts: Sequence[tuple[int, bool]] = (),
+    journal_path: Path | None = None,
+    entry_filter: EntryFilter | None = None,
+) -> LiveRun:
+    """Drive a LiveSession through ``data`` exactly like ``run_backtest``'s loop.
+
+    At each timestamp T (union of all candle times, ascending): (1) exits of candle T for the
+    open positions, pairs sorted, with the backtest exit model (``exit_on_candle``; a
+    position whose pair has no later candle is force-closed at the close, EXIT_END) reported
+    through ``on_exit`` with ``exit_ts = T + exit_fill_ms``; (2) for each pair with a candle
+    at T, sorted, ``on_candle_close`` on the prefix up to T, then ``on_fill`` at the next
+    candle's open * (1 + slippage) if that candle opens at the decision time, else
+    ``on_fill_skipped`` with the backtester's reason. ``exit_fill_ms = 0`` with
+    ``exit_time_uncertainty_ms = cfg.timeframe_ms`` is the backtest convention;
+    ``exit_fill_ms = tf // 2`` with offset 0 journals "real" mid-candle fill times.
+
+    ``restarts``: ``(after_ts, needs_open)`` points. At the first timestamp >= ``after_ts``
+    (after its exits and entries; if ``needs_open``, the first one with a position OPEN) the
+    session's journal is written to ``journal_path`` and a brand-new session is rebuilt from
+    ``read_journal`` of that file alone. Features come from
+    ``compute_features`` on the full series, handed over as a Prefix: the indicators are
+    causal and prefix-exact (the parity test re-checks that on every signal candle).
+    """
+    ex = _Exchange(data, cfg, list(events), exit_time_uncertainty_ms, exit_fill_ms, entry_filter)
+    run = LiveRun([], ex.decisions, ex.breaker_log, [], 0.0, ex.session)
+    pending = sorted(restarts)
+    if pending and journal_path is None:
+        raise ValueError("a restart needs a journal_path")
+    ptr = dict.fromkeys(ex.series, 0)
+    for ts in sorted({c.ts for cs in ex.series.values() for c in cs}):
+        current: dict[str, int] = {}
+        for p, candles in ex.series.items():
+            k = ptr[p]
+            if k < len(candles) and candles[k].ts == ts:
+                current[p], ptr[p] = k, k + 1
+        ex.exits(current)
+        ex.entries(current)
+        due = [r for r in pending if r[0] <= ts and (ex.session.open_positions or not r[1])]
+        if due:
+            pending = [r for r in pending if r not in due]
+            run.restarts.append((ts, ex.restart(journal_path)))  # type: ignore[arg-type]
+    ex.decisions.extend(ex.session.decision_log)
+    ex.breaker_log.extend(ex.session.breaker_log)
+    run.trades = list(ex.session.closed)
+    run.equity_curve = list(ex.session.equity_curve)
+    run.final_equity = ex.session.equity
+    run.session = ex.session
+    return run

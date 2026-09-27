@@ -34,7 +34,10 @@ candle that touches stop or target, at the documented price (exits never paused 
 delayed); fee/pnl/R arithmetic; outcome in R: a clean stop-loss (exit candle opens above
 the stop, fill at ``stop * (1 - s)``) is exactly -1R, a take-profit exactly
 +``reward_risk`` R (both within 1e-9), a gap-through stop-loss is at most -1R, and NOTHING
-else is below -1R or above +``reward_risk`` R; no data at or after ``end_ts``.
+else is below -1R or above +``reward_risk`` R; no data at or after ``end_ts``. Under the D4
+stop-fill stress (``cfg.stop_fill_wick_k = k > 0``, test-only configs) a non-gap stop fills
+at ``(stop - k * (stop - low)) * (1 - s)``: such a stop-loss must then be at most -1R, and a
+loss below -1R without a gap is accepted ONLY for these stressed stop-losses.
 
 Checked across trades (``cross_trade_violations``, which needs only the journal rows and
 the config, so it also audits a live / testnet journal of real fill times): no pyramiding;
@@ -51,11 +54,28 @@ was certain, i.e. the pair's next entry decision is at least that late (R9, A2);
 while the 7-day realized loss halt is active (R9, recomputed from the closed pnl). The
 backtest audit adds: equity curve and final equity consistent with the trades.
 
+Live / testnet journals (``live_journal_violations``, CLI ``--live-journal``; CONTRACT v4
+D5): the journal holds REAL fill times, so every exit counts from ``exit_ts`` itself (exit
+offset 0), open positions are legal, and the backtest fill-price identities (entry = next
+open plus slippage, exit = modelled price, exact -1R / +RR outcomes, fees = fee_rate on both
+legs) are NOT asserted. Checked instead, per trade: R1-R4 and R8 re-derived at its
+``signal_ts`` from the supplied candles (the signal candle must be in the data); the fill
+lies in ``[signal close, signal close + timeframe)`` (never before the decision, never on a
+stale one); the planned geometry (stop < entry < target, net and price reward:risk >=
+``reward_risk``, ``risk_amount == qty * L_u``, stop distance within bounds, the R7 cap) and
+the R7 cap measured on the realized equity at the fill; exits never paused (no candle lying
+wholly between the fill and the recorded exit, or after the fill of a still-open trade,
+reached the stop (low <= stop) or traded through the target (high > target)); the pnl / R
+arithmetic of the recorded fees. Across trades: R6 and R9 at offset 0, and R5 only when
+events are supplied (without them R5 is not journal-verifiable and the CLI says so).
+
 CLI (exit code 1 if any violation is found)::
 
     python -m research.trendbot.invariants --journal trades.csv --data-dir research/data \
         [--events events.csv] [--start-ts MS] [--end-ts MS] \
         [--config overrides.json] [--fee-rate F] [--slippage-pct S]
+    python -m research.trendbot.invariants --live-journal testnet.csv --data-dir DIR \
+        [--events events.csv] [--starting-equity X] [--config ...] [--fee-rate F] ...
     python -m research.trendbot.invariants --synthetic planted --seed 1 [--years 6] [--gaps]
 
 Audit a journal against the candles it was traded on (the journal must hold every trade of
@@ -302,12 +322,12 @@ def _check_timing(t: Trade, a: _Audit) -> list[str]:
     return out
 
 
-def _check_gates(t: Trade, a: _Audit) -> list[str]:
-    pd = a.pairs[t.pair]
+def _check_gates(t: Trade, pd: _PairData, cfg: StrategyConfig) -> list[str]:
+    """R1-R4 on the signal candle, re-derived from the candles (compute_features)."""
     i = pd.index.get(t.signal_ts)
     if i is None:
-        return []  # reported by _check_timing
-    row, cfg = pd.rows[i], a.cfg
+        return []  # reported by the timing check
+    row = pd.rows[i]
     fast, slow, reg, rsi, vol = row.ema_fast, row.ema_slow, row.ema_regime, row.rsi, row.vol_ratio
     out: list[str] = []
     if fast is None or slow is None or not (row.close > fast and row.close > slow and fast > slow):
@@ -328,8 +348,14 @@ def _is_confirmed_pivot(candles: Sequence[Candle], j: int, i: int, k: int) -> bo
     return all(low < candles[j - m].low and low < candles[j + m].low for m in range(1, k + 1))
 
 
-def _check_structure(t: Trade, a: _Audit) -> list[str]:
-    pd, cfg = a.pairs[t.pair], a.cfg
+_STOP_METHODS = ("pivot", "lookback_low")
+
+
+def _check_structure(t: Trade, pd: _PairData, cfg: StrategyConfig) -> list[str]:
+    """R8: the stop sits ``buffer`` below a low that was a confirmed pivot (or the fallback
+    lookback low) at the close of the signal candle. A trade labelled "pivot" or
+    "lookback_low" must match that construction; a foreign label (an imported bot journal,
+    ``stop_method="external"``) may match either."""
     i = pd.index.get(t.signal_ts)
     if i is None:
         return []
@@ -354,6 +380,8 @@ def _check_structure(t: Trade, a: _Audit) -> list[str]:
         lookback = j >= fb_lo and low == fb_min
         if (t.stop_method == "pivot" and pivot) or (t.stop_method == "lookback_low" and lookback):
             return out
+        if t.stop_method not in _STOP_METHODS and (pivot or lookback):
+            return out
     out.append(
         f"{_who(t)} stop {t.stop:.8g} ({t.stop_method}) is not {buffer:g}% below a swing low "
         "that was confirmed at decision time (R8)"
@@ -369,12 +397,15 @@ def _touch(c: Candle, stop: float, target: float) -> str | None:
     return None
 
 
-def _expected_exit_price(c: Candle, reason: str, t: Trade, slip: float) -> float:
+def _expected_exit_price(c: Candle, reason: str, t: Trade, slip: float, wick_k: float) -> float:
     if reason == EXIT_TP:
         return t.target
     if reason == EXIT_END:
         return c.close * (1.0 - slip)
-    return (c.open if c.open <= t.stop else t.stop) * (1.0 - slip)
+    if c.open <= t.stop:
+        return c.open * (1.0 - slip)  # gap through the stop
+    # D4 stop-fill stress: a share wick_k of the way from the stop to the candle low.
+    return (t.stop - wick_k * (t.stop - c.low) if wick_k else t.stop) * (1.0 - slip)
 
 
 def _check_exit(t: Trade, a: _Audit) -> list[str]:
@@ -394,7 +425,7 @@ def _check_exit(t: Trade, a: _Audit) -> list[str]:
     reason = hit if hit is not None else (EXIT_END if x == len(pd.candles) - 1 else None)
     if reason != t.exit_reason:
         return [f"{_who(t)} recorded exit {t.exit_reason} but candle {_iso(c.ts)} implies {reason}"]
-    price = _expected_exit_price(c, reason, t, a.slip)
+    price = _expected_exit_price(c, reason, t, a.slip, a.cfg.stop_fill_wick_k)
     if t.exit_price is None or not _close(t.exit_price, price):
         return [f"{_who(t)} exit price {t.exit_price} != {price} implied by the exit model"]
     return []
@@ -419,20 +450,24 @@ def _check_accounting(t: Trade, a: _Audit) -> list[str]:
 
 
 def _check_r_outcome(t: Trade, a: _Audit) -> list[str]:
-    """A1 in R: clean SL exactly -1, TP exactly +reward_risk; only gap-through SLs below -1R."""
+    """A1 in R: clean SL exactly -1, TP exactly +reward_risk; only gap-through SLs below -1R,
+    or (D4, ``stop_fill_wick_k > 0`` only) stressed non-gap SLs."""
     r, x = t.r_multiple, a.pairs[t.pair].index.get(t.exit_ts or -1)
     if r is None or x is None:
         return []  # missing exits / candles are reported by _check_closed / _check_exit
     rr, reason = a.cfg.reward_risk, t.exit_reason
     gap = reason == EXIT_SL and a.pairs[t.pair].candles[x].open <= t.stop
+    stressed = reason == EXIT_SL and not gap and a.cfg.stop_fill_wick_k > 0
     out: list[str] = []
     if reason == EXIT_TP and abs(r - rr) > TOL:
         out.append(f"{_who(t)} take-profit made {r:.12f}R, not exactly +{rr:g}R net of costs (A1)")
-    if reason == EXIT_SL and not gap and abs(r + 1.0) > TOL:
+    if reason == EXIT_SL and not gap and not stressed and abs(r + 1.0) > TOL:
         out.append(f"{_who(t)} clean stop-loss made {r:.12f}R, not exactly -1R all-in (A1)")
+    if stressed and r > -1.0 + TOL:
+        out.append(f"{_who(t)} stressed stop-loss made {r:.12f}R, better than -1R (D4)")
     if gap and r > -1.0 + TOL:
         out.append(f"{_who(t)} gap-through stop-loss made {r:.12f}R, better than -1R (A1)")
-    if r < -1.0 - TOL and not gap:
+    if r < -1.0 - TOL and not gap and not stressed:
         out.append(f"{_who(t)} lost {r:.6f}R, below -1R without a gap through the stop (A1)")
     if r > rr + TOL and reason != EXIT_TP:
         out.append(f"{_who(t)} made {r:.6f}R, above the +{rr:g}R take-profit (A1)")
@@ -737,8 +772,8 @@ def check_invariants(
         out.extend(closed)
         out.extend(_check_geometry(t, audit.cfg))
         out.extend(_check_timing(t, audit))
-        out.extend(_check_gates(t, audit))
-        out.extend(_check_structure(t, audit))
+        out.extend(_check_gates(t, audit.pairs[t.pair], audit.cfg))
+        out.extend(_check_structure(t, audit.pairs[t.pair], audit.cfg))
         if not closed:
             out.extend(_check_exit(t, audit))
             out.extend(_check_accounting(t, audit))
@@ -746,6 +781,128 @@ def check_invariants(
     # Backtest timing: exit_ts is the exit candle OPEN, the exit is certain at its close.
     out.extend(cross_trade_violations(audit.trades, audit.cfg, list(events), audit.tf))
     out.extend(_check_equity(audit))
+    return out
+
+
+# ---------------------------------------------------------------------------- live journals
+def _pair_data(candles: Iterable[Candle], cfg: StrategyConfig) -> _PairData:
+    rows = list(candles)
+    return _PairData(rows, {c.ts: k for k, c in enumerate(rows)}, compute_features(rows, cfg))
+
+
+def _check_live_record(t: Trade) -> list[str]:
+    """Exit fields all set (closed) or all empty (open); pnl / R arithmetic of the RECORDED
+    fees (live fees may differ from ``fee_rate``, so they are not recomputed)."""
+    values = (t.exit_ts, t.exit_price, t.exit_reason, t.pnl, t.r_multiple)
+    if all(v is None for v in values):
+        return []
+    if any(v is None for v in values):
+        return [f"{_who(t)} is half-closed (exit_ts, exit_price, exit_reason, pnl, r_multiple)"]
+    if t.exit_reason not in (EXIT_SL, EXIT_TP, EXIT_END):
+        return [f"{_who(t)} has unknown exit reason {t.exit_reason!r}"]
+    out: list[str] = []
+    exit_ts, exit_price, pnl, r = (
+        int(t.exit_ts),
+        float(t.exit_price),
+        float(t.pnl),
+        float(t.r_multiple),
+    )  # all set: checked just above
+    if exit_ts < t.entry_ts:
+        out.append(f"{_who(t)} exits at {_iso(exit_ts)} before its entry")
+    expected = t.qty * (exit_price - t.entry_price) - t.fees
+    if t.fees < 0 or abs(pnl - expected) > TOL * max(t.risk_amount, 1e-12):
+        out.append(f"{_who(t)} pnl {pnl} != qty * (exit - entry) - fees {expected}")
+    if abs(r - pnl / t.risk_amount) > TOL:
+        out.append(f"{_who(t)} r_multiple {r} != pnl / planned risk")
+    return out
+
+
+def _check_live_timing(t: Trade, pd: _PairData, cfg: StrategyConfig) -> list[str]:
+    """The signal candle is in the data and the fill lies in its fill candle."""
+    if t.signal_ts not in pd.index:
+        return [f"{_who(t)} has no signal candle in the supplied data (R1-R4/R8 unverifiable)"]
+    d, tf = decision_time(t, cfg), cfg.timeframe_ms
+    if t.entry_ts < d:
+        return [f"{_who(t)} filled at {_iso(t.entry_ts)}, before its signal candle closed"]
+    if t.entry_ts >= d + tf:
+        return [
+            f"{_who(t)} filled at {_iso(t.entry_ts)}, more than one candle after the decision "
+            f"at {_iso(d)} (stale signal)"
+        ]
+    return []
+
+
+def _check_live_exit(t: Trade, pd: _PairData, cfg: StrategyConfig) -> list[str]:
+    """Exits never paused: no candle wholly inside (fill, exit) -- or after the fill of a
+    still-open trade -- reached the stop (low <= stop) or traded through the target."""
+    tf = cfg.timeframe_ms
+    start = bisect_left([c.ts for c in pd.candles], t.entry_ts)
+    for c in pd.candles[start:]:
+        if t.exit_ts is not None and c.ts + tf > t.exit_ts:
+            break
+        level = "stop" if c.low <= t.stop else "target" if c.high > t.target else None
+        if level is None:
+            continue
+        state = "is still open" if t.exit_ts is None else f"exits only at {_iso(t.exit_ts)}"
+        return [
+            f"{_who(t)} exit delayed: its {level} was reached in the candle of "
+            f"{_iso(c.ts)} but it {state} (exits are never paused)"
+        ]
+    return []
+
+
+def _check_live_risk(t: Trade, ledger: _Ledger, cfg: StrategyConfig) -> list[str]:
+    """R7 on the realized equity at the decision (known exits only, offset 0)."""
+    equity = ledger.equity_before(decision_time(t, cfg))
+    cap = min(cfg.risk_for(t.pair).max_risk_pct, MANDATE_MAX_RISK_PCT.get(base_of(t.pair), 0.0))
+    if equity <= 0:
+        return [f"{_who(t)} entered with a realized equity of {equity:.2f}"]
+    pct = t.risk_amount / equity * 100.0
+    if pct > cap * (1.0 + 1e-7):
+        return [
+            f"{_who(t)} risks {pct:.6f}% of the realized equity {equity:.2f} at its decision, "
+            f"above the {cap:g}% cap (R7)"
+        ]
+    return []
+
+
+def live_journal_violations(
+    trades: Iterable[Trade],
+    data: Mapping[str, Sequence[Candle]],
+    cfg: StrategyConfig,
+    events: Iterable[NewsEvent] | None = None,
+    starting_equity: float | None = None,
+) -> list[str]:
+    """Audit a LIVE / testnet journal (real fill times) against the candles it traded on.
+
+    D5 live-journal mode (see the module docstring): exit offset 0; per trade R1-R4 and R8
+    re-derived at ``signal_ts`` from ``data`` (a trade whose signal candle is missing is a
+    violation), fill inside the signal's fill candle, planned geometry and R7 (also against
+    the realized equity from ``starting_equity``, default ``cfg.starting_capital``), exits
+    never paused, pnl / R arithmetic; across trades ``cross_trade_violations`` at offset 0
+    (R6, R9, and R5 only if ``events`` is given). Open trades are allowed. The backtest
+    fill-price identities are not asserted. Returns one sentence per violation.
+    """
+    rows = list(trades)
+    pairs = {pair: _pair_data(data.get(pair, ()), cfg) for pair in sorted({t.pair for t in rows})}
+    ledger = _Ledger(rows, cfg, 0, starting_equity)
+    out: list[str] = []
+    ids = [t.trade_id for t in rows]
+    if len(set(ids)) != len(ids):
+        out.append("duplicate trade ids in the journal")
+    for t in sorted(rows, key=lambda t: (t.signal_ts, t.trade_id)):
+        pd = pairs[t.pair]
+        if not pd.candles:
+            out.append(f"{_who(t)} has no candle data")
+            continue
+        out.extend(_check_live_record(t))
+        out.extend(_check_geometry(t, cfg))
+        out.extend(_check_live_timing(t, pd, cfg))
+        out.extend(_check_gates(t, pd, cfg))
+        out.extend(_check_structure(t, pd, cfg))
+        out.extend(_check_live_exit(t, pd, cfg))
+        out.extend(_check_live_risk(t, ledger, cfg))
+    out.extend(cross_trade_violations(rows, cfg, events, 0, starting_equity))
     return out
 
 
@@ -772,9 +929,22 @@ def _parser() -> argparse.ArgumentParser:
         description="Independently audit a trade list against every mandatory rule.",
     )
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--journal", help="trade journal CSV (journal.write_journal format)")
+    src.add_argument("--journal", help="BACKTEST journal CSV (journal.write_journal format)")
+    src.add_argument(
+        "--live-journal",
+        help="LIVE / testnet journal CSV of real fill times: exit offset 0, per-trade R1-R5/R8 "
+        "re-derived from --data-dir candles and --events, no backtest fill-price identities",
+    )
     src.add_argument("--synthetic", choices=WORLDS, help="run and audit a synthetic world")
-    p.add_argument("--data-dir", help="candle CSV directory (required with --journal)")
+    p.add_argument(
+        "--data-dir", help="candle CSV directory (required with --journal / --live-journal)"
+    )
+    p.add_argument(
+        "--starting-equity",
+        type=float,
+        default=None,
+        help="--live-journal: account equity before the first trade (default: the config's)",
+    )
     p.add_argument("--events", help="news calendar CSV (time_utc,scope,impact,kind,note)")
     p.add_argument("--start-ts", type=int, default=None, help="window start used by the run")
     p.add_argument("--end-ts", type=int, default=None, help="window end used by the run")
@@ -815,13 +985,20 @@ def load_cli_config(
     return config_from_overrides(overrides)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
-    try:
-        cfg = load_cli_config(args.config, args.fee_rate, args.slippage_pct)
-    except (ConfigError, ValueError, OSError) as exc:
-        parser.error(f"invalid --config / cost flags: {exc}")
+def _audit_live(args: argparse.Namespace, cfg: StrategyConfig) -> tuple[str, int, list[str]]:
+    trades = read_journal(args.live_journal)
+    data = load_dataset(args.data_dir, sorted({t.pair for t in trades}), args.timeframe)
+    events = load_events(args.events) if args.events else None
+    violations = live_journal_violations(trades, data, cfg, events, args.starting_equity)
+    r5 = (
+        f"R5 checked against {len(events)} event(s)"
+        if events is not None
+        else "R5 NOT checked: no --events given (R5 is not journal-verifiable without them)"
+    )
+    return f"live journal {args.live_journal} (exit offset 0; {r5})", len(trades), violations
+
+
+def _audit_backtest(args: argparse.Namespace, cfg: StrategyConfig) -> tuple[str, int, list[str]]:
     events: list[NewsEvent] = load_events(args.events) if args.events else []
     window = (args.start_ts, args.end_ts)
     if args.synthetic:
@@ -829,18 +1006,31 @@ def main(argv: list[str] | None = None) -> int:
         result = run_backtest(data, cfg, events, start_ts=window[0], end_ts=window[1])
         label = f"synthetic {args.synthetic} seed {args.seed}" + (" (gaps)" if args.gaps else "")
     else:
-        if not args.data_dir:
-            parser.error("--data-dir is required with --journal")
         trades = read_journal(args.journal)
         data = load_dataset(args.data_dir, sorted({t.pair for t in trades}), args.timeframe)
         result = result_from_journal(trades, cfg, window, bool(events))
         label = f"journal {args.journal}"
-    violations = check_invariants(result, data, events, cfg)
+    return label, len(result.trades), check_invariants(result, data, events, cfg)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        cfg = load_cli_config(args.config, args.fee_rate, args.slippage_pct)
+    except (ConfigError, ValueError, OSError) as exc:
+        parser.error(f"invalid --config / cost flags: {exc}")
+    if not args.synthetic and not args.data_dir:
+        parser.error("--data-dir is required with --journal / --live-journal")
+    if args.live_journal:
+        label, n, violations = _audit_live(args, cfg)
+    else:
+        label, n, violations = _audit_backtest(args, cfg)
     print(
         f"config: {cfg.variant_id()}, fee_rate {cfg.fee_rate:g}/side, slippage "
         f"{cfg.slippage_pct:g}%, exchange {cfg.exchange_id}"
     )
-    print(f"{label}: {len(result.trades)} trades audited, {len(violations)} violation(s).")
+    print(f"{label}: {n} trades audited, {len(violations)} violation(s).")
     for v in violations:
         print(f"- {v}")
     return 1 if violations else 0

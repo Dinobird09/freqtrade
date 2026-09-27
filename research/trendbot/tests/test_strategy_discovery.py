@@ -68,10 +68,26 @@ def test_regime_off_is_the_one_test_only_variant() -> None:
     assert off.variant_id().endswith("regimeOFF")
 
 
-def test_discover_refuses_a_test_only_base(world) -> None:
+def test_discover_refuses_a_regime_off_base(world) -> None:
     data, events, _ = world
-    with pytest.raises(ValueError, match="production base"):
+    with pytest.raises(ValueError, match="R4 regime filter ON"):
         sd.discover(data, sd.regime_off_variant(BASE), events)
+
+
+def test_a_stop_fill_stress_base_stresses_the_whole_grid(world) -> None:
+    """D4: the stress is an execution assumption applied to every variant, so selection
+    still runs among the (stressed) grid; only regime OFF is never selectable, and every
+    config of the run is test-only (never adoptable)."""
+    data, events, _split = world
+    stressed = BASE.with_changes(stop_fill_wick_k=0.5)
+    grid = sd.default_grid(stressed)[:3]
+    res = sd.discover(data, stressed, events, min_train=MIN_TRAIN, min_test=MIN_TRAIN, grid=grid)
+    assert all(r.cfg.stop_fill_wick_k == 0.5 and r.cfg.is_test_only for r in res.results)
+    assert len(res.test_only) == 1 and res.test_only[0].endswith("regimeOFF_wick0.5")
+    assert res.selection.k_eligible_by_design == 3
+    assert res.selection.variant is not None and res.selection.variant not in res.test_only
+    assert sd.never_selectable(sd.regime_off_variant(stressed))
+    assert not sd.never_selectable(stressed)
 
 
 # ---------------------------------------------------------------------------- selection

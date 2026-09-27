@@ -35,12 +35,19 @@ Label (:func:`label`), rules applied in order, never tuned on TEST outcomes:
    distinguishable from zero after multiplicity correction")
 6. otherwise                                               -> ROBUST
 
-Drawdown (CONTRACT.md v3 C5, :func:`dd_check`): the realised (closed-trade) max drawdown is
-``Summary.max_dd_pct``; the mark-to-market one (:func:`mtm_max_dd_pct`) values open positions
-at every 4H close. ``dd_ok`` requires the TEST MTM max drawdown to be at most
-``min(20 %, the 95th percentile of the max drawdown of TRAIN trade sequences bootstrapped at
-the TEST length)`` (:func:`train_dd_quantile`), in percent of equity at the risk each trade
-actually took.
+Drawdown (CONTRACT.md v3 C5 as revised by v4 D7, :func:`dd_check`): the realised
+(closed-trade) max drawdown is ``Summary.max_dd_pct``; the mark-to-market one
+(:func:`mtm_max_dd_pct`) values open positions at every 4H close. ``dd_ok`` requires the TEST
+MTM max drawdown to be at most ``min(DD_CAP_PCT = 15 %, the 95th percentile of the max
+drawdown of TRAIN trade sequences bootstrapped at the TEST length)``
+(:func:`train_dd_quantile`), in percent of equity at the risk each trade actually took.
+
+Why the cap is 15 % (D7, :data:`DD_CAP_RATIONALE`): at the mandated 1 % cluster risk budget a
+15 % drawdown is about 15 consecutive full-size losses. At the 2:1 break-even win probability
+p* = 1/3 such a streak has probability (2/3)^15 = 0.23 %, so a TEST drawdown beyond it is
+inconsistent with even a break-even strategy traded at the mandated risk. The TRAIN-bootstrap
+p95 bound usually binds first. The 3 % weekly-loss halt (R9) limits how FAST a drawdown can
+accrue, not how DEEP it can go, so it does not replace this cap.
 """
 
 from __future__ import annotations
@@ -63,7 +70,17 @@ N_BOOT = 4000  # bootstrap resamples (C4: >= 4000)
 M_CANDIDATES = 4  # pre-registered TEST looks: base, discovery-selected, base+ml, base+guard
 ALPHA = 0.05  # family-wise error rate spread over the m candidates (Bonferroni)
 ROBUST_MIN_N = 30  # ROBUST needs at least this many trades in EACH window (C4)
-DD_CAP_PCT = 20.0  # the TEST drawdown limit is never above 20 % (C5)
+DD_CAP_PCT = 15.0  # the TEST drawdown limit is never above 15 % (C5, revised by v4 D7)
+BREAKEVEN_WIN_P = 1.0 / 3.0  # break-even win probability at the mandated 2:1 (p* = 1/(1+2))
+DD_CAP_STREAK_P = (1.0 - BREAKEVEN_WIN_P) ** round(DD_CAP_PCT)  # (2/3)^15 = 0.23 %
+DD_CAP_RATIONALE = (
+    f"the {DD_CAP_PCT:g}% cap is about {DD_CAP_PCT:g} consecutive full-size losses at the "
+    f"mandated 1% cluster risk budget; at the 2:1 break-even win probability p* = 1/3 such a "
+    f"streak has probability (2/3)^{DD_CAP_PCT:g} = {DD_CAP_STREAK_P:.2%}, so a TEST drawdown "
+    "beyond it is inconsistent with even a break-even strategy at the mandated risk (the "
+    "TRAIN-bootstrap p95 usually binds first; the 3% weekly-loss halt limits how fast a "
+    "drawdown accrues, not how deep it goes)"
+)
 DD_QUANTILE = 0.95  # C5: 95th percentile of bootstrapped TRAIN max drawdowns
 BLOCK_SEED_OFFSET = 1  # the block bootstrap uses random.Random(seed + 1)
 NOT_DISTINGUISHABLE = "positive but not distinguishable from zero after multiplicity correction"
@@ -515,7 +532,8 @@ def mtm_max_dd_pct(
 
 
 def dd_limit(max_dd_pct: float = DD_CAP_PCT, train_dd_p95_pct: float | None = None) -> float:
-    """The C5 limit ``min(20 %, max_dd_pct, TRAIN bootstrap p95)`` (None p95 = not given)."""
+    """The C5/D7 limit ``min(DD_CAP_PCT = 15 %, max_dd_pct, TRAIN bootstrap p95)`` (None p95 =
+    not given). ``max_dd_pct`` can only tighten the cap, never loosen it."""
     limit = min(DD_CAP_PCT, float(max_dd_pct))
     if train_dd_p95_pct is not None:
         limit = min(limit, float(train_dd_p95_pct))

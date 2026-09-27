@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import random
+import re
 from dataclasses import replace
 from functools import cache
 from pathlib import Path
@@ -28,6 +29,7 @@ from research.trendbot.invariants import (
     blocked_open_trades,
     check_invariants,
     cross_trade_violations,
+    live_journal_violations,
     load_cli_config,
     main,
     result_from_journal,
@@ -51,6 +53,7 @@ from research.trendbot.tests.bt_helpers import (
     Scenario,
     bench_scenario,
     data_of,
+    drive_live_session,
     news,
     slot,
     ts,
@@ -654,3 +657,213 @@ def test_cli_runs_and_audits_a_synthetic_world(capsys):
     assert "synthetic decay seed 2" in capsys.readouterr().out
     assert main(["--synthetic", "zero_edge", "--seed", "2", "--years", "1.5", "--gaps"]) == 0
     assert "synthetic zero_edge seed 2 (gaps)" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------- D4 stop-fill stress
+@cache
+def stressed_run(k: float = 0.5):
+    data, events = world("planted")
+    cfg = CFG.with_changes(stop_fill_wick_k=k)
+    return data, events, cfg, run_backtest(data, cfg, events)
+
+
+def _gap(t, data) -> bool:
+    return next(c for c in data[t.pair] if c.ts == t.exit_ts).open <= t.stop
+
+
+def test_stop_fill_stress_run_is_clean_only_under_its_own_config():
+    data, events, cfg, res = stressed_run()
+    clean_sl = [t for t in res.trades if t.exit_reason == EXIT_SL and not _gap(t, data)]
+    assert len(clean_sl) > 20 and all(t.r_multiple < -1.0 for t in clean_sl)
+    assert all(abs(t.r_multiple - 2.0) < 1e-9 for t in res.trades if t.exit_reason == EXIT_TP)
+    assert check_invariants(res, data, events, cfg) == []
+    # Audited as a default (k = 0) run, the same trades are violations: r < -1 on non-gap
+    # stops is accepted ONLY when the config says the stress model was used.
+    msgs = check_invariants(res, data, events, CFG)
+    assert any("below -1R without a gap" in m for m in msgs)
+    assert any("implied by the exit model" in m for m in msgs)
+
+
+def test_stressed_stop_reported_at_the_touch_price_is_caught():
+    data, events, cfg, res = stressed_run()
+    bad = replace(res, trades=copy.deepcopy(res.trades))
+    t = next(t for t in bad.trades if t.exit_reason == EXIT_SL and not _gap(t, data))
+    _resettle(t, t.stop * (1 - CFG.slippage_pct / 100) * 1.001)  # better than even the touch
+    msgs = check_invariants(bad, data, events, cfg)
+    assert any("implied by the exit model" in m for m in msgs)
+    assert any("stressed stop-loss made" in m and "(D4)" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------- D5 live journals
+@cache
+def live_run():
+    """A LiveSession journal with REAL (mid-candle) exit times: offset 0, as on testnet."""
+    data, events = world("planted")
+    run = drive_live_session(data, CFG, events, exit_time_uncertainty_ms=0, exit_fill_ms=TF // 2)
+    return data, events, run.trades
+
+
+def test_live_session_journal_is_clean_in_live_mode():
+    data, events, trades = live_run()
+    assert len(trades) > 30
+    assert live_journal_violations(trades, data, CFG, events) == []
+    assert live_journal_violations(trades, data, CFG) == []  # R5 skipped without events
+    # Read as a BACKTEST journal it is not: its exit times are not candle opens.
+    assert check_invariants(result_from_journal(trades, CFG), data, events, CFG) != []
+
+
+def test_open_positions_are_legal_until_their_stop_is_reached():
+    data, events, trades = live_run()
+    rows = copy.deepcopy(trades)
+    last = rows[-1]
+    exit_candle = last.exit_ts - TF // 2
+    last.exit_ts = last.exit_price = last.exit_reason = last.pnl = last.r_multiple = None
+    last.fees = 0.0
+    cut = {p: [c for c in cs if c.ts < exit_candle] for p, cs in data.items()}
+    assert live_journal_violations(rows, cut, CFG, events) == []
+    # With the candle that reached its stop / target supplied, a still-open trade is a
+    # paused exit.
+    msgs = live_journal_violations(rows, data, CFG, events)
+    assert any("exit delayed" in m and "is still open" in m for m in msgs), msgs
+
+
+def _live_signal_shifted(rows, data, events):
+    t = rows[3]
+    t.signal_ts -= 3 * TF
+    t.entry_ts -= 3 * TF
+
+
+def _live_before_the_close(rows, data, events):
+    rows[4].entry_ts -= 60_000
+
+
+def _live_stale(rows, data, events):
+    rows[4].entry_ts += TF
+
+
+def _live_stop_above_structure(rows, data, events):
+    t = rows[2]
+    t.stop *= 1.004
+    t.risk_amount = t.qty * unit_loss(t.entry_price, t.stop, CFG)
+
+
+def _live_exit_delayed(rows, data, events):
+    t = next(t for t in rows if t.exit_reason == EXIT_SL)
+    t.exit_ts += 2 * TF
+
+
+def _live_oversized(rows, data, events):
+    t = rows[5]  # 1.5x the size while still claiming 1 %: only the equity check sees it
+    for name in ("qty", "risk_amount", "fees", "pnl"):
+        setattr(t, name, getattr(t, name) * 1.5)
+
+
+def _live_bnb_stacks(rows, data, events):
+    t = copy.deepcopy(next(t for t in rows if t.pair == "BTC/USDT"))
+    t.trade_id, t.pair = 10_001, "BNB/USDT"
+    rows.append(t)
+
+
+def _bench_rows(rows, after_open_h: float):
+    """Make the first pair's first three trades stop-losses and move its 4th entry to the
+    candle close ``after_open_h`` hours after the OPEN of the 3rd stop-loss's exit candle
+    (its real fill is half a candle later)."""
+    mine = [t for t in rows if t.pair == rows[0].pair]
+    for t in mine[:3]:
+        t.exit_reason = EXIT_SL
+    decided = mine[2].exit_ts - TF // 2 + round(after_open_h * HOUR_MS)
+    mine[3].signal_ts, mine[3].entry_ts = decided - TF, decided
+    return mine[3]
+
+
+def _live_bench_ignored(rows, data, events):
+    _bench_rows(rows, 24)  # 24h after the exit candle opened = only 22h after the real fill
+
+
+def _live_news(rows, data, events):
+    t = rows[6]
+    events.append(NewsEvent(t.signal_ts + TF + HOUR_MS, "ALL", "high", "macro", "planted"))
+
+
+def _live_missing_candle(rows, data, events):
+    t = rows[7]
+    data[t.pair] = [c for c in data[t.pair] if c.ts != t.signal_ts]
+
+
+def _live_half_closed(rows, data, events):
+    rows[8].pnl = None
+
+
+@pytest.mark.parametrize(
+    ("corruption", "pattern"),
+    [
+        (_live_signal_shifted, r"R1 trend|\(R[2348]\)"),
+        (_live_before_the_close, "before its signal candle closed"),
+        (_live_stale, "stale signal"),
+        (_live_stop_above_structure, r"\(R8\)"),
+        (_live_exit_delayed, "exit delayed"),
+        (_live_oversized, r"of the realized equity .* above the 1% cap \(R7\)"),
+        (_live_bnb_stacks, "BNB never stacks"),
+        (_live_bench_ignored, "benched"),
+        (_live_news, r"\(R5\)"),
+        (_live_missing_candle, "no signal candle in the supplied data"),
+        (_live_half_closed, "half-closed"),
+    ],
+)
+def test_live_mode_catches_each_violation(corruption, pattern):
+    data, events, trades = live_run()
+    rows, data, events = copy.deepcopy(trades), dict(data), list(events)
+    corruption(rows, data, events)
+    msgs = live_journal_violations(rows, data, CFG, events)
+    assert any(re.search(pattern, m) for m in msgs), msgs[:5]
+
+
+def test_live_mode_bench_runs_24h_from_the_real_fill():
+    """Offset 0: the bench runs 24h from the REAL fill of the 3rd stop-loss. A decision 22h
+    after it is benched; one 26h after it is legal in live mode, although the same rows read
+    with the backtest offset (exit certain a candle later) would still be benched."""
+    data, events, trades = live_run()
+    early = copy.deepcopy(trades)
+    victim = _bench_rows(early, 24)
+    msgs = live_journal_violations(early, data, CFG, events)
+    assert any(f"#{victim.trade_id} " in m and "benched" in m for m in msgs), msgs
+    late = copy.deepcopy(trades)
+    victim = _bench_rows(late, 24 + TF / HOUR_MS)
+    assert [m for m in live_journal_violations(late, data, CFG, events) if "(R9)" in m] == []
+    backtest_offset = cross_trade_violations(late, CFG, None, TF)
+    assert any(f"#{victim.trade_id} " in m and "benched" in m for m in backtest_offset)
+
+
+def _live_files(root: Path, trades, events) -> list[str]:
+    data, _events, _trades = live_run()
+    for pair, candles in data.items():
+        save_candles_csv(candles, root / "data" / pair_filename(pair))
+    (root / "events.csv").write_text(
+        "time_utc,scope,impact,kind,note\n"
+        + "".join(f"{e.ts},{e.scope},{e.impact},{e.kind},{e.note}\n" for e in events)
+    )
+    write_journal(trades, root / "testnet.csv")
+    return ["--live-journal", str(root / "testnet.csv"), "--data-dir", str(root / "data")]
+
+
+def test_cli_live_journal_mode(tmp_path, capsys):
+    _data, events, trades = live_run()
+    argv = _live_files(tmp_path, trades, events)
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "exit offset 0" in out and "R5 NOT checked" in out and "0 violation(s)" in out
+    assert main([*argv, "--events", str(tmp_path / "events.csv")]) == 0
+    assert f"R5 checked against {len(events)} event(s)" in capsys.readouterr().out
+    # The same journal on a 5,000 account: every full-size trade risked 2 % of it (R7).
+    assert main([*argv, "--starting-equity", "5000"]) == 1
+    assert "(R7)" in capsys.readouterr().out
+    tampered = copy.deepcopy(trades)
+    tampered[2].stop *= 1.004
+    tampered[2].risk_amount = tampered[2].qty * unit_loss(
+        tampered[2].entry_price, tampered[2].stop, CFG
+    )
+    write_journal(tampered, tmp_path / "testnet.csv")
+    assert main(argv) == 1
+    assert "(R8)" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["--live-journal", str(tmp_path / "testnet.csv")])  # --data-dir is required

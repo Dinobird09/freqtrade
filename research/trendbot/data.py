@@ -17,14 +17,33 @@ source instead of leaking into a backtest. Missing candles are NOT an error; use
 ``gap_report`` to list them.
 
 The timeframe is verified whenever it is known (``load_dataset``, or ``load_candles_csv``
-with ``timeframe=``): every spacing between consecutive candles must be a whole multiple of
-the timeframe and the SMALLEST spacing must equal it, so a 1h or a 1d file saved under a
-``-4h.csv`` name is refused with the offending line numbers and timestamps.
+with ``timeframe=``):
+
+- every candle must be EPOCH-ALIGNED, ``ts % timeframe_ms == 0`` (CONTRACT v4 D2): exchange 4H
+  candles open at 00:00, 04:00, ... UTC, so a file whose clock is shifted (e.g. by a local
+  time zone or a DST hour) is refused with the first offending line and ts instead of
+  silently moving every decision time. Week-multiple timeframes are the one exception: they
+  are aligned to Monday 00:00 UTC (``ts % tf == 4 days``), the convention of exchange weekly
+  candles (1970-01-01 was a Thursday);
+- every spacing between consecutive candles must be a whole multiple of the timeframe and
+  the SMALLEST spacing must equal it, so a 1h or a 1d file saved under a ``-4h.csv`` name is
+  refused with the offending line numbers and timestamps.
+
+Provenance (CONTRACT v4 D2): ``fetch_data`` writes ``manifest.json`` next to the candle files
+(exchange id, ccxt version, symbols, timeframe, since/until, fetched_at_utc and, per file,
+name, symbol, rows, first/last ts and sha256). :func:`verify_manifest` returns ``"real"`` only
+when every requested file is listed there with a matching sha256 (and matching symbol,
+timeframe, rows and first/last ts), else ``"unverified-csv"``. An offline check cannot
+authenticate an exchange download: the manifest proves only that the files are byte-identical
+to what was recorded, so it makes a laundered or hand-edited CSV a deliberate act (someone has
+to rewrite the manifest) instead of an accident.
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 import re
 from collections.abc import Iterable, Sequence
@@ -41,6 +60,18 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _ONE_MS = timedelta(milliseconds=1)
 _ISO_PREFIX = re.compile(r"\d{4}-\d{2}-\d{2}([T ]|$)")  # extended format only: YYYY-MM-DD
 _UNIT_MS = {"m": 60_000, "h": HOUR_MS, "d": DAY_MS, "w": 7 * DAY_MS}
+_WEEK_MS = 7 * DAY_MS
+_MONDAY_ANCHOR_MS = 4 * DAY_MS  # 1970-01-05T00:00Z, the first Monday after the epoch
+
+MANIFEST_NAME = "manifest.json"
+MANIFEST_FORMAT = "trendbot-candle-manifest/1"
+PROVENANCE_REAL = "real"
+PROVENANCE_UNVERIFIED = "unverified-csv"
+MANIFEST_NOTE = (
+    "An offline check cannot authenticate an exchange download: manifest.json only shows that "
+    "the candle files are byte-identical to what fetch_data recorded (or to what someone "
+    "deliberately wrote into it). It makes a laundered CSV a deliberate act, not an accident."
+)
 
 
 # ---------------------------------------------------------------------- time helpers
@@ -113,11 +144,38 @@ def _order_problem(prev_ts: int | None, ts: int) -> str | None:
     return f"ts {ts} ({ts_to_iso(ts)}) is not after the previous row ({ts_to_iso(prev_ts)})"
 
 
-def validate_candles(candles: Sequence[Candle]) -> None:
-    """Apply the loader's checks to in-memory candles; raise ValueError naming the index."""
+def alignment_offset(ts: int, timeframe_ms: int) -> int:
+    """How far ``ts`` lies past the latest candle boundary of ``timeframe_ms`` (0 = aligned).
+
+    Boundaries are multiples of the timeframe since the epoch; for week multiples they are
+    shifted to Monday 00:00 UTC (the exchange convention for weekly candles).
+    """
+    anchor = _MONDAY_ANCHOR_MS if timeframe_ms % _WEEK_MS == 0 else 0
+    return (ts - anchor) % timeframe_ms
+
+
+def _alignment_problem(ts: int, tf_ms: int) -> str | None:
+    off = alignment_offset(ts, tf_ms)
+    if not off:
+        return None
+    tf = _fmt_span(tf_ms)
+    return (
+        f"ts {ts} ({ts_to_iso(ts)}) is not epoch-aligned: {tf} candles open at multiples of "
+        f"{tf} since 1970-01-01T00:00Z, this one is {_fmt_span(off)} past a boundary "
+        "(shifted clock or local-time export?)"
+    )
+
+
+def validate_candles(candles: Sequence[Candle], timeframe_ms: int | None = None) -> None:
+    """Apply the loader's checks to in-memory candles; raise ValueError naming the index.
+
+    With ``timeframe_ms`` every candle must also be epoch-aligned (see the module docstring).
+    """
     prev_ts: int | None = None
     for i, c in enumerate(candles):
         problem = candle_problem(c) or _order_problem(prev_ts, c.ts)
+        if problem is None and timeframe_ms is not None:
+            problem = _alignment_problem(c.ts, timeframe_ms)
         if problem:
             raise ValueError(f"candle #{i} (ts={c.ts}): {problem}")
         prev_ts = c.ts
@@ -172,6 +230,21 @@ def _fmt_span(ms: int) -> str:
     return f"{ms} ms"
 
 
+def _check_alignment(p: Path, rows: Sequence[tuple[int, Candle]], tf_ms: int) -> None:
+    """Refuse a file with any candle that does not open on a ``tf_ms`` boundary (D2)."""
+    for line, c in rows:
+        problem = _alignment_problem(c.ts, tf_ms)
+        if problem:
+            raise ValueError(f"{p}: line {line}: {problem}")
+
+
+def _check_timeframe(p: Path, rows: Sequence[tuple[int, Candle]], tf_ms: int) -> None:
+    """The spacing checks (a wrong timeframe is named as such), then the epoch alignment of
+    every candle (a correctly spaced but shifted file, e.g. +1h, fails here)."""
+    _check_spacing(p, rows, tf_ms)
+    _check_alignment(p, rows, tf_ms)
+
+
 def _check_spacing(p: Path, rows: Sequence[tuple[int, Candle]], tf_ms: int) -> None:
     """Refuse a file whose candles are not ``tf_ms`` candles (wrong or mixed timeframe).
 
@@ -208,9 +281,10 @@ def _check_spacing(p: Path, rows: Sequence[tuple[int, Candle]], tf_ms: int) -> N
 def load_candles_csv(path: str | Path, timeframe: str | int | None = None) -> list[Candle]:
     """Load and validate one candle file; raise ValueError with the 1-based line number.
 
-    With ``timeframe`` (``"4h"`` or milliseconds) the candle spacing is verified too: every
-    step a whole multiple of it and the smallest step EQUAL to it (see ``_check_spacing``),
-    so a file holding another timeframe is refused with the offending lines and timestamps.
+    With ``timeframe`` (``"4h"`` or milliseconds) every candle must be epoch-aligned
+    (``ts % timeframe_ms == 0``; the first misaligned line and ts are named) and the candle
+    spacing is verified: every step a whole multiple of it and the smallest step EQUAL to it
+    (see ``_check_spacing``), so a shifted file or one holding another timeframe is refused.
     """
     p = Path(path)
     rows = _read_rows(p)
@@ -218,7 +292,7 @@ def load_candles_csv(path: str | Path, timeframe: str | int | None = None) -> li
         tf_ms = timeframe if isinstance(timeframe, int) else timeframe_to_ms(timeframe)
         if isinstance(tf_ms, bool) or tf_ms <= 0:
             raise ValueError(f"timeframe must be > 0 ms, got {timeframe!r}")
-        _check_spacing(p, rows, tf_ms)
+        _check_timeframe(p, rows, tf_ms)
     return [c for _, c in rows]
 
 
@@ -250,10 +324,12 @@ def load_dataset(
 ) -> dict[str, list[Candle]]:
     """Load ``<data_dir>/<pair_filename>`` for every pair, in the given order.
 
-    Besides the per-file checks, every pair must be non-empty and hold ``timeframe``
-    candles: each spacing a whole multiple of the timeframe (gaps are allowed; see
+    Besides the per-file checks, every pair must be non-empty and hold epoch-aligned
+    ``timeframe`` candles: every ``ts % timeframe_ms == 0`` (a +1h-shifted 4H file is refused
+    at its first line), each spacing a whole multiple of the timeframe (gaps are allowed; see
     ``gap_report``) and the smallest spacing exactly one timeframe. That catches a 1h file
-    saved under a 4h name as well as a 1d file saved under a 4h name.
+    saved under a 4h name as well as a 1d file saved under a 4h name. Provenance is a
+    separate question: see :func:`verify_manifest`.
     """
     tf_ms = timeframe_to_ms(timeframe)
     root = Path(data_dir)
@@ -268,7 +344,7 @@ def load_dataset(
         rows = _read_rows(path)
         if not rows:
             raise ValueError(f"{path}: header only, no candles")
-        _check_spacing(path, rows, tf_ms)
+        _check_timeframe(path, rows, tf_ms)
         out[pair] = [c for _, c in rows]
     return out
 
@@ -307,3 +383,138 @@ def resample_candles(candles: Sequence[Candle], source_ms: int, target_ms: int) 
             )
         )
     return out
+
+
+# ---------------------------------------------------------------------- provenance (D2)
+def file_sha256(path: str | Path) -> str:
+    """Hex sha256 of a file's raw bytes."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+_MANIFEST_TOP_FIELDS = ("exchange_id", "ccxt_version", "timeframe", "fetched_at_utc")
+_MANIFEST_FILE_FIELDS = ("name", "symbol", "timeframe", "rows", "first_ts", "last_ts", "sha256")
+
+
+def _read_manifest(path: Path) -> tuple[dict[str, object] | None, list[str]]:
+    """Parsed manifest (None if unusable) and its structural problems."""
+    if not path.is_file():
+        return None, [f"{path}: no {MANIFEST_NAME} (written by fetch_data next to the candles)"]
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return None, [f"{path}: not valid JSON ({exc})"]
+    if not isinstance(manifest, dict):
+        return None, [f"{path}: the manifest must be a JSON object"]
+    problems: list[str] = []
+    if manifest.get("format") != MANIFEST_FORMAT:
+        problems.append(f"{path}: format is {manifest.get('format')!r}, not {MANIFEST_FORMAT!r}")
+    for key in _MANIFEST_TOP_FIELDS:
+        if not isinstance(manifest.get(key), str) or not manifest[key]:
+            problems.append(f"{path}: missing or empty {key!r}")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not all(isinstance(e, dict) for e in files):
+        return None, [*problems, f"{path}: 'files' must be a list of objects"]
+    names = [e.get("name") for e in files]
+    dups = sorted({str(n) for n in names if names.count(n) > 1})
+    if dups:
+        problems.append(f"{path}: files listed more than once: {', '.join(dups)}")
+    return manifest, problems
+
+
+def _file_problems(
+    name: str, pair: str, timeframe: str, fpath: Path, actual_sha: str | None, entry: object
+) -> list[str]:
+    """Why ``fpath`` is not the file the manifest entry describes (empty list = verified)."""
+    if actual_sha is None:
+        return [f"{name}: file not found in the data directory"]
+    if not isinstance(entry, dict):
+        return [f"{name}: not listed in {MANIFEST_NAME}"]
+    missing = [k for k in _MANIFEST_FILE_FIELDS if k not in entry]
+    if missing:
+        return [f"{name}: manifest entry lacks {', '.join(missing)}"]
+    out: list[str] = []
+    if entry["sha256"] != actual_sha:
+        out.append(
+            f"{name}: sha256 {actual_sha} does not match the manifest's {entry['sha256']} "
+            "(file changed after download, or not the downloaded file)"
+        )
+    if entry["symbol"] != pair or entry["timeframe"] != timeframe:
+        out.append(
+            f"{name}: manifest lists {entry['symbol']} {entry['timeframe']}, "
+            f"expected {pair} {timeframe}"
+        )
+    if out:
+        return out
+    try:
+        rows = _read_rows(fpath)
+    except ValueError as exc:
+        return [f"{name}: {exc}"]
+    facts = (len(rows), rows[0][1].ts if rows else None, rows[-1][1].ts if rows else None)
+    listed = (entry["rows"], entry["first_ts"], entry["last_ts"])
+    if facts != listed:
+        out.append(f"{name}: file has (rows, first_ts, last_ts) {facts}, manifest says {listed}")
+    return out
+
+
+def verify_manifest(
+    data_dir: str | Path, pairs: Sequence[str], timeframe: str = "4h"
+) -> tuple[str, dict[str, object]]:
+    """``("real", details)`` only if EVERY pair's candle file is listed in
+    ``<data_dir>/manifest.json`` with a matching sha256 (and matching symbol, timeframe,
+    rows and first/last ts); otherwise ``("unverified-csv", details)``. Never raises for a
+    missing or malformed manifest: that is simply unverified.
+
+    ``details``: ``manifest_path``, ``manifest_sha256`` (None if absent), ``timeframe``,
+    ``exchange_id`` / ``ccxt_version`` / ``fetched_at_utc`` (from the manifest, or None),
+    ``exchange_ids`` (sorted per-file venues), ``files`` ({file name: {pair, path, sha256,
+    listed, verified}}), ``problems`` (one sentence each; empty iff "real") and ``note`` (the
+    D2 caveat: an offline check cannot authenticate an exchange download).
+    """
+    root = Path(data_dir)
+    mpath = root / MANIFEST_NAME
+    manifest, problems = _read_manifest(mpath)
+    listed: dict[str, object] = {}
+    if manifest is not None:
+        listed = {str(e.get("name")): e for e in manifest["files"]}  # type: ignore[union-attr]
+    files: dict[str, dict[str, object]] = {}
+    venues: set[str] = set()
+    if not pairs:
+        problems.append("no pairs to verify")
+    for pair in pairs:
+        name = pair_filename(pair, timeframe)
+        fpath = root / name
+        actual = file_sha256(fpath) if fpath.is_file() else None
+        entry = listed.get(name)
+        file_problems = (
+            _file_problems(name, pair, timeframe, fpath, actual, entry)
+            if manifest is not None
+            else []
+        )
+        problems.extend(file_problems)
+        if isinstance(entry, dict) and isinstance(entry.get("exchange_id"), str):
+            venues.add(entry["exchange_id"])
+        files[name] = {
+            "pair": pair,
+            "path": str(fpath),
+            "sha256": actual,
+            "listed": isinstance(entry, dict),
+            "verified": manifest is not None and not file_problems,
+        }
+    head = manifest or {}
+    details: dict[str, object] = {
+        "manifest_path": str(mpath),
+        "manifest_sha256": file_sha256(mpath) if mpath.is_file() else None,
+        "timeframe": timeframe,
+        "exchange_id": head.get("exchange_id"),
+        "ccxt_version": head.get("ccxt_version"),
+        "fetched_at_utc": head.get("fetched_at_utc"),
+        "exchange_ids": sorted(venues),
+        "files": files,
+        "problems": problems,
+        "note": MANIFEST_NOTE,
+    }
+    return (PROVENANCE_UNVERIFIED if problems else PROVENANCE_REAL), details

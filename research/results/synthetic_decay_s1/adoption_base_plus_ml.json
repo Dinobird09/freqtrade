@@ -1,37 +1,39 @@
 {
   "variant": "base+ml",
-  "config_fingerprint": "9be9d6da6ad86d8579570ae32c09984ac335bda8ac8a52bbb11751042e1e03b9",
+  "config_fingerprint": "a6e40080a9bd046422119e3402bd64631f269192e04a581cfa2ce35b2eeaeff7",
   "model_fingerprint": "3d4ae99353458efed55a39af109e9ecba66ddaf2646f29663ca5038661dd4aef",
   "provenance": "synthetic:decay:1",
   "data_files": null,
   "events_file": null,
+  "manifest": null,
+  "ledger_path": "test_looks.jsonl",
   "backtest": {
     "report_path": "REPORT.md",
     "completed_utc": "2026-09-27T12:00:00Z",
-    "report_sha256": "139ed3f3cf45717d6a3afb7b416374ef0f08933d0a08c77173b06327453f9c96"
+    "report_sha256": "f66204e35641f9b6f9e83158a6155b0e542db9deee81764f3f5416e98c5a5b41"
   },
   "walk_forward": {
-    "label": "TRAIN-ONLY",
-    "dd_ok": false,
+    "label": "UNTESTED",
+    "dd_ok": true,
     "split_utc": "2023-03-14T00:00:00Z",
-    "train_n": 88,
+    "train_n": 23,
     "test_n": 55,
     "test_avg_r": -0.0727272727272737,
     "report_path": "REPORT.md",
     "train_journal_path": "journals/base_plus_ml_train.csv",
-    "train_journal_sha256": "61c37bb60438e65e144cee6e1469208fb28a1295b45085bcc2f50c1619edcd47",
+    "train_journal_sha256": "9ce771f583f6166e6cc6e0867712d47cde792725606a8e2063745a1492caa5f5",
     "test_journal_path": "journals/base_plus_ml_test.csv",
-    "test_journal_sha256": "ec8230534776fec40641fb955911a5dcf82935ae75ba9a1f68bb98a83773ba89",
+    "test_journal_sha256": "c9030b4245ab41218a9d2738f4d21b608d0bf1956e7e28c94d4ebf2d1f7d4259",
     "min_train": 30,
     "min_test": 30,
-    "train_avg_r": 0.5904465793604851,
+    "train_avg_r": 0.1286651732053385,
     "label_params": {
       "seed": 7,
       "n_boot": 4000,
       "m": 4,
       "alpha": 0.05,
-      "max_dd_pct": 20.0,
-      "train_dd_p95_pct": 7.376549415503608,
+      "max_dd_pct": 15.0,
+      "train_dd_p95_pct": 16.05848496929653,
       "mtm_max_dd_pct": 12.353905726391359
     }
   },
@@ -43,7 +45,7 @@
     "approved": null,
     "notes": null,
     "review_path": "review_base_plus_ml/trades_review.csv",
-    "review_sha256": "0f37a035d6b772bc52ba60da67c54039e033d7abead96d0a6a8aef9c3b99e342"
+    "review_sha256": "a1878baa33aee823df8330131ca6974377507fb87f05a956e7678104dac27474"
   },
   "testnet": {
     "exchange": null,
@@ -54,7 +56,12 @@
     "journal_path": null,
     "notes": null,
     "events_path": null,
-    "events_sha256": null
+    "events_sha256": null,
+    "journal_sha256": null,
+    "decisions_path": null,
+    "decisions_sha256": null,
+    "candles": null,
+    "starting_equity": null
   },
   "live": {
     "enabled_utc": null

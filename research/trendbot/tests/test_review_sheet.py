@@ -1,19 +1,30 @@
 import csv
+import hashlib
 import io
 import random
 import re
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from research.trendbot.backtester import run_backtest
 from research.trendbot.config import StrategyConfig
+from research.trendbot.data import pair_filename, save_candles_csv
 from research.trendbot.journal import write_journal
-from research.trendbot.models import EXIT_END, EXIT_SL, EXIT_TP, FeatureRow, Trade
+from research.trendbot.models import EXIT_END, EXIT_SL, EXIT_TP, Candle, FeatureRow, Trade
 from research.trendbot.review_sheet import (
     BASE_FEATURES,
+    CONTEXT_COLUMNS,
+    CONTEXT_CSV_COLUMNS,
+    CONTEXT_UNAVAILABLE,
     CSV_NAME,
+    DEEP_WICK_STOP_DISTANCES,
     FLAG_BAD_LEVELS,
     FLAG_CODES,
+    FLAG_CONTEXT_MISMATCH,
+    FLAG_CONTEXT_MISSING,
+    FLAG_DEEP_WICK,
     FLAG_EXIT_BEFORE_ENTRY,
     FLAG_EXIT_MODEL,
     FLAG_LOOKAHEAD,
@@ -26,14 +37,18 @@ from research.trendbot.review_sheet import (
     FLAG_RR_ABOVE,
     FLAG_RR_BELOW,
     FLAG_SIZE,
+    FLAG_STOP_MISMATCH,
     FLAG_WIN_TOO_LARGE,
     FLAG_WINDOW_END,
     FLAG_ZERO_HOLD,
     MD_NAME,
     REVIEW_KEY,
     REVIEW_OK_VALUES,
+    WINDOW_TEST,
+    WINDOW_TRAIN,
     ReviewRow,
     auto_flags,
+    context_flags,
     duplicate_keys,
     entry_order,
     expected_sl_r,
@@ -44,8 +59,13 @@ from research.trendbot.review_sheet import (
     planned_rr,
     review_key,
     review_row,
+    trade_context,
+    wick_fill_extra_r,
+    window_of,
     write_review_pack,
 )
+from research.trendbot.structure import find_stop, latest_confirmed_pivot
+from research.trendbot.synthetic import make_world
 
 
 CFG = StrategyConfig()
@@ -89,12 +109,23 @@ EXPECTED_HEADER = (
     "f_hour_utc",
     "f_rsi",
     "f_vol_ratio",
+    "mae_r",
+    "mfe_r",
+    "stop_ref_time_utc",
+    "stop_ref_low",
+    "stop_ref_bar",
+    "exit_low",
+    "wick_depth_r",
+    "context_csv",
+    "context_sha256",
     "ml_prob",
     "notes",
     "auto_flags",
     "reviewer_ok",
     "reviewer_note",
 )
+# The header of a pack written before the trade-context columns existed (still readable).
+LEGACY_HEADER = tuple(c for c in EXPECTED_HEADER if c not in CONTEXT_COLUMNS)
 
 
 def _trade(
@@ -933,3 +964,564 @@ def test_load_review_accepts_extra_sorted_feature_columns(tmp_path):
     t = _trade(features={**FEATURES, "zeta": 1.0, "alpha": 2.0})
     rows = load_review(write_review_pack([t], tmp_path, "feat", CFG)["csv"])
     assert [r.key for r in rows] == [("ALL", 1)]
+
+
+# ---------------------------------------------------------------------------- trade context
+# Crafted candles (4H from T0; flat at 100 with lows 99.5, so no pivot anywhere except where
+# placed) and a trade built by hand on them, so every context number is checked by hand.
+SIGNAL = 45  # signal candle index; the fill candle is 46, the exit candle 50
+EXIT = 50
+PIVOT = 40
+SLIP = CFG.slippage_pct / 100
+
+
+def _c(i, o, h, lo, c, v=100.0):
+    return Candle(T0 + i * TF, o, h, lo, c, v)
+
+
+def _pivot_candles(exit_low=95.0, exit_open=99.2, pivot=PIVOT, n=60):
+    candles = [_c(i, 100.0, 100.5, 99.5, 100.0) for i in range(n)]
+    candles[pivot] = _c(pivot, 100.0, 100.5, 97.0, 100.0)  # the only pivot low
+    candles[SIGNAL] = _c(SIGNAL, 100.0, 101.2, 99.6, 101.0, 400.0)
+    candles[46] = _c(46, 101.2, 102.0, 100.0, 101.5)  # fill candle
+    candles[47] = _c(47, 101.5, 103.5, 99.8, 100.2)  # highest high of the trade
+    candles[48] = _c(48, 100.2, 102.5, 100.0, 101.0)
+    candles[49] = _c(49, 101.0, 101.5, 99.0, 99.2)
+    close = max(exit_low, min(exit_open, 96.0))
+    candles[EXIT] = _c(EXIT, exit_open, max(exit_open, 99.4), exit_low, close)
+    return candles
+
+
+def _stop_of(candles, i=SIGNAL, pair="BTC/USDT", cfg=CFG):
+    plan, why = find_stop(candles, i, pair, cfg)
+    assert plan is not None, why
+    return plan.stop
+
+
+def _entry_of(candles, i=SIGNAL):
+    return candles[i + 1].open * (1 + SLIP)
+
+
+def _pivot_trade(candles, reason=EXIT_SL, **kw):
+    """The trade the backtester would record on ``candles`` (fill at the open * (1 + slip))."""
+    stop = _stop_of(candles)
+    if reason == EXIT_SL and "exit_price" not in kw and candles[EXIT].open <= stop:
+        kw["exit_price"] = candles[EXIT].open * (1 - SLIP)  # gap-through fills at the open
+    return _trade(
+        signal_ts=T0 + SIGNAL * TF,
+        entry=_entry_of(candles),
+        stop=stop,
+        exit_reason=reason,
+        hold_candles=EXIT - SIGNAL - 1,
+        **kw,
+    )
+
+
+def _low_at_depth(candles, stop_distances):
+    """The exit-candle low that sits ``stop_distances`` stop distances below the stop."""
+    stop, entry = _stop_of(candles), _entry_of(candles)
+    return stop - stop_distances * (entry - stop)
+
+
+def _read_context(path):
+    with path.open(newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_pivot_stop_is_the_crafted_one():
+    candles = _pivot_candles()
+    assert latest_confirmed_pivot(candles, SIGNAL, CFG) == PIVOT
+    assert _stop_of(candles) == pytest.approx(97.0 * (1 - 0.0025), abs=1e-12)
+
+
+def test_mae_mfe_and_wick_by_hand():
+    candles = _pivot_candles(exit_low=95.0)
+    t = _pivot_trade(candles)
+    ctx = trade_context(t, candles, CFG)
+    # Hand arithmetic: E = 101.2 * 1.0005 = 101.2506, S = 97 * 0.9975 = 96.7575,
+    # R per unit = risk_amount / qty = L_u = (E - S*0.9995) + 0.001*E + 0.001*S*0.9995
+    #   = (101.2506 - 96.709121) + 0.101251 + 0.096709 = 4.739439.
+    # MAE = (101.2506 - 95.0) / 4.739439 = 1.3188; MFE = (103.5 - 101.2506) / 4.739439 = 0.4746;
+    # wick depth = (96.7575 - 95.0) / 4.739439 = 0.3708 R = 1.7575 / 4.4931 = 0.39 stop distances.
+    e, s = 101.2 * 1.0005, 97.0 * 0.9975
+    unit = (e - s * 0.9995) + 0.001 * e + 0.001 * s * 0.9995
+    assert unit == pytest.approx(t.risk_amount / t.qty, rel=1e-12)
+    assert ctx.available and ctx.mismatches == ()
+    assert (ctx.signal_index, ctx.fill_index, ctx.exit_index) == (SIGNAL, 46, EXIT)
+    # Lowest low over the fill .. exit candles (46..50) is the exit candle's 95.0; the highest
+    # high is candle 47's 103.5.
+    assert ctx.mae_r == pytest.approx((e - 95.0) / unit, rel=1e-12)
+    assert ctx.mfe_r == pytest.approx((103.5 - e) / unit, rel=1e-12)
+    assert ctx.exit_low == 95.0
+    assert ctx.wick_depth_r == pytest.approx((s - 95.0) / unit, rel=1e-12)
+    assert ctx.wick_depth_sd == pytest.approx((s - 95.0) / (e - s), rel=1e-12)
+    assert ctx.ref_index == PIVOT and ctx.ref_method == "pivot"
+    assert ctx.rederived_stop == pytest.approx(t.stop, rel=1e-15)
+    row = review_row(t, CFG, None, context=ctx)
+    assert row["mae_r"] == f"{(e - 95.0) / unit:.4f}" == "1.3188"
+    assert row["mfe_r"] == f"{(103.5 - e) / unit:.4f}" == "0.4746"
+    assert row["stop_ref_time_utc"] == "2024-01-07T16:00:00Z"  # T0 + 40 * 4h
+    assert row["stop_ref_low"] == "97.000000"
+    assert row["stop_ref_bar"] == "-5"
+    assert row["exit_low"] == "95.000000"
+    assert row["wick_depth_r"] == f"{(s - 95.0) / unit:.4f}" == "0.3708"
+    # 0.39 stop distances below the stop: a normal, not a deep, wick.
+    assert auto_flags(t, CFG, ctx) == []
+
+
+def test_tp_trade_has_no_wick_cells_and_mfe_reaches_the_target():
+    candles = _pivot_candles()
+    t0 = _pivot_trade(candles, EXIT_TP)
+    candles[EXIT] = _c(EXIT, 101.0, t0.target + 0.5, 100.5, 101.0)
+    t = _pivot_trade(candles, EXIT_TP)
+    ctx = trade_context(t, candles, CFG)
+    unit = t.risk_amount / t.qty
+    assert ctx.mismatches == ()
+    assert ctx.mfe_r == pytest.approx((t.target + 0.5 - t.entry_price) / unit, rel=1e-12)
+    assert ctx.mae_r == pytest.approx((t.entry_price - 99.0) / unit, rel=1e-12)  # candle 49
+    assert (ctx.exit_low, ctx.wick_depth_r, ctx.wick_depth_sd) == (None, None, None)
+    row = review_row(t, CFG, None, context=ctx)
+    assert row["exit_low"] == row["wick_depth_r"] == ""
+    assert auto_flags(t, CFG, ctx) == []
+
+
+def test_lookback_low_trade_names_the_lowest_low_used():
+    # Strictly rising lows: no pivot low anywhere, so R8 falls back to the lowest low of the
+    # last fallback_lookback (10) candles, candles 36..45, i.e. candle 36 (bar -9).
+    candles = []
+    for i in range(60):
+        lo = 90.0 + 0.1 * i
+        candles.append(_c(i, lo + 0.5, lo + 1.2, lo, lo + 1.0))
+    assert latest_confirmed_pivot(candles, SIGNAL, CFG) is None
+    plan, _ = find_stop(candles, SIGNAL, "BTC/USDT", CFG)
+    assert plan.method == "lookback_low" and plan.structure_level == pytest.approx(93.6)
+    t = _trade(
+        signal_ts=T0 + SIGNAL * TF,
+        entry=_entry_of(candles),
+        stop=plan.stop,
+        exit_reason=EXIT_TP,
+        hold_candles=EXIT - SIGNAL - 1,
+        stop_method="lookback_low",
+    )
+    candles[EXIT] = replace(candles[EXIT], high=t.target + 1.0)
+    ctx = trade_context(t, candles, CFG)
+    assert ctx.ref_index == 36 and ctx.ref_method == "lookback_low"
+    row = review_row(t, CFG, None, context=ctx)
+    assert row["stop_ref_bar"] == "-9"
+    assert row["stop_ref_low"] == "93.600000"
+    assert row["stop_ref_time_utc"] == "2024-01-07T00:00:00Z"  # T0 + 36 * 4h
+    assert auto_flags(t, CFG, ctx) == []
+    # The context starts 30 candles before the fill (the structure candle is inside it).
+    assert (ctx.first_index, len(ctx.rows)) == (16, EXIT - 16 + 1)
+
+
+def test_context_csv_rows_marks_and_hash(tmp_path):
+    candles = _pivot_candles()
+    t = _pivot_trade(candles, trade_id=7)
+    split = T0 + 10 * TF  # the trade is TEST
+    paths = write_review_pack([t], tmp_path, "ctx", CFG, split_ts=split, data={t.pair: candles})
+    _, [row] = _read_csv(paths["csv"])
+    assert row["context_csv"] == "context/TEST_7.csv"
+    ctx_path = tmp_path / "context" / "TEST_7.csv"
+    assert row["context_sha256"] == hashlib.sha256(ctx_path.read_bytes()).hexdigest()
+    rows = _read_context(ctx_path)
+    assert tuple(rows[0]) == CONTEXT_CSV_COLUMNS
+    # 30 candles before the fill candle (16..45, the signal candle is the last) through the
+    # exit candle 50: 35 rows, bars -29 .. +5 relative to the signal candle.
+    assert [int(r["index"]) for r in rows] == list(range(16, EXIT + 1))
+    assert [int(r["bar"]) for r in rows] == list(range(16 - SIGNAL, EXIT - SIGNAL + 1))
+    assert rows[0]["time_utc"] == "2024-01-03T16:00:00Z" and rows[0]["ts"] == str(T0 + 16 * TF)
+    marks = {int(r["index"]): r["marks"] for r in rows if r["marks"]}
+    assert marks == {PIVOT: "stop_ref_pivot", SIGNAL: "signal", 46: "entry", EXIT: "exit_SL"}
+    for r in rows:
+        c = candles[int(r["index"])]
+        assert (r["open"], r["high"], r["low"], r["close"]) == tuple(
+            f"{x:.8f}" for x in (c.open, c.high, c.low, c.close)
+        )
+        assert r["volume"] == f"{c.volume:.6f}"
+    # MAE / MFE recomputed by hand from the context file itself match the sheet.
+    unit = t.risk_amount / t.qty
+    span = [r for r in rows if int(r["index"]) >= 46]
+    mae = (t.entry_price - min(float(r["low"]) for r in span)) / unit
+    mfe = (max(float(r["high"]) for r in span) - t.entry_price) / unit
+    assert (row["mae_r"], row["mfe_r"]) == (f"{mae:.4f}", f"{mfe:.4f}")
+    md = paths["md"].read_text(encoding="utf-8")
+    assert "## Trade context (candles)" in md
+    assert "[context/TEST_7.csv](context/TEST_7.csv)" in md
+    assert f"pivot bar -5 (2024-01-07T16:00:00Z, low 97.000000) | {row['wick_depth_r']} |" in md
+    assert "- Candle context: candles supplied by the caller; found for 1 of 1 trades" in md
+    assert load_review(paths["csv"])[0].key == ("TEST", 7)
+
+
+def test_context_reaches_back_to_an_old_pivot_and_its_left_side():
+    # A pivot 30 candles before the signal (the oldest swing_lookback allows) is 31 before the
+    # fill candle: the context extends to it and its k = 2 left neighbours.
+    candles = _pivot_candles(pivot=SIGNAL - CFG.swing_lookback)
+    t = _pivot_trade(candles)
+    ctx = trade_context(t, candles, CFG)
+    assert ctx.ref_index == 15
+    assert ctx.first_index == 15 - CFG.swing_pivot_k
+    assert len(ctx.rows) == EXIT - ctx.first_index + 1
+    assert review_row(t, CFG, None, context=ctx)["stop_ref_bar"] == "-30"
+
+
+@pytest.mark.parametrize(
+    ("stop_distances", "gap", "deep"),
+    [
+        (0.39, False, False),
+        (0.49, False, False),
+        (0.51, False, True),
+        (1.50, False, True),
+        (1.50, True, False),  # gap-through: filled at the open, not by the touch model
+    ],
+)
+def test_deep_wick_flag_fires_only_on_deep_non_gap_stop_outs(stop_distances, gap, deep):
+    base = _pivot_candles()
+    low = _low_at_depth(base, stop_distances)
+    stop = _stop_of(base)
+    candles = _pivot_candles(exit_low=low, exit_open=stop - 0.1 if gap else 99.2)
+    t = _pivot_trade(candles)
+    ctx = trade_context(t, candles, CFG)
+    assert ctx.mismatches == ()
+    assert ctx.wick_depth_sd == pytest.approx(stop_distances, rel=1e-9)
+    codes = [flag_code(f) for f in auto_flags(t, CFG, ctx)]
+    assert (FLAG_DEEP_WICK in codes) is deep
+    assert FLAG_DEEP_WICK not in _codes(t)  # never without the candles
+    if deep:
+        assert codes == [FLAG_DEEP_WICK]
+        [flag] = context_flags(t, ctx, CFG)
+        assert f"is {stop_distances:.3f} stop distances ({ctx.wick_depth_r:.3f}R) below" in flag
+        # The extra loss of the D4 wick fill, by hand from the pnl of the two fill prices.
+        f = CFG.fee_rate
+
+        def pnl(x):
+            return t.qty * (x - t.entry_price) - f * t.qty * (t.entry_price + x)
+
+        for k in (0.5, 1.0):
+            touch, wick = stop * (1 - SLIP), (stop - k * (stop - low)) * (1 - SLIP)
+            extra = (pnl(touch) - pnl(wick)) / t.risk_amount
+            assert wick_fill_extra_r(t, low, k, CFG) == pytest.approx(extra, rel=1e-9)
+            assert f"k={k:g} {extra:.3f}R" in flag
+        assert ";" not in flag and "|" not in flag and "\n" not in flag
+
+
+def test_deep_wick_threshold_is_in_stop_distances():
+    assert DEEP_WICK_STOP_DISTANCES == 0.5
+    assert FLAG_DEEP_WICK in FLAG_CODES and FLAG_DEEP_WICK not in _codes(_trade())
+
+
+def test_context_mismatches_are_flagged():
+    candles = _pivot_candles()
+    t = _pivot_trade(candles)
+    # The SL exit candle never reaches the stop in these candles.
+    shallow = list(candles)
+    shallow[EXIT] = _c(EXIT, 99.2, 99.4, 98.0, 98.5)
+    [flag] = context_flags(t, trade_context(t, shallow, CFG), CFG)
+    assert flag.startswith(f"{FLAG_CONTEXT_MISMATCH}: the SL exit candle")
+    assert "never reached the stop" in flag
+    # An earlier candle already hit the stop: the recorded exit is not the model's first.
+    early = list(candles)
+    early[48] = _c(48, 100.2, 102.5, 96.0, 101.0)
+    [flag] = context_flags(t, trade_context(t, early, CFG), CFG)
+    assert "the candle 2024-01-09T00:00:00Z already reached the stop before" in flag
+    # A TP whose exit candle also touched the stop (the model fills the stop first).
+    tp = _pivot_trade(candles, EXIT_TP)
+    both = list(candles)
+    both[EXIT] = _c(EXIT, 99.2, tp.target + 1, 95.0, 99.0)
+    [flag] = context_flags(tp, trade_context(tp, both, CFG), CFG)
+    assert "also reached the stop" in flag and "fills first" in flag
+    # A fill candle that is not the candle after the signal.
+    late = replace(t, entry_ts=t.entry_ts + TF)
+    codes = [flag_code(f) for f in context_flags(late, trade_context(late, candles, CFG), CFG)]
+    assert FLAG_CONTEXT_MISMATCH in codes
+
+
+def test_stop_that_structure_does_not_reproduce_is_flagged():
+    candles = _pivot_candles()
+    t = _pivot_trade(candles)
+    moved = replace(t, stop=t.stop * 0.99)
+    [flag] = [
+        f
+        for f in auto_flags(moved, CFG, trade_context(moved, candles, CFG))
+        if flag_code(f) == FLAG_STOP_MISMATCH
+    ]
+    assert "re-derived by structure.find_stop at the signal candle" in flag
+    assert ";" not in flag
+    relabelled = replace(t, stop_method="lookback_low")
+    [flag] = context_flags(relabelled, trade_context(relabelled, candles, CFG), CFG)
+    assert flag == (
+        f"{FLAG_STOP_MISMATCH}: recorded stop method 'lookback_low' != 'pivot' re-derived at "
+        "the signal candle"
+    )
+    # A different buffer (wrong config for these trades) is visible, not silent.
+    wide = CFG.with_changes(
+        pair_risk={**CFG.pair_risk, "BTC": replace(CFG.pair_risk["BTC"], stop_buffer_pct=0.5)}
+    )
+    assert FLAG_STOP_MISMATCH in [
+        flag_code(f) for f in context_flags(t, trade_context(t, candles, wide), wide)
+    ]
+
+
+def test_missing_candles_are_flagged_and_leave_the_cells_blank(tmp_path):
+    candles = _pivot_candles()
+    t = _pivot_trade(candles)
+    for data in ({}, {"ETH/USDT": candles}, {t.pair: candles[:48]}, {t.pair: candles[46:]}):
+        ctx = trade_context(t, data.get(t.pair), CFG)
+        assert not ctx.available
+        assert [flag_code(f) for f in context_flags(t, ctx, CFG)] == [FLAG_CONTEXT_MISSING]
+    [flag] = context_flags(t, trade_context(t, candles[:48], CFG), CFG)
+    assert flag == (
+        f"{FLAG_CONTEXT_MISSING}: no BTC/USDT candle in the supplied data for the exit candle "
+        "2024-01-09T08:00:00Z"
+    )
+    paths = write_review_pack([t], tmp_path, "gap", CFG, data={"ETH/USDT": candles})
+    _, [row] = _read_csv(paths["csv"])
+    assert all(row[c] == "" for c in CONTEXT_COLUMNS)
+    assert row["auto_flags"].startswith(FLAG_CONTEXT_MISSING)
+    assert not (tmp_path / "context").exists()
+    md = paths["md"].read_text(encoding="utf-8")
+    assert "found for 0 of 1 trades; context_missing 1" in md
+    assert "| 1 | ALL | BTC/USDT | SL | -1.0000 | | | | | missing |" in md
+
+
+def test_without_data_the_context_is_blank_and_old_behaviour_unchanged(tmp_path):
+    trades = _sample_trades()
+    a = write_review_pack(trades, tmp_path / "a", "T", CFG, T0 + 25 * TF, {"R1_trend": 3})
+    b = write_review_pack(trades, tmp_path / "b", "T", CFG, T0 + 25 * TF, {"R1_trend": 3}, None)
+    assert a["csv"].read_bytes() == b["csv"].read_bytes()
+    assert a["md"].read_bytes() == b["md"].read_bytes()
+    header, rows = _read_csv(a["csv"])
+    assert tuple(header) == EXPECTED_HEADER
+    by_id = {t.trade_id: t for t in trades}
+    for row in rows:
+        assert all(row[c] == "" for c in CONTEXT_COLUMNS)
+        trade = by_id[int(row["trade_id"])]
+        assert row["auto_flags"] == "; ".join(auto_flags(trade, CFG))  # no context flags
+        # Every pre-existing column holds exactly what it held before the context columns.
+        old = review_row(trade, CFG, T0 + 25 * TF)
+        assert {c: row[c] for c in LEGACY_HEADER} == {c: old[c] for c in LEGACY_HEADER}
+    assert not (tmp_path / "a" / "context").exists()
+    md = a["md"].read_text(encoding="utf-8")
+    assert CONTEXT_UNAVAILABLE in md
+    assert "- Candle context: unavailable" in md
+    assert "- Flagged trades: 2 of 5" in md
+
+
+def test_rewriting_a_pack_removes_stale_context_files(tmp_path):
+    candles = _pivot_candles()
+    t = _pivot_trade(candles)
+    write_review_pack([t], tmp_path, "x", CFG, data={t.pair: candles})
+    keep = tmp_path / "context" / "README.txt"
+    keep.write_text("not ours", encoding="utf-8")
+    assert (tmp_path / "context" / "ALL_1.csv").is_file()
+    write_review_pack([replace(t, trade_id=2)], tmp_path, "x", CFG, data={t.pair: candles})
+    assert sorted(p.name for p in (tmp_path / "context").iterdir()) == ["ALL_2.csv", "README.txt"]
+    keep.unlink()
+    write_review_pack([t], tmp_path, "x", CFG)
+    assert not (tmp_path / "context").exists()
+
+
+def test_test_only_banner_names_the_reason(tmp_path):
+    # v4 D1: a stop-fill stress config is test-only too, and the banner says why.
+    stressed = CFG.with_changes(stop_fill_wick_k=0.5)
+    md = write_review_pack([], tmp_path / "k", "k", stressed)["md"].read_text(encoding="utf-8")
+    assert "- **TEST-ONLY config: stop fills are stressed with stop_fill_wick_k=0.5" in md
+    assert "regime filter is OFF" not in md
+    both = stressed.with_changes(regime_filter=False)
+    md = write_review_pack([], tmp_path / "b", "b", both)["md"].read_text(encoding="utf-8")
+    assert "TEST-ONLY config: the R4 regime filter is OFF and stop fills are stressed" in md
+
+
+# ---------------------------------------------------------------------------- with a backtest
+def _walk_forward_trades(world, gaps=False):
+    data, events = make_world(world, 1, years=3.0, gaps=gaps)
+    times = [c.ts for c in data["BTC/USDT"]]
+    split = times[int(len(times) * 0.7)]
+    train = run_backtest(data, CFG, events, end_ts=split).trades
+    test = run_backtest(data, CFG, events, start_ts=split).trades
+    offset = max((t.trade_id for t in train), default=0)
+    test = [replace(t, trade_id=t.trade_id + offset) for t in test]
+    return data, split, train + test
+
+
+@pytest.mark.parametrize(("world", "gaps"), [("planted", False), ("null", True)])
+def test_backtest_trades_are_reproduced_by_their_candles(tmp_path, world, gaps):
+    data, split, trades = _walk_forward_trades(world, gaps)
+    assert len(trades) >= 20
+    paths = write_review_pack(trades, tmp_path, "bt", CFG, split_ts=split, data=data)
+    _, rows = _read_csv(paths["csv"])
+    by_key = {(window_of(t, split), t.trade_id): t for t in trades}
+    for row in rows:
+        codes = {flag_code(f) for f in row["auto_flags"].split("; ") if f}
+        # The candles reproduce every trade: no missing context, no contradiction and the
+        # R8 stop re-derived at the signal candle is the recorded one.
+        assert not codes & {FLAG_CONTEXT_MISSING, FLAG_CONTEXT_MISMATCH, FLAG_STOP_MISMATCH}
+        t = by_key[(row["window"], int(row["trade_id"]))]
+        assert row["context_csv"] == f"context/{row['window']}_{t.trade_id}.csv"
+        assert row["stop_ref_bar"] and int(row["stop_ref_bar"]) <= 0
+        assert float(row["mae_r"]) >= 0 and float(row["mfe_r"]) >= 0
+        candles = data[t.pair]
+        exit_c = next(c for c in candles if c.ts == t.exit_ts)
+        if t.exit_reason == EXIT_SL:
+            depth = (t.stop - exit_c.low) / (t.entry_price - t.stop)
+            deep = depth > DEEP_WICK_STOP_DISTANCES and exit_c.open > t.stop
+            assert (FLAG_DEEP_WICK in codes) is deep
+            assert float(row["wick_depth_r"]) >= 0
+        else:
+            assert FLAG_DEEP_WICK not in codes and row["wick_depth_r"] == ""
+        if t.exit_reason == EXIT_TP:
+            assert float(row["mfe_r"]) >= (t.target - t.entry_price) / (t.risk_amount / t.qty)
+    assert {r["window"] for r in rows} == {WINDOW_TRAIN, WINDOW_TEST}
+    assert len(load_review(paths["csv"])) == len(trades)
+
+
+# ---------------------------------------------------------------------------- load_review (v4)
+def _drop_context_columns(csv_path):
+    with csv_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    keep = [i for i, c in enumerate(rows[0]) if c not in CONTEXT_COLUMNS]
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh, lineterminator="\n").writerows([[r[i] for i in keep] for r in rows])
+    return csv_path
+
+
+def test_load_review_accepts_a_pack_written_before_the_context_columns(tmp_path):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "old", CFG, split_ts=split)["csv"]
+    fresh = load_review(csv_path)
+    _drop_context_columns(csv_path)
+    header, _ = _read_csv(csv_path)
+    assert tuple(header) == LEGACY_HEADER
+    assert load_review(csv_path) == fresh
+
+
+def test_load_review_reads_a_committed_legacy_or_current_pack():
+    results = Path(__file__).resolve().parents[2] / "results"
+    committed = results / "synthetic_planted_s1" / "review_base" / CSV_NAME
+    if not committed.is_file():
+        pytest.skip("no committed review pack")
+    assert len(load_review(committed)) > 0
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        _header_edit(",wick_depth_r", ""),
+        _header_edit("mae_r,mfe_r", "mfe_r,mae_r"),
+        _header_edit(",context_sha256", ",context_hash"),
+    ],
+)
+def test_load_review_rejects_partial_or_reordered_context_columns(tmp_path, transform):
+    split, trades = _split_trades()
+    csv_path = write_review_pack(trades, tmp_path, "ctx", CFG, split_ts=split)["csv"]
+    _rewrite(csv_path, transform)
+    with pytest.raises(ValueError, match=r"line 1: not a trades_review\.csv header") as info:
+        load_review(csv_path)
+    assert "trade-context columns must be exactly" in str(info.value)
+
+
+def _context_pack(tmp_path):
+    candles = _pivot_candles()
+    t = _pivot_trade(candles)
+    return write_review_pack([t], tmp_path, "c", CFG, data={t.pair: candles})["csv"]
+
+
+def test_load_review_checks_the_context_files(tmp_path):
+    csv_path = _context_pack(tmp_path)
+    assert [r.key for r in load_review(csv_path)] == [("ALL", 1)]
+    ctx_file = tmp_path / "context" / "ALL_1.csv"
+    original = ctx_file.read_bytes()
+    ctx_file.write_bytes(original.replace(b"95.00000000", b"96.00000000"))
+    with pytest.raises(
+        ValueError, match=r"line 2: context file .* does not match its context_sha256"
+    ):
+        load_review(csv_path)
+    ctx_file.unlink()
+    with pytest.raises(ValueError, match=r"line 2: context file .* is missing"):
+        load_review(csv_path)
+    ctx_file.write_bytes(original)
+    assert len(load_review(csv_path)) == 1
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("context_csv", "../elsewhere/ALL_1.csv"),
+        ("context_csv", "context/ALL_2.csv"),
+        ("context_csv", ""),
+        ("context_sha256", ""),
+    ],
+)
+def test_load_review_rejects_a_foreign_context_reference(tmp_path, column, value):
+    csv_path = _context_pack(tmp_path)
+    _rewrite(csv_path, _cell_edit(2, column, value))
+    with pytest.raises(ValueError, match="line 2: context_csv") as info:
+        load_review(csv_path)
+    assert "expected 'context/ALL_1.csv'" in str(info.value)
+
+
+# ---------------------------------------------------------------------------- CLI (v4)
+def test_cli_data_dir_adds_the_context(tmp_path, capsys):
+    candles = _pivot_candles(exit_low=_low_at_depth(_pivot_candles(), 0.8))
+    t = _pivot_trade(candles)
+    data_dir = tmp_path / "data"
+    save_candles_csv(candles, data_dir / pair_filename(t.pair, "4h"))
+    journal = tmp_path / "trades.csv"
+    write_journal([t], journal)
+    out = tmp_path / "review"
+    assert (
+        main(["--journal", str(journal), "--out-dir", str(out), "--data-dir", str(data_dir)]) == 0
+    )
+    printed = capsys.readouterr().out
+    assert "1 trades (1 flagged, candle context from 4h candle files in" in printed
+    _, [row] = _read_csv(out / CSV_NAME)
+    assert row["context_csv"] == "context/ALL_1.csv" and row["stop_ref_bar"] == "-5"
+    assert flag_code(row["auto_flags"]) == FLAG_DEEP_WICK
+    # Identical to the API with the same candles (the journal round-trip is exact).
+    api = write_review_pack(
+        [t], tmp_path / "api", f"Trade review: {journal.name}", CFG, data={t.pair: candles}
+    )
+    assert (out / CSV_NAME).read_bytes() == api["csv"].read_bytes()
+    assert (out / "context" / "ALL_1.csv").read_bytes() == (
+        tmp_path / "api" / "context" / "ALL_1.csv"
+    ).read_bytes()
+    md = (out / MD_NAME).read_text(encoding="utf-8")
+    assert f"- Candle context: 4h candle files in {data_dir} (data.load_dataset)" in md
+
+
+def test_cli_synthetic_world_adds_the_context(tmp_path, capsys):
+    data, events = make_world("planted", 1, years=2.0)
+    trades = run_backtest(data, CFG, events).trades
+    journal = tmp_path / "trades.csv"
+    write_journal(trades, journal)
+    out = tmp_path / "review"
+    args = ["--journal", str(journal), "--out-dir", str(out)]
+    assert main([*args, "--synthetic", "planted", "--seed", "1", "--years", "2"]) == 0
+    assert "candle context from synthetic world planted seed 1, 2 years" in capsys.readouterr().out
+    api = write_review_pack(
+        trades, tmp_path / "api", f"Trade review: {journal.name}", CFG, data=data
+    )
+    assert (out / CSV_NAME).read_bytes() == api["csv"].read_bytes()
+    md = (out / MD_NAME).read_text(encoding="utf-8")
+    assert "verification only, never evidence about real markets" in md
+    assert f"found for {len(trades)} of {len(trades)} trades; context_missing 0, " in md
+    assert "context_mismatch 0, stop_mismatch 0" in md
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--seed", "3"],
+        ["--years", "2"],
+        ["--synthetic", "planted", "--data-dir", "x"],
+        ["--synthetic", "nowhere"],
+        ["--data-dir", "does-not-exist"],
+    ],
+)
+def test_cli_rejects_bad_context_sources(tmp_path, extra):
+    journal = tmp_path / "trades.csv"
+    write_journal(_sample_trades(), journal)
+    with pytest.raises(SystemExit) as exc:
+        main(["--journal", str(journal), "--out-dir", str(tmp_path / "o"), *extra])
+    assert exc.value.code == 2
+    assert not (tmp_path / "o").exists()
