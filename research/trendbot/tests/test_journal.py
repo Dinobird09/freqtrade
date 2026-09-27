@@ -72,7 +72,7 @@ def sample_trades() -> list[Trade]:
             r_multiple=-1.0000000000000002,
             ml_prob=None,
             stop_method="lookback_low",
-            notes='gap, "quoted"\nsecond line – unicode',
+            notes='gap, "quoted"\nsecond line caf\u00e9 \u20ac',
             features={"dist_regime_pct": 1e-17, "rsi": 70.0},
         ),
         open_trade(3),
