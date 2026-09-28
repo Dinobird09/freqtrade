@@ -131,7 +131,113 @@ Set `"learning": {"mode": "advisory"}` to log rules without blocking anything. L
 only veto trades that already passed the nine strategy rules; it never loosens a rule or
 raises risk.
 
-## 7. Tests (optional)
+## 7. Running up to 10 bots (fleet)
+
+`setup` also creates `fleet.json` and a `bots/` folder with two example bot settings files.
+Add up to 10 bots, one settings file each, then start the fleet dashboard:
+
+| OS | command |
+|---|---|
+| macOS / Linux | `research/trendbot/scripts/start_fleet.sh` |
+| Windows | `powershell -ExecutionPolicy Bypass -File research\trendbot\scripts\start_fleet.ps1` |
+
+The **Bots** table:
+
+- lists every bot with its status, mode, equity, return, trades, avg R and open positions;
+- each row has **Start / Stop** and **View** (the rest of the page then shows that bot);
+- the header has **Start all / Pause all / Stop all**.
+
+**Approval beyond 5:**
+
+- when 5 bots are already running, starting another does not start it;
+- instead a pop-up lists exactly which bots would start, their modes and pairs, and flags LIVE ones;
+- you must type **APPROVE** within 2 minutes;
+- every approval is logged to `fleet_approvals.jsonl`;
+- the server enforces this, so it cannot be bypassed from outside the page;
+- 10 is the hard maximum.
+
+**Safety checks when the fleet loads:**
+
+- **Separate state:** every bot needs its own state folder.
+- **One bot per pair per account:** bots on the same exchange and mode may not trade the same
+  pair. They would fight over one balance.
+- **No split cluster:** BTC/ETH/BNB must stay in one bot, because their shared risk budget
+  (R6) is enforced inside a bot.
+- **Share of the balance:** each bot has its own `starting_equity`. On a shared exchange
+  account, set it to that bot's share of the balance.
+
+Coins other than BTC/ETH/BNB must be configured in the bot's `strategy.pair_risk`, at most
+1% risk per trade (see `bots/binance-sol-paper.json`).
+
+## 8. Signal layers, data sources and weekly retraining
+
+Every layer can only **block** an entry that already passed the nine strategy rules. It is
+switched on only after it helps on data it never saw:
+
+1. It is trained on the older 70% of the price history, plus the paper, testnet and live
+   trades that closed in that period.
+2. It is then tested on the newer 30%.
+3. It must raise average R there by at least 0.05R and beat 95% of random vetoes that remove
+   the same number of trades (p ≤ 0.05).
+
+Otherwise it stays off.
+
+| layer | what it is | extra install (optional) |
+|---|---|---|
+| `gbm` | gradient-boosted trees on the entry features | XGBoost is used if installed, built-in otherwise |
+| `lstm` | LSTM over the last 32 candles | `torch` |
+| `rl` | reinforcement-learning agent: learns take/skip values from every signal's outcome, including vetoed and paper-trade signals, and updates after every close | none |
+| `hmm_regime` | Gaussian hidden Markov model of crash/bear/neutral/bull regimes, forward-filtered (no look-ahead) | none |
+| `fear_greed` | Fear & Greed index | none |
+| `news_sentiment` | news RSS, Reddit and CryptoPanic headlines scored by FinBERT or a built-in lexicon | `transformers` for FinBERT |
+| `orderflow` | footprint: buy/sell delta, 400% imbalances, absorption | none |
+
+The DEX scanner (`dex_scan.py`) is separate:
+
+- it checks DEXScreener, RugCheck and Solana holder concentration;
+- it ranks memecoins into a watchlist with risk flags: liquidity, can't-exit, top-10 holders
+  > 20%, pair age, honeypot hints;
+- it is **analysis only**: the bot never trades DEX tokens and holds no wallet keys;
+- enable it with `"dex": {"enabled": true}`, or run
+  `python -m research.trendbot.dex_scan --chain solana --from-boosts`.
+
+The optional ML libraries are listed in `research/trendbot/requirements-ml.txt`.
+
+**Automatic jobs.** While the bot runs, it starts two background jobs on its own. You can
+also trigger them from the dashboard with **Collect data now** and **Retrain now**.
+
+| job | when | what it does |
+|---|---|---|
+| **collect** | hourly | Fear & Greed, news, Reddit, CryptoPanic, exchange trades for order flow, DEX scan |
+| **retrain** | weekly, Sunday 01:00 UTC | retrains and re-validates every layer on the latest candles and journal (paper trades count), switches layers on or off, writes `layers.json` + `models/`; the bot reloads them |
+
+Any layer can be switched off from the **Signal layers** table.
+
+Some layers only start working once their data exists:
+
+- **`news_sentiment`:** needs 30+ days of collected headlines, because news that was never
+  collected can't be backtested.
+- **`orderflow`:** needs order-flow history. Backfill it from Binance's public trade files
+  with `"orderflow": {"history_months": 6}`, or let the bot collect it live.
+
+**API keys:**
+
+| source | key needed? |
+|---|---|
+| exchange (testnet / live trading) | yes: `TRENDBOT_API_KEY`, `TRENDBOT_API_SECRET` in `.env` |
+| Fear & Greed (alternative.me) | no |
+| news RSS feeds, Reddit public JSON | no |
+| CryptoPanic news | optional free key: `CRYPTOPANIC_TOKEN=` in `.env` |
+| DEXScreener, RugCheck | no |
+| Solana holder data | no; optionally `SOLANA_RPC_URL=` a Helius/QuickNode URL for higher limits |
+| Binance aggTrades history (order flow) | no |
+
+**TradingView MCP:** `claude mcp add --transport http mcp-tradingview
+https://mcp.tradingview.com/mcp` connects TradingView to **Claude Code** on your computer, so
+Claude can read charts and data while you work with it. The bot itself runs without Claude,
+so it cannot use an MCP server. It gets its market data from the exchange directly.
+
+## 9. Tests (optional)
 
 ```bash
 .venv/bin/pip install pytest

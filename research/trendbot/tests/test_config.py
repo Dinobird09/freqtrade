@@ -89,11 +89,17 @@ def test_bnb_buffer_range(buffer):
         BASE.with_changes(pair_risk=pr)
 
 
-def test_unknown_pair_has_no_cap():
+def test_other_coins_are_capped_at_one_percent():
     pr = dict(BASE.pair_risk)
-    pr["SOL"] = PairRisk(max_risk_pct=1.0, stop_buffer_pct=0.3)
+    pr["SOL"] = PairRisk(max_risk_pct=1.01, stop_buffer_pct=0.3)
     with pytest.raises(ConfigError):
         BASE.with_changes(pair_risk=pr)
+    pr["SOL"] = PairRisk(max_risk_pct=1.0, stop_buffer_pct=0.3)
+    assert BASE.with_changes(pair_risk=pr).risk_for("SOL/USDT").max_risk_pct == 1.0
+    sol_only = BASE.with_changes(pair_risk={"SOL": PairRisk(0.5, 0.5)})  # a SOL-only fleet bot
+    assert sol_only.risk_for("SOL/USDT").max_risk_pct == 0.5
+    with pytest.raises(ConfigError):
+        sol_only.risk_for("BTC/USDT")
 
 
 @pytest.mark.parametrize(

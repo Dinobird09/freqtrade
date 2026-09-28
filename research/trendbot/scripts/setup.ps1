@@ -7,4 +7,6 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r research\trendbot\requirements.txt
 if (-not (Test-Path bot.json)) { Copy-Item research\trendbot\bot_settings.example.json bot.json }
 if (-not (Test-Path .env)) { Copy-Item research\trendbot\.env.example .env }
+if (-not (Test-Path fleet.json)) { Copy-Item research\trendbot\fleet_example.json fleet.json }
+if (-not (Test-Path bots)) { Copy-Item -Recurse research\trendbot\bots_example bots }
 Write-Host "Setup done. Edit bot.json (and .env for testnet/live), then run research\trendbot\scripts\start.ps1"

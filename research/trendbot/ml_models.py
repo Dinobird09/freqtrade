@@ -351,6 +351,7 @@ _GBM_DEFAULTS: dict[str, Any] = {
     "margin": 0.0,
     "min_examples": 60,
     "min_per_class": 10,
+    "extras": True,  # False: only the 6 FeatureRow features (no history-based extras)
 }
 
 
@@ -391,7 +392,10 @@ class GBMLayer(Layer):
         return True, why
 
     def vector(self, pair: str, features, view: MarketView, until_ts: int) -> list[float] | None:
-        return gbm_vector(features, self._cache.get(view, pair, until_ts))
+        extras = self._cache.get(view, pair, until_ts)
+        if not self.params["extras"]:
+            return feature_vector(features) if extras is not None else None
+        return gbm_vector(features, extras)
 
     def fit(self, ctx: TrainContext) -> None:
         tf = ctx.cfg.timeframe_ms
@@ -441,7 +445,7 @@ class GBMLayer(Layer):
         return {
             "params": self.params,
             "backend": self.backend,
-            "features": list(GBM_FEATURES),
+            "features": list(GBM_FEATURES if self.params["extras"] else GBM_FEATURES[:6]),
             "train_n": self.train_n,
             "breakeven": self.breakeven,
             "model": None if self.model is None else self.model.to_dict(),

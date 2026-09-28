@@ -57,6 +57,7 @@ RULE_IDS = {
 # Hard ceilings from the mandate. Variants may go lower, never higher.
 MANDATE_MAX_RISK_PCT = {"BTC": 1.0, "ETH": 1.0, "BNB": 0.5}
 MANDATE_BNB_BUFFER_RANGE = (0.5, 0.8)
+OTHER_MAX_RISK_PCT = 1.0  # ceiling for coins the mandate does not name (never above BTC/ETH's)
 MANDATE_MIN_RR = 2.0
 MANDATE_RSI_RANGE = (50.0, 70.0)
 MANDATE_MIN_VOL_MULT = 1.5
@@ -179,10 +180,9 @@ class StrategyConfig:
         if self.reward_risk < MANDATE_MIN_RR:
             errs.append(f"reward_risk must be >= {MANDATE_MIN_RR}:1 (got {self.reward_risk})")
         for base, pr in self.pair_risk.items():
-            cap = MANDATE_MAX_RISK_PCT.get(base)
-            if cap is None:
-                errs.append(f"{base}: no mandated risk cap; only {sorted(MANDATE_MAX_RISK_PCT)}")
-                continue
+            # BTC/ETH/BNB caps come from the mandate; any other explicitly configured coin
+            # (e.g. a SOL bot in a fleet) is capped at OTHER_MAX_RISK_PCT (1%).
+            cap = MANDATE_MAX_RISK_PCT.get(base, OTHER_MAX_RISK_PCT)
             if not (0 < pr.max_risk_pct <= cap):
                 errs.append(f"{base}: max_risk_pct must be in (0, {cap}] (got {pr.max_risk_pct})")
             if pr.stop_buffer_pct <= 0:
@@ -196,7 +196,7 @@ class StrategyConfig:
             self.pair_risk[b].max_risk_pct for b in self.correlated_cluster if b in self.pair_risk
         ]
         max_cluster_cap = max(cluster_caps, default=0.0)
-        if self.cluster_risk_budget_pct > max_cluster_cap + 1e-12:
+        if cluster_caps and self.cluster_risk_budget_pct > max_cluster_cap + 1e-12:
             errs.append(
                 "cluster_risk_budget_pct may not exceed the largest single-pair cap "
                 f"({max_cluster_cap}%): the cluster shares ONE risk budget"

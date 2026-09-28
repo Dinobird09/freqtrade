@@ -9,5 +9,8 @@ PY="${PYTHON:-python3}"
 .venv/bin/pip install -r research/trendbot/requirements.txt
 [ -f bot.json ] || cp research/trendbot/bot_settings.example.json bot.json
 [ -f .env ] || cp research/trendbot/.env.example .env
+[ -f fleet.json ] || cp research/trendbot/fleet_example.json fleet.json
+[ -d bots ] || cp -r research/trendbot/bots_example bots
 echo "Setup done. Edit bot.json (and .env for testnet/live), then run:"
-echo "  research/trendbot/scripts/start.sh"
+echo "  research/trendbot/scripts/start.sh        # one bot (bot.json)"
+echo "  research/trendbot/scripts/start_fleet.sh  # up to 10 bots (fleet.json + bots/)"

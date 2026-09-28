@@ -126,3 +126,6 @@ docker-compose-*.yml
 # trendbot local runtime files
 /bot.json
 trendbot_state/
+/fleet.json
+/fleet_approvals.jsonl
+/bots/
