@@ -51,10 +51,12 @@ from .data import load_candles_csv, save_candles_csv, timeframe_to_ms
 from .gatekeeper import DecisionRecord, EntryDecision, LiveSession
 from .journal import ms_to_iso, read_journal, write_journal
 from .journal_rules import audit, render_markdown
+from .layers import LayerBook, MarketView
 from .learning import LearningBook, LearningSettings, entry_context, expected_outcome
 from .live_exchange import CcxtGateway, Fill, OrderError, PaperBroker, quote_of
 from .models import EXIT_END, EXIT_SL, EXIT_TP, Candle, Trade, base_of
 from .news import NewsCalendar, load_events
+from .retrain import due
 
 
 log = logging.getLogger("trendbot.bot")
@@ -78,6 +80,13 @@ class BotSettings:
     strategy: dict[str, Any] = field(default_factory=dict)  # StrategyConfig overrides
     adoption_record: str | None = None  # if set, live mode requires this record to pass LIVE
     learning: dict[str, Any] = field(default_factory=dict)  # learning.LearningSettings fields
+    # Signal layers (layers.py): {"enabled": [...], "params": {name: {...}}, "validation": {...},
+    # "schedule": {"retrain_weekday": 6, "retrain_hour_utc": 1, "collect_every_minutes": 60},
+    # "auto_jobs": true}
+    layers: dict[str, Any] = field(default_factory=dict)
+    sentiment: dict[str, Any] = field(default_factory=dict)  # sentiment.collect settings
+    orderflow: dict[str, Any] = field(default_factory=dict)  # orderflow.collect settings
+    dex: dict[str, Any] = field(default_factory=dict)  # {"enabled": false, ...} dex_scan settings
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -136,6 +145,12 @@ class TrendBot:
         self._decisions_saved = 0
         self._cache: dict[str, list[Candle]] = {}
         self.book = LearningBook(self.dir, self.cfg, LearningSettings(**settings.learning))
+        lay = settings.layers
+        self.layer_book = LayerBook(
+            self.dir, self.cfg, enabled=lay.get("enabled"), params=lay.get("params")
+        )
+        self.settings_path: Path | None = None  # set by main(); needed to spawn jobs
+        self._jobs: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ paths
     @property
@@ -217,7 +232,15 @@ class TrendBot:
         }
 
     def _events(self) -> list[Any]:
-        return load_events(self.s.events) if self.s.events else []
+        """The news calendar (R5); a missing file is an empty calendar (logged once)."""
+        if not self.s.events:
+            return []
+        if not Path(self.s.events).exists():
+            if not getattr(self, "_warned_events", False):
+                log.warning("events file %s not found yet: no news blackouts", self.s.events)
+                self._warned_events = True
+            return []
+        return load_events(self.s.events)
 
     def _save(self) -> None:
         sess = self._sess()
@@ -269,6 +292,10 @@ class TrendBot:
 
     def step(self) -> None:
         """One iteration: operator requests, exits, then entries on newly closed candles."""
+        if self.layer_book.reload():
+            log.info("signal layers reloaded: active %s", sorted(self.layer_book.layers))
+            self._compose_filter()
+        self.schedule_jobs()
         self.handle_requests()
         self.manage_exits()
         if not self.stop_requested:
@@ -289,6 +316,9 @@ class TrendBot:
                 self.stop_requested = True
             elif action == "close":
                 self._close_request(str(req.get("pair", "ALL")))
+            elif action == "layer":
+                self.layer_book.set_override(str(req["name"]), req.get("status"))
+                self._compose_filter()
             elif action == "rule":
                 self.book.set_override(str(req["rule_id"]), req.get("status"))
                 self._relearn()
@@ -318,8 +348,27 @@ class TrendBot:
     def _relearn(self) -> None:
         sess = self._sess()
         self.book.relearn(sess.journal_trades(), self._cache)
-        sess.entry_filter = self.book.filter()
+        self._compose_filter()
         self.book.write(sess.journal_trades(), self.state.get("trade_context", {}))
+
+    def _compose_filter(self) -> None:
+        """Entry veto = learned rules first, then every active validated signal layer."""
+        view = MarketView(self._cache, self.cfg.timeframe_ms)
+        self._sess().entry_filter = self.layer_book.filter(view, extra=[self.book.filter()])
+
+    # ------------------------------------------------------------------ scheduled jobs
+    def schedule_jobs(self) -> None:
+        """Spawn the collect / retrain jobs when due (never blocks the trading loop)."""
+        if not self.s.layers.get("auto_jobs", True) or self.settings_path is None:
+            return
+        last = self.state.setdefault("jobs_last", {})
+        for job in due(self.s.layers.get("schedule", {}), last, int(time.time() * 1000)):
+            proc = self._jobs.get(job)
+            if proc is not None and proc.poll() is None:
+                continue
+            self._jobs[job] = spawn_job(job, self.settings_path, self.dir)
+            last[job] = int(time.time() * 1000)
+            log.info("scheduled job %s started (pid %d)", job, self._jobs[job].pid)
 
     # ------------------------------------------------------------------ exits
     def manage_exits(self) -> None:
@@ -359,6 +408,7 @@ class TrendBot:
         )
         for _, msg in sess.breaker_log[-3:]:
             log.info("breaker: %s", msg)
+        self.layer_book.observe(t.pair, t.features, closed.r_multiple or 0.0, closed.exit_ts)
         self._relearn()
         log.info("LESSON %s", self.book.lessons.get(str(t.trade_id), ""))
         self._save()
@@ -385,7 +435,10 @@ class TrendBot:
         sess = self._sess()
         sess.gatekeeper.news = NewsCalendar(self._events(), self.cfg)  # reload the calendar
         for pair in todo:
-            candles = self.refresh_candles(pair)
+            self.refresh_candles(pair)
+        self._compose_filter()  # layers see the freshly topped-up history
+        for pair in todo:
+            candles = self._cache.get(pair, [])
             if not candles or candles[-1].ts != signal_ts:
                 log.info("%s: candle %d not available yet", pair, signal_ts)
                 continue
@@ -529,6 +582,19 @@ class TrendBot:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------- background jobs
+def spawn_job(job: str, settings_path: Path, state_dir: Path) -> Any:
+    """Start ``retrain.py <job>`` as a separate process (output in retrain.log)."""
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH")]))
+    cmd = [sys.executable, "-m", "research.trendbot.retrain", job, "--settings", str(settings_path)]
+    err = (Path(state_dir) / "jobs.stderr.log").open("ab")
+    return subprocess.Popen(cmd, cwd=Path.cwd(), env=env, stdout=subprocess.DEVNULL, stderr=err)
+
+
 # ---------------------------------------------------------------------- control files
 def read_control(state_dir: Path) -> dict[str, Any]:
     """Persistent operator flags written by the dashboard (control.json)."""
@@ -667,6 +733,7 @@ def main(argv: list[str] | None = None, gateway: Any = None) -> int:
     cfg = settings.strategy_config()
     gw = gateway if gateway is not None else build_gateway(settings, cfg)
     bot = TrendBot(settings, gw, cfg=cfg)
+    bot.settings_path = Path(args.settings).resolve()
     bot.start()
     if args.command == "status":
         print(bot.status())

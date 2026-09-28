@@ -192,6 +192,28 @@ button.small { padding: 1px 8px; font-size: 12px; }
     </div>
 
     <div class="card span-12">
+      <div class="card-head"><h2>Signal layers</h2><span class="muted" id="layers-sub"></span>
+        <span class="spacer"></span>
+        <button type="button" id="btn-collect">Collect data now</button>
+        <button type="button" id="btn-retrain">Retrain now</button></div>
+      <div id="layers"></div>
+    </div>
+
+    <div class="card span-6">
+      <div class="card-head"><h2>Market data</h2><span class="muted" id="market-sub"></span></div>
+      <div id="market"></div>
+    </div>
+    <div class="card span-6">
+      <div class="card-head"><h2>Order flow (latest 4H candle)</h2></div>
+      <div id="flow"></div>
+    </div>
+
+    <div class="card span-12">
+      <div class="card-head"><h2>DEX watchlist</h2><span class="muted">scanner only: the bot never trades these</span></div>
+      <div class="scroll" id="dex"></div>
+    </div>
+
+    <div class="card span-12">
       <div class="card-head"><h2>Trade ledger</h2><span class="muted">why each trade was taken, what was expected, what happened, the lesson</span></div>
       <div class="scroll" id="ledger"></div>
     </div>
@@ -683,7 +705,7 @@ function renderAll() {
   document.getElementById("b-updated").textContent = "snapshot " + dt(mt.generated_at) + (EMBEDDED ? " (static export)" : "");
   renderTiles(s); renderBreakers(s); renderEquity(s); renderPairTabs(s); renderPrice(s);
   renderOpen(s); renderR(s); renderDecisionCounts(s); renderTrades(s); renderDecisions(s);
-  renderControls(s); renderRules(s); renderLedger(s);
+  renderControls(s); renderRules(s); renderLedger(s); renderLayers(s); renderMarket(s); renderDex(s);
   document.getElementById("log").textContent = s.log.length ? s.log.join("\n") : "bot.log is empty or missing.";
 }
 
@@ -744,6 +766,75 @@ function renderRules(s) {
       ? controlButton("Disable", "small", { action: "rule", rule_id: r.id, status: "disabled" })
       : r.override ? controlButton("Automatic", "small", { action: "rule", rule_id: r.id, status: null })
       : controlButton("Force on", "small", { action: "rule", rule_id: r.id, status: "active" }) }], L.rules));
+}
+const STATUS_KIND = { active: "critical", rejected: "good", collecting: "warning", unavailable: "warning", disabled: "good", error: "serious" };
+function renderLayers(s) {
+  const host = clear(document.getElementById("layers")), L = s.layers || { rows: [] };
+  const bot = s.bot || {}, running = bot.jobs_running || [];
+  const rs = L.retrain_status || {};
+  document.getElementById("layers-sub").textContent =
+    (L.retrained_utc ? `last retrain ${L.retrained_utc}` : "never retrained") +
+    (running.length ? ` · running: ${running.join(", ")}` : "") + " · active layers veto entries that passed R1–R9";
+  const retrain = document.getElementById("btn-retrain"), collect = document.getElementById("btn-collect");
+  retrain.disabled = !controlsOn() || !bot.can_start || running.includes("retrain");
+  collect.disabled = !controlsOn() || !bot.can_start || running.includes("collect");
+  retrain.onclick = () => control({ action: "retrain" }, "Retrain and re-validate every signal layer now?");
+  collect.onclick = () => control({ action: "collect" });
+  if (!L.rows.length) { host.append(el("div", { class: "empty" }, "No layer trained yet: press Retrain now (or wait for the weekly schedule).")); return; }
+  host.append(tableView([
+    { label: "layer", get: (r) => el("strong", {}, r.name) },
+    { label: "kind", get: (r) => r.kind },
+    { label: "status", get: (r) => status(STATUS_KIND[r.status] || "warning", r.status) },
+    { label: "unseen-data gain", num: true, get: (r) => r.gain_r === undefined || r.gain_r === null ? "–" : signed(r.gain_r, 3, "R") },
+    { label: "why", get: (r) => el("span", { class: "secondary" }, r.reason || "") },
+    { label: "trained (UTC)", nowrap: true, get: (r) => (r.trained_utc || "").replace("T", " ").slice(0, 16) },
+    { label: "", get: (r) => r.override === "disabled"
+      ? controlButton("Automatic", "small", { action: "layer", name: r.name, status: null })
+      : controlButton("Disable", "small", { action: "layer", name: r.name, status: "disabled" }) }], L.rows));
+  if (rs.seconds !== undefined) host.append(el("div", { class: "muted", style: "font-size:12px;margin-top:6px" },
+    `retrain took ${rs.seconds}s on ${Object.values(rs.candles || {}).reduce((a, b) => a + b, 0)} candles and ${rs.journal_trades} journal trades (paper trades count)`));
+}
+function renderMarket(s) {
+  const host = clear(document.getElementById("market")), m = s.market || {};
+  const fg = m.fear_greed;
+  const cs = (s.layers || {}).collect_status || {};
+  document.getElementById("market-sub").textContent = cs.finished_utc ? `collected ${cs.finished_utc}` : "not collected yet";
+  if (fg) {
+    const v = fg.value, label = v <= 25 ? "extreme fear" : v <= 45 ? "fear" : v < 55 ? "neutral" : v < 75 ? "greed" : "extreme greed";
+    const d = el("div", { style: "margin-bottom:10px" });
+    d.append(el("span", { style: "font-size:22px;font-weight:650" }, String(v)), el("span", { class: "secondary" }, `  Fear & Greed index · ${label} · known from ${dt(fg.known_from)}`));
+    host.append(d);
+  }
+  if (m.news && m.news.length) {
+    host.append(tableView([
+      { label: "coin", get: (r) => r.coin }, { label: "news sentiment", num: true, get: (r) => signed(r.score, 2) },
+      { label: "items", num: true, get: (r) => r.items }, { label: "bucket (UTC)", nowrap: true, get: (r) => dt(r.ts) }], m.news));
+  } else if (!fg) host.append(el("div", { class: "empty" }, "No market data collected yet: press Collect data now."));
+  const srcs = cs.sources || {};
+  const bad = Object.entries(srcs).filter(([, v]) => !v.ok);
+  if (bad.length) host.append(el("div", { class: "muted", style: "font-size:12px;margin-top:6px" }, "failed sources: " + bad.map(([k, v]) => `${k} (${v.error})`).join("; ")));
+}
+function renderFlowCell(v) { return typeof v === "number" ? (Math.abs(v) >= 100 ? nf(0).format(v) : nf(2).format(v)) : String(v); }
+function renderDex(s) {
+  const host = clear(document.getElementById("dex")), rows = (s.market || {}).dex || [];
+  const flowHost = clear(document.getElementById("flow")), flows = (s.market || {}).orderflow || [];
+  if (flows.length) {
+    const keys = ["delta_pct", "delta", "buy_volume", "sell_volume", "absorption", "buy_imbalances", "sell_imbalances", "poc"];
+    const present = keys.filter((k) => flows.some((f) => f[k] !== undefined));
+    flowHost.append(tableView([{ label: "pair", get: (r) => r.pair }, { label: "candle (UTC)", nowrap: true, get: (r) => dt(r.ts) },
+      ...present.map((k) => ({ label: k.replace(/_/g, " "), num: true, get: (r) => r[k] === undefined ? "–" : renderFlowCell(r[k]) }))], flows));
+  } else flowHost.append(el("div", { class: "empty" }, "No order-flow data yet: it is collected from exchange trades (Collect data now)."));
+  if (!rows.length) { host.append(el("div", { class: "empty" }, "No DEX scan yet: enable \"dex\" in bot.json or run python -m research.trendbot.dex_scan.")); return; }
+  const pick = (r, ...ks) => { for (const k of ks) if (r[k] !== undefined && r[k] !== null) return r[k]; return null; };
+  host.append(tableView([
+    { label: "token", get: (r) => pick(r, "symbol", "base_symbol", "name") || "?" },
+    { label: "chain", get: (r) => pick(r, "chain", "chain_id", "chainId") || "" },
+    { label: "liquidity $", num: true, get: (r) => money(pick(r, "liquidity_usd", "liquidity")) },
+    { label: "24h volume $", num: true, get: (r) => money(pick(r, "volume_h24", "volume_24h")) },
+    { label: "top-10 holders", num: true, get: (r) => { const v = pick(r, "top10_share", "top10_pct"); return v === null ? "unknown" : nf(1).format(v > 1 ? v : v * 100) + "%"; } },
+    { label: "score", num: true, get: (r) => { const v = pick(r, "score"); return v === null ? "–" : nf(2).format(v); } },
+    { label: "tradable", get: (r) => el("span", { class: "pill " + (pick(r, "tradable") ? "ok" : "no") }, pick(r, "tradable") ? "passes checks" : "excluded") },
+    { label: "flags", get: (r) => el("span", { class: "secondary" }, (pick(r, "flags") || []).map((f) => typeof f === "string" ? f : (f.name || f.code || JSON.stringify(f))).join(", ")) }], rows));
 }
 function renderLedger(s) {
   const host = clear(document.getElementById("ledger")), rows = s.ledger || [];

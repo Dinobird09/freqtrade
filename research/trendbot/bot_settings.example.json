@@ -1,14 +1,58 @@
 {
   "exchange": "binance",
   "mode": "paper",
-  "pairs": ["BTC/USDT", "ETH/USDT", "BNB/USDT"],
+  "pairs": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "BNB/USDT"
+  ],
   "state_dir": "trendbot_state/binance-paper",
-  "events": "research/trendbot/events_example.csv",
+  "events": "trendbot_state/binance-paper/events.csv",
   "starting_equity": 10000,
   "poll_seconds": 10,
   "close_delay_seconds": 5,
   "history_candles": 1500,
   "entry_buffer_pct": 0.3,
-  "strategy": {"fee_rate": 0.001, "slippage_pct": 0.05, "weekly_loss_limit_pct": 3.0},
-  "adoption_record": null
+  "strategy": {
+    "fee_rate": 0.001,
+    "slippage_pct": 0.05,
+    "weekly_loss_limit_pct": 3.0
+  },
+  "adoption_record": null,
+  "learning": {
+    "mode": "enforce",
+    "min_trades": 8
+  },
+  "layers": {
+    "enabled": [
+      "gbm",
+      "rl",
+      "lstm",
+      "hmm_regime",
+      "fear_greed",
+      "news_sentiment",
+      "orderflow"
+    ],
+    "params": {},
+    "validation": {
+      "min_test_trades": 20,
+      "min_gain_r": 0.05,
+      "max_veto_share": 0.6
+    },
+    "schedule": {
+      "retrain_weekday": 6,
+      "retrain_hour_utc": 1,
+      "collect_every_minutes": 60
+    },
+    "auto_jobs": true
+  },
+  "sentiment": {},
+  "orderflow": {
+    "backfill_months": 0
+  },
+  "dex": {
+    "enabled": false,
+    "chain": "solana",
+    "position_usd": 500
+  }
 }

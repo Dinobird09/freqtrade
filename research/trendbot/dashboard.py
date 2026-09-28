@@ -262,6 +262,8 @@ def build_snapshot(
         "control": _read_json(d / "control.json"),
         "learning": _learning_view(d),
         "ledger": _ledger_view(d, trades_tail),
+        "layers": _layers_view(d),
+        "market": _market_view(d),
     }
 
 
@@ -284,6 +286,80 @@ def _learning_view(d: Path) -> dict[str, Any]:
         ],
         "overrides": raw.get("overrides", {}),
     }
+
+
+def _layers_view(d: Path) -> dict[str, Any]:
+    reg = _read_json(d / "layers.json")
+    overrides = reg.get("overrides", {})
+    rows = []
+    for name, info in sorted((reg.get("layers") or {}).items()):
+        status = "disabled" if overrides.get(name) == "disabled" else info.get("status")
+        rows.append(
+            {
+                "name": name,
+                "kind": info.get("kind"),
+                "status": status,
+                "reason": info.get("reason"),
+                "description": info.get("description"),
+                "gain_r": info.get("gain_r"),
+                "trained_utc": info.get("trained_utc"),
+                "override": overrides.get(name),
+            }
+        )
+    return {
+        "rows": rows,
+        "retrained_utc": reg.get("retrained_utc"),
+        "retrain_status": _read_json(d / "retrain_status.json"),
+        "collect_status": _read_json(d / "collect_status.json"),
+    }
+
+
+def _market_view(d: Path) -> dict[str, Any]:
+    """Latest external data for the tables: Fear & Greed, news sentiment, order flow, DEX."""
+    out: dict[str, Any] = {"fear_greed": None, "news": [], "orderflow": [], "dex": []}
+    try:
+        from .sentiment import load_sources as sentiment_sources
+
+        src = sentiment_sources(d) or {}
+        fg = src.get("fear_greed") or []
+        if fg:
+            ts, value = fg[-1][0], fg[-1][1]
+            out["fear_greed"] = {"known_from": ts, "value": value}
+        for coin, rows in sorted((src.get("news_sentiment") or {}).items()):
+            if rows:
+                ts, mean, n = rows[-1][0], rows[-1][1], rows[-1][2]
+                out["news"].append({"coin": coin, "ts": ts, "score": mean, "items": n})
+    except Exception as exc:  # optional module / missing data: show nothing, never fail
+        out["news_error"] = str(exc)
+    try:
+        from .orderflow import load_sources as flow_sources
+
+        flows = (flow_sources(d) or {}).get("orderflow") or {}
+        for pair, by_ts in sorted(flows.items()):
+            if by_ts:
+                ts = max(by_ts)
+                fp = by_ts[ts]
+                row = fp if isinstance(fp, dict) else getattr(fp, "__dict__", {})
+                if not row and hasattr(fp, "__slots__"):
+                    row = {k: getattr(fp, k) for k in fp.__slots__}
+                out["orderflow"].append(
+                    {
+                        "pair": pair,
+                        "ts": ts,
+                        **{k: v for k, v in row.items() if isinstance(v, (int, float, str, bool))},
+                    }
+                )
+    except Exception as exc:
+        out["orderflow_error"] = str(exc)
+    try:
+        from .dex_scan import load_watchlist
+
+        wl = load_watchlist(d)
+        items = wl.get("tokens", wl.get("items", [])) if isinstance(wl, dict) else (wl or [])
+        out["dex"] = list(items)[:50]
+    except Exception as exc:
+        out["dex_error"] = str(exc)
+    return out
 
 
 def _ledger_view(d: Path, tail: int) -> list[dict[str, Any]]:
@@ -327,6 +403,7 @@ class Controller:
         self.dir = state_dir
         self.settings_path = settings_path
         self.proc: subprocess.Popen[bytes] | None = None
+        self.jobs: dict[str, subprocess.Popen[bytes]] = {}
         self.poll_s = 10.0
         if settings_path is not None:
             from .live_bot import BotSettings
@@ -347,6 +424,10 @@ class Controller:
             "heartbeat_age_s": None if age_s is None else round(age_s, 1),
             "last_status": beat.get("status"),
             "can_start": self.settings_path is not None,
+            "jobs_running": sorted(
+                [n for n, p in self.jobs.items() if p.poll() is None]
+                + [n for n in ("collect", "retrain") if (self.dir / f".{n}.lock").exists()]
+            ),
             "pending_requests": len(list((self.dir / "requests").glob("*.json")))
             if (self.dir / "requests").exists()
             else 0,
@@ -372,6 +453,20 @@ class Controller:
             pair = str(req.get("pair") or "ALL")
             post_request(self.dir, action="close", pair=pair)
             return True, f"close requested for {pair}: market sell at the next bot step"
+        if action in ("retrain", "collect"):
+            if self.settings_path is None:
+                return False, f"{action} needs the dashboard to be launched with --settings"
+            from .live_bot import spawn_job
+
+            proc = spawn_job(action, self.settings_path, self.dir)
+            self.jobs[action] = proc
+            return True, f"{action} started (pid {proc.pid}); progress in retrain.log"
+        if action == "layer":
+            from .layers import set_layer_override
+
+            status = req.get("status")
+            set_layer_override(self.dir, str(req.get("name")), status)
+            return True, f"layer {req.get('name')} -> {status or 'automatic'}"
         if action == "rule":
             status = req.get("status")
             if status not in ("active", "disabled", None):

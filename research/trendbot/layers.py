@@ -357,14 +357,7 @@ class LayerBook:
         return self.registry.get("layers", {}).get(name, {}).get("status", "collecting")
 
     def set_override(self, name: str, status: str | None) -> None:
-        ov = self.registry.setdefault("overrides", {})
-        if status is None:
-            ov.pop(name, None)
-        elif status == "disabled":
-            ov[name] = status
-        else:
-            raise ValueError("a layer override may only be 'disabled' or None (automatic)")
-        self._write_registry()
+        self.registry = set_layer_override(self.dir, name, status)
         self.reload(force=True)
 
     def filter(self, view: MarketView, extra: Sequence[Any] = ()) -> LayerFilter:
@@ -419,6 +412,10 @@ class LayerBook:
             res["description"] = LAYER_TYPES[name].description if name in LAYER_TYPES else ""
             out[name] = res
             log.info("layer %s: %s (%s)", name, res["status"], res.get("reason"))
+        if self.path.exists():  # keep operator overrides made while retraining ran
+            self.registry["overrides"] = json.loads(self.path.read_text(encoding="utf-8")).get(
+                "overrides", {}
+            )
         self.registry["layers"] = out
         self.registry["retrained_utc"] = ms_to_iso(now_ms)
         self._write_registry()
@@ -434,3 +431,22 @@ def _atomic(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+def set_layer_override(state_dir: Path, name: str, status: str | None) -> dict[str, Any]:
+    """Operator switch for one layer, written straight into layers.json (the bot reloads it).
+
+    ``status`` is ``"disabled"`` or ``None`` (automatic: the validation result decides).
+    """
+    if status not in ("disabled", None):
+        raise ValueError("a layer override may only be 'disabled' or None (automatic)")
+    path = Path(state_dir) / "layers.json"
+    reg = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"layers": {}}
+    ov = reg.setdefault("overrides", {})
+    if status is None:
+        ov.pop(name, None)
+    else:
+        ov[name] = status
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic(path, json.dumps(reg, indent=1))
+    return reg

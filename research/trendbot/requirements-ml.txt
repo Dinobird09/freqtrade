@@ -1,0 +1,5 @@
+# Optional extras for the signal layers. Everything works without them (stdlib fallbacks);
+# install what you want to use, then press "Retrain now" in the dashboard.
+xgboost>=2.0          # "gbm" layer uses XGBoost instead of the built-in boosted trees
+torch>=2.2            # "lstm" layer (CPU is enough)
+transformers>=4.40    # FinBERT news scoring (ProsusAI/finbert); lexicon scorer otherwise
