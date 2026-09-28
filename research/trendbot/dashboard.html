@@ -265,10 +265,9 @@ tr.selected td { background: var(--wash); }
 const EMBEDDED = /*__SNAPSHOT__*/null;
 const REFRESH_S = __REFRESH_S__;
 const CONTROL_TOKEN = "__CONTROL_TOKEN__";
-state.bot = new URLSearchParams(location.search).get("bot");
-state.fleet = null;
 const SVGNS = "http://www.w3.org/2000/svg";
-const state = { snap: null, pair: null, tables: {}, theme: "auto" };
+const state = { snap: null, pair: null, tables: {}, theme: "auto",
+  bot: new URLSearchParams(location.search).get("bot"), fleet: null };
 
 // ------------------------------------------------------------------ helpers
 function el(tag, attrs, text) {

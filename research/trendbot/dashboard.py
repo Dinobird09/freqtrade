@@ -556,6 +556,10 @@ class FleetRuntime:
         snap = build_snapshot(state_dir, cfg)
         snap["bot"] = ctrl.bot_status() if ctrl else None
         snap["meta"]["bot_name"] = name
+        bot = self.fleet.bots.get(name) if self.fleet is not None else None
+        if bot is not None and snap["meta"].get("mode") in (None, "unknown"):
+            snap["meta"]["mode"] = bot.settings.mode  # never started: show the configured mode
+            snap["meta"]["exchange"] = bot.settings.exchange
         return snap
 
     def summary(self) -> dict[str, Any]:

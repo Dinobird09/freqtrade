@@ -22,9 +22,12 @@ rl    A contextual bandit with tabular Q-learning: state = tercile bins (fitted 
 A layer that cannot score a signal (missing features or history) never vetoes it.
 
 gbm defaults (100 trees, depth 2, learning rate 0.05, >= 10 rows per leaf, leaf ridge l2 = 10,
-subsample 0.8) were chosen among 8 settings on synthetic seeds 1-6 and checked on seeds 7-12:
-``validate_layer`` activated it on 6 of 12 "hour_edge" worlds and 0 of 12 "null" worlds
-(with l2 = 1 it was active on 2 of 6 null worlds: too little shrinkage for ~250 labels).
+subsample 0.8) were chosen among 8 settings on synthetic seeds 1-6. Measured with
+``layers.validate_layer`` (incl. its p <= 0.05 test against random vetoes): active on 1 of 6
+"hour_edge" worlds for seeds 1-6 (seed 1: +0.225R, 33% vetoed, p = 0.070, so rejected) and 5
+of 12 for held-out seeds 7-18 (mean gain +0.18R), and on 0 of 18 "null" worlds. With
+``extras=False`` (the 6 FeatureRow features only; the synthetic worlds plant no effect in the
+extras) it was active on 6 of 12 held-out hour_edge worlds and 0 of 12 null worlds.
 """
 
 from __future__ import annotations
@@ -543,7 +546,8 @@ class LSTMLayer(Layer):
         return sequence_channels(view.history(pair, until_ts, n + _VOL_LOOKBACK), n)
 
     def _normalise(self, seqs: Sequence[list[list[float]]]) -> list[list[list[float]]]:
-        assert self.norm is not None
+        if self.norm is None:
+            raise RuntimeError("lstm is not fitted")
         mu, sd = self.norm["mean"], self.norm["std"]
         return [
             [[(v - m) / s for v, m, s in zip(st, mu, sd, strict=True)] for st in q] for q in seqs
