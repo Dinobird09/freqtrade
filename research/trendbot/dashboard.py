@@ -264,6 +264,7 @@ def build_snapshot(
         "ledger": _ledger_view(d, trades_tail),
         "layers": _layers_view(d),
         "market": _market_view(d),
+        "brain": _brain_view(d),
     }
 
 
@@ -285,6 +286,22 @@ def _learning_view(d: Path) -> dict[str, Any]:
             for r in raw.get("rules", [])
         ],
         "overrides": raw.get("overrides", {}),
+    }
+
+
+def _brain_view(d: Path) -> dict[str, Any]:
+    from .chantisimo import read_thoughts
+
+    raw = _read_json(d / "chantisimo.json")
+    return {
+        "name": raw.get("name", "Chantisimo"),
+        "memory": raw.get("memory"),
+        "graduation": raw.get("graduation", []),
+        "mistakes": raw.get("mistakes", []),
+        "active_rules": raw.get("active_rules", []),
+        "teachers": (raw.get("settings") or {}).get("learn_from", []),
+        "thoughts": read_thoughts(d, 40, "thought"),
+        "reflections": read_thoughts(d, 25, "reflection"),
     }
 
 
@@ -359,6 +376,9 @@ def _market_view(d: Path) -> dict[str, Any]:
         out["dex_scanned"] = wl.get("generated_at")
     except Exception as exc:
         out["dex_error"] = str(exc)
+    from .connections import latest_mcp_rows
+
+    out["mcp"] = [{**r, "text": (r.get("text") or "")[:600]} for r in latest_mcp_rows(d)[:40]]
     return out
 
 
@@ -584,6 +604,8 @@ class FleetRuntime:
         from .fleet import FleetError
 
         action = req.get("action")
+        if str(action).startswith(("keys_", "mcp_")):
+            return connection_action(req)
         try:
             if action == "approve":
                 a = self.fleet.take_approval(
@@ -662,6 +684,72 @@ class FleetRuntime:
         return (200 if ok_all else 400), {"ok": ok_all, "message": prefix + "; ".join(msgs)}
 
 
+def connection_action(req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Connections card: exchange keys (saved to .env, never echoed) and MCP servers."""
+    from . import connections as c
+
+    a = str(req.get("action"))
+    ex, acc = str(req.get("exchange", "")), str(req.get("account", ""))
+    try:
+        if a == "keys_save":
+            msg = c.set_exchange_keys(
+                ex,
+                acc,
+                str(req.get("key", "")),
+                str(req.get("secret", "")),
+                str(req.get("password") or ""),
+            )
+            return 200, {"ok": True, "message": msg}
+        if a == "keys_clear":
+            return 200, {"ok": True, "message": c.clear_exchange_keys(ex, acc)}
+        if a == "keys_test":
+            return 200, {"ok": True, "message": c.test_exchange(ex, acc)}
+        name = str(req.get("name", ""))
+        if a == "mcp_save":
+            return 200, {
+                "ok": True,
+                "message": c.save_mcp(name, str(req.get("url", "")), req.get("token")),
+            }
+        if a == "mcp_remove":
+            return 200, {"ok": True, "message": c.remove_mcp(name)}
+        if a == "mcp_test":
+            res = c.test_mcp(name)
+            srv = res["server"].get("name") or name
+            return 200, {
+                "ok": True,
+                "message": f"{srv}: connected, {len(res['tools'])} tools",
+                **res,
+            }
+        args = req.get("args") or {}
+        if not isinstance(args, dict):
+            return 400, {"ok": False, "message": "args must be a JSON object"}
+        if a == "mcp_call":
+            text = c.call_mcp(
+                name,
+                str(req.get("tool")),
+                args,
+                req.get("pair") or None,
+                str(req.get("exchange_id") or "binance"),
+            )
+            return 200, {
+                "ok": True,
+                "message": f"{name}.{req.get('tool')} replied",
+                "text": text[:8000],
+            }
+        if a == "mcp_source":
+            msg = c.set_mcp_source(
+                name,
+                str(req.get("tool")),
+                args,
+                bool(req.get("per_pair")),
+                bool(req.get("enabled", True)),
+            )
+            return 200, {"ok": True, "message": msg}
+    except c.ConnectionSetupError as exc:
+        return 400, {"ok": False, "message": str(exc)}
+    return 400, {"ok": False, "message": f"unknown action {a!r}"}
+
+
 def make_handler(  # noqa: C901 - one closure per HTTP verb
     state_dir: Path | None,
     cfg: StrategyConfig | None,
@@ -716,6 +804,10 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                     self._json(HTTPStatus.OK, runtime.snapshot(self._query().get("bot")))
                 elif path == "/api/fleet":
                     self._json(HTTPStatus.OK, runtime.summary())
+                elif path == "/api/connections":
+                    from .connections import status as connections_status
+
+                    self._json(HTTPStatus.OK, connections_status())
                 else:
                     self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
             except (OSError, ValueError) as exc:

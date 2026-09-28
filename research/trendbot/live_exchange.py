@@ -157,13 +157,19 @@ class CcxtGateway:
             import ccxt
         except ImportError as exc:
             raise SystemExit("ccxt is not installed: pip install ccxt") from exc
+        from .connections import key_names, resolve_keys
+
         load_env_file()
-        key, secret = os.environ.get(ENV_KEY), os.environ.get(ENV_SECRET)
+        key, secret, password = resolve_keys(exchange_id, mode)
         if not key or not secret:
-            raise SystemExit(f"set {ENV_KEY} and {ENV_SECRET} in the environment for {mode}")
+            names = key_names(exchange_id, mode) if exchange_id in ("binance", "coinbase") else ()
+            raise SystemExit(
+                f"no API keys for {exchange_id} {mode}: add them in the dashboard "
+                f"(Connections) or set {' / '.join(names[:2]) or ENV_KEY} in .env"
+            )
         params: dict[str, Any] = {"apiKey": key, "secret": secret, "enableRateLimit": True}
-        if os.environ.get(ENV_PASSWORD):
-            params["password"] = os.environ[ENV_PASSWORD]
+        if password:
+            params["password"] = password
         exchange = getattr(ccxt, exchange_id)(params)
         if mode == "testnet":
             exchange.set_sandbox_mode(True)

@@ -96,6 +96,10 @@ def run_collect(settings: Any, *, fetch: Any = None, exchange: Any = None) -> di
     ]
     if settings.dex.get("enabled"):
         jobs.append(("dex_scan", dict(settings.dex)))
+    from .connections import load_connections
+
+    if any(e.get("sources") for e in load_connections()["mcp"].values()):
+        jobs.append(("connections", {"pairs": list(settings.pairs), "exchange": settings.exchange}))
     for name, section in jobs:
         try:
             mod = importlib.import_module(f"{__package__}.{name}")
@@ -125,6 +129,13 @@ def run_retrain(settings: Any, cfg: Any, *, now_ms: int | None = None) -> dict[s
     data = load_cached_candles(state_dir)
     journal = state_dir / "journal.csv"
     trades = [t for t in (read_journal(journal) if journal.exists() else []) if t.is_closed]
+    teachers = (getattr(settings, "brain", None) or {}).get("learn_from") or []
+    if teachers:  # Chantisimo: the paper bots' trades teach this bot's layers too
+        from .chantisimo import Chantisimo, load_teachers
+
+        brain = Chantisimo(state_dir)
+        brain.teachers = load_teachers(teachers, state_dir)
+        trades += brain.teacher_trades(trades)
     events = (
         load_events(settings.events) if settings.events and Path(settings.events).exists() else []
     )
@@ -140,6 +151,7 @@ def run_retrain(settings: Any, cfg: Any, *, now_ms: int | None = None) -> dict[s
         "seconds": round(time.time() - t0, 1),
         "candles": {p: len(c) for p, c in data.items()},
         "journal_trades": len(trades),
+        "teacher_dirs": list(teachers),
         "layers": {
             n: {"status": r.get("status"), "reason": r.get("reason")} for n, r in results.items()
         },

@@ -385,12 +385,21 @@ class LearningBook:
             [r for r in self.rules if r.status == "active"], enforce=self.s.mode == "enforce"
         )
 
-    def relearn(self, trades: Sequence[Trade], data: Mapping[str, Sequence[Candle]] | None):
+    def relearn(
+        self,
+        trades: Sequence[Trade],
+        data: Mapping[str, Sequence[Candle]] | None,
+        extra: Sequence[Trade] = (),
+    ):
+        """Lessons for own trades; rules from own + ``extra`` (e.g. paper teachers') trades."""
         closed = sorted((t for t in trades if t.is_closed), key=lambda t: (t.exit_ts, t.trade_id))
         for i, t in enumerate(closed):
             self.lessons.setdefault(str(t.trade_id), lesson_for(t, closed[:i]))
-        rules = derive_rules(closed, self.s)
-        self.rules = select_active(rules, closed, self.s, self.overrides, data, self.cfg)
+        pool = sorted(
+            closed + [t for t in extra if t.is_closed], key=lambda t: (t.exit_ts, t.trade_id)
+        )
+        rules = derive_rules(pool, self.s)
+        self.rules = select_active(rules, pool, self.s, self.overrides, data, self.cfg)
         return self.rules
 
     def set_override(self, rule_id: str, status: str | None) -> None:

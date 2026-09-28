@@ -41,6 +41,7 @@ RULE_IDS = {
     "X_operator": "Execution: new entries paused by the operator (exits keep running)",
     "L_signal_layer": "Layer: veto from a validated signal layer (ML/RL/regime/sentiment/flow)",
     "L_learned_rule": "Layer: veto from a learned rule (learning.py), evidence- and backtest-gated",
+    "L_brain": "Layer: Chantisimo brain veto (pair not yet proven in paper trading)",
     # Adoption-path gates (adoption.py); mirrored there as ADOPTION_RULE_IDS.
     "ADOPT_record": "The adoption record names the variant it tracks",
     "ADOPT_fingerprint": "The config (and ML model, if any) promoted is exactly the one tested",

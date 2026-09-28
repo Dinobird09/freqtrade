@@ -1,14 +1,14 @@
 {
   "exchange": "binance",
-  "mode": "paper",
+  "mode": "testnet",
   "pairs": [
     "BTC/USDT",
     "ETH/USDT",
     "BNB/USDT"
   ],
-  "state_dir": "trendbot_state/binance-paper",
-  "events": "trendbot_state/binance-paper/events.csv",
-  "starting_equity": 10000,
+  "state_dir": "trendbot_state/binance-core-testnet",
+  "events": "trendbot_state/binance-core-testnet/events.csv",
+  "starting_equity": null,
   "poll_seconds": 10,
   "close_delay_seconds": 5,
   "history_candles": 1500,
@@ -58,7 +58,9 @@
   },
   "brain": {
     "enabled": true,
-    "learn_from": [],
+    "learn_from": [
+      "trendbot_state/binance-core-paper"
+    ],
     "recall_k": 12,
     "graduation": true,
     "min_paper_trades": 20,

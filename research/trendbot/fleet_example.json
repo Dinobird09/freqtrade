@@ -2,7 +2,17 @@
   "approval_threshold": 5,
   "max_bots": 10,
   "bots": [
-    {"name": "binance-core-paper", "settings": "bots/binance-core-paper.json"},
-    {"name": "binance-sol-paper", "settings": "bots/binance-sol-paper.json"}
+    {
+      "name": "binance-core-paper",
+      "settings": "bots/binance-core-paper.json"
+    },
+    {
+      "name": "binance-sol-paper",
+      "settings": "bots/binance-sol-paper.json"
+    },
+    {
+      "name": "binance-core-testnet",
+      "settings": "bots/binance-core-testnet.json"
+    }
   ]
 }

@@ -147,7 +147,7 @@ def load_builtin_layers() -> dict[str, type[Layer]]:
     """Import the modules that register the built-in layers (each optional-dep safe)."""
     import importlib
 
-    for mod in ("ml_models", "regime_hmm", "sentiment", "orderflow"):
+    for mod in ("ml_models", "regime_hmm", "sentiment", "orderflow", "chantisimo"):
         try:
             importlib.import_module(f"{__package__}.{mod}")
         except ImportError as exc:  # a module itself is missing: report, don't crash

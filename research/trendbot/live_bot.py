@@ -46,6 +46,7 @@ from typing import Any
 
 from .adoption_evidence import read_decisions_log, write_decisions_log
 from .adoption_record import config_from_overrides
+from .chantisimo import BrainSettings, Chantisimo
 from .config import StrategyConfig
 from .data import load_candles_csv, save_candles_csv, timeframe_to_ms
 from .gatekeeper import DecisionRecord, EntryDecision, LiveSession
@@ -87,6 +88,7 @@ class BotSettings:
     sentiment: dict[str, Any] = field(default_factory=dict)  # sentiment.collect settings
     orderflow: dict[str, Any] = field(default_factory=dict)  # orderflow.collect settings
     dex: dict[str, Any] = field(default_factory=dict)  # {"enabled": false, ...} dex_scan settings
+    brain: dict[str, Any] = field(default_factory=dict)  # chantisimo.BrainSettings fields
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -149,6 +151,8 @@ class TrendBot:
         self.layer_book = LayerBook(
             self.dir, self.cfg, enabled=lay.get("enabled"), params=lay.get("params")
         )
+        self.brain = Chantisimo(self.dir, BrainSettings(**settings.brain), settings.mode)
+        self._teacher_sig: tuple[Any, ...] = ()
         self.settings_path: Path | None = None  # set by main(); needed to spawn jobs
         self._jobs: dict[str, Any] = {}
 
@@ -346,15 +350,29 @@ class TrendBot:
 
     # ------------------------------------------------------------------ learning
     def _relearn(self) -> None:
+        """Chantisimo re-reads its memory (own + teacher trades) and the rules are re-learned."""
         sess = self._sess()
-        self.book.relearn(sess.journal_trades(), self._cache)
+        own = sess.journal_trades()
+        self._teacher_sig = self._teacher_signature()
+        self.brain.remember(own)
+        extra = self.brain.teacher_trades(own)
+        self.book.relearn(own, self._cache, extra=extra)
         self._compose_filter()
-        self.book.write(sess.journal_trades(), self.state.get("trade_context", {}))
+        self.book.write(own, self.state.get("trade_context", {}))
+        self.brain.write(self.s.pairs, self.book.rules)
+
+    def _teacher_signature(self) -> tuple[Any, ...]:
+        sig = []
+        for d in self.brain.s.learn_from:
+            p = Path(d) / "journal.csv"
+            sig.append((str(p), p.stat().st_mtime if p.exists() else None))
+        return tuple(sig)
 
     def _compose_filter(self) -> None:
-        """Entry veto = learned rules first, then every active validated signal layer."""
+        """Entry veto: Chantisimo (graduation) -> learned rules -> validated signal layers."""
         view = MarketView(self._cache, self.cfg.timeframe_ms)
-        self._sess().entry_filter = self.layer_book.filter(view, extra=[self.book.filter()])
+        inner = self.layer_book.filter(view, extra=[self.book.filter()])
+        self._sess().entry_filter = self.brain.filter(inner) if self.brain.s.enabled else inner
 
     # ------------------------------------------------------------------ scheduled jobs
     def schedule_jobs(self) -> None:
@@ -409,6 +427,9 @@ class TrendBot:
         for _, msg in sess.breaker_log[-3:]:
             log.info("breaker: %s", msg)
         self.layer_book.observe(t.pair, t.features, closed.r_multiple or 0.0, closed.exit_ts)
+        ctx = self.state.get("trade_context", {}).get(str(t.trade_id), {})
+        reflection = self.brain.reflect(closed, ctx.get("brain_recall"))
+        log.info("CHANTISIMO #%d: %s", t.trade_id, reflection["lesson"])
         self._relearn()
         log.info("LESSON %s", self.book.lessons.get(str(t.trade_id), ""))
         self._save()
@@ -433,6 +454,8 @@ class TrendBot:
         if not todo:
             return
         sess = self._sess()
+        if self._teacher_signature() != self._teacher_sig:  # teachers closed trades: learn
+            self._relearn()
         sess.gatekeeper.news = NewsCalendar(self._events(), self.cfg)  # reload the calendar
         for pair in todo:
             self.refresh_candles(pair)
@@ -549,9 +572,12 @@ class TrendBot:
             )
             or "no learned rule matched (all active rules were checked before entry)"
         )
-        self.state["trade_context"][str(trade.trade_id)] = entry_context(
-            dec.check, dec.reason, trade.features, expected, note
-        )
+        ctx = entry_context(dec.check, dec.reason, trade.features, expected, note)
+        recalled = self.brain.pending.get(pair)
+        if recalled is not None:
+            ctx["brain_recall"] = {k: v for k, v in recalled.items() if k != "similar"}
+            ctx["why"].append(recalled["text"])
+        self.state["trade_context"][str(trade.trade_id)] = ctx
         log.info(
             "ENTRY %s #%d qty %.8g at %.8g, stop %.8g, target %.8g, risk %.2f%%",
             pair,

@@ -122,13 +122,23 @@ button.danger { color: var(--critical); border-color: var(--critical); font-weig
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button.small { padding: 1px 8px; font-size: 12px; }
 .toast { font-size: 12.5px; color: var(--text-secondary); }
-dialog#approval { border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; max-width: 520px;
+dialog.modal, dialog#approval { border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; max-width: 520px;
   background: var(--surface-1); color: var(--text-primary); box-shadow: 0 12px 40px rgba(0,0,0,0.35); }
-dialog#approval::backdrop { background: rgba(0,0,0,0.45); }
-dialog#approval h3 { margin: 0 0 8px; font-size: 17px; }
-dialog#approval input { font: inherit; padding: 5px 8px; border: 1px solid var(--baseline); border-radius: 6px;
+dialog.modal::backdrop, dialog#approval::backdrop { background: rgba(0,0,0,0.45); }
+dialog.modal h3, dialog#approval h3 { margin: 0 0 8px; font-size: 17px; }
+dialog.modal { max-width: 720px; width: calc(100% - 40px); }
+dialog.modal input, dialog.modal textarea, .conn-form input, .conn-form select, dialog#approval input { font: inherit; padding: 5px 8px; border: 1px solid var(--baseline); border-radius: 6px;
   background: var(--page); color: var(--text-primary); width: 100%; margin: 8px 0 12px; }
 tr.selected td { background: var(--wash); }
+.conn-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+.conn-form input, .conn-form select { width: auto; margin: 0; }
+dialog.modal label { display: block; font-size: 12.5px; color: var(--text-secondary); margin-top: 6px; }
+dialog.modal input, dialog.modal textarea { margin: 4px 0 6px; }
+dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); padding: 8px; border-radius: 6px;
+  border: 1px solid var(--border); font-size: 12px; white-space: pre-wrap; }
+.subhead { font-size: 13px; font-weight: 650; margin: 12px 0 4px; }
+.brain-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 960px) { .brain-grid { grid-template-columns: 1fr; } }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -172,6 +182,57 @@ tr.selected td { background: var(--wash); }
     <span class="spacer"></span>
     <span class="toast" id="toast" role="status" aria-live="polite"></span>
   </section>
+
+  <section class="card" id="conn-card" style="margin-bottom:12px" aria-label="Connections">
+    <details id="conn-details">
+      <summary class="card-head" style="cursor:pointer"><h2 style="display:inline">Connections</h2>
+        <span class="muted" id="conn-sub">exchange API keys and MCP servers (TradingView, …)</span></summary>
+      <div class="subhead">Exchange accounts</div>
+      <div class="muted" style="font-size:12px">Keys are saved only to your local .env file, never shown again, and never leave this computer except to the exchange. Use trade-only keys without withdrawal permission. Restart a bot after changing its keys.</div>
+      <div class="scroll" id="conn-exchanges"></div>
+      <div class="subhead">MCP servers</div>
+      <div class="muted" style="font-size:12px">Connect an MCP server such as TradingView. Test it, see its tools, try one, and have the bot collect a tool's replies hourly for every pair (shown under Market data).</div>
+      <div class="scroll" id="conn-mcp"></div>
+      <div class="conn-form">
+        <select id="mcp-preset" aria-label="Preset"><option value="tradingview">TradingView</option><option value="">Custom</option></select>
+        <input id="mcp-name" placeholder="name" value="tradingview" aria-label="Server name" autocomplete="off">
+        <input id="mcp-url" placeholder="https://…/mcp" value="https://mcp.tradingview.com/mcp" size="36" aria-label="Server URL" autocomplete="off">
+        <input id="mcp-token" type="password" placeholder="access token (if it needs one)" aria-label="Access token" autocomplete="new-password">
+        <button type="button" class="primary" id="mcp-add">Add server</button>
+      </div>
+    </details>
+  </section>
+
+  <dialog class="modal" id="keys-dialog" aria-labelledby="keys-title">
+    <h3 id="keys-title">API keys</h3>
+    <div id="keys-note" class="secondary"></div>
+    <label for="keys-key">API key</label><input id="keys-key" type="password" autocomplete="new-password" spellcheck="false">
+    <label for="keys-secret">API secret</label><input id="keys-secret" type="password" autocomplete="new-password" spellcheck="false">
+    <label for="keys-password">Passphrase (only if your exchange gave you one)</label><input id="keys-password" type="password" autocomplete="new-password" spellcheck="false">
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+      <button type="button" id="keys-cancel">Cancel</button>
+      <button type="button" class="primary" id="keys-ok">Save keys</button>
+    </div>
+  </dialog>
+
+  <dialog class="modal" id="tools-dialog" aria-labelledby="tools-title">
+    <h3 id="tools-title">Tools</h3>
+    <div class="scroll" id="tools-list"></div>
+    <div id="tools-try" style="display:none">
+      <div class="subhead" id="tools-try-title"></div>
+      <label for="tools-args">Arguments (JSON). Placeholders: {symbol} = BINANCE:BTCUSDT, {pair}, {base}, {quote}, {exchange}</label>
+      <textarea id="tools-args" rows="3" spellcheck="false"></textarea>
+      <label for="tools-pair">Pair used for the placeholders</label><select id="tools-pair"></select>
+      <label><input type="checkbox" id="tools-perpair" checked style="width:auto"> collect once per pair</label>
+      <div style="display:flex;gap:8px;margin:6px 0">
+        <button type="button" id="tools-run">Try it</button>
+        <button type="button" class="primary" id="tools-collect">Collect hourly</button>
+        <button type="button" id="tools-uncollect">Stop collecting</button>
+      </div>
+      <pre id="tools-out"></pre>
+    </div>
+    <div style="display:flex;justify-content:flex-end"><button type="button" id="tools-close">Close</button></div>
+  </dialog>
 
   <section class="tiles" id="tiles" aria-label="Key figures"></section>
 
@@ -217,6 +278,18 @@ tr.selected td { background: var(--wash); }
       <div id="rules"></div>
     </div>
 
+    <div class="card span-12" id="brain-card">
+      <div class="card-head"><h2>Chantisimo: the brain</h2><span class="muted" id="brain-sub"></span></div>
+      <div id="brain-memory" class="secondary" style="margin-bottom:6px"></div>
+      <div id="brain-grad"></div>
+      <div class="subhead">Mistakes it has learned from</div>
+      <div class="scroll" id="brain-mistakes"></div>
+      <div class="brain-grid">
+        <div><div class="subhead">Recent thoughts (each signal that passed the 9 rules)</div><div class="scroll" id="brain-thoughts"></div></div>
+        <div><div class="subhead">Reflections after each closed trade</div><div class="scroll" id="brain-reflections"></div></div>
+      </div>
+    </div>
+
     <div class="card span-12">
       <div class="card-head"><h2>Signal layers</h2><span class="muted" id="layers-sub"></span>
         <span class="spacer"></span>
@@ -228,6 +301,7 @@ tr.selected td { background: var(--wash); }
     <div class="card span-6">
       <div class="card-head"><h2>Market data</h2><span class="muted" id="market-sub"></span></div>
       <div id="market"></div>
+      <div id="mcp-data"></div>
     </div>
     <div class="card span-6">
       <div class="card-head"><h2>Order flow (latest 4H candle)</h2></div>
@@ -734,6 +808,7 @@ function renderAll() {
   renderTiles(s); renderBreakers(s); renderEquity(s); renderPairTabs(s); renderPrice(s);
   renderOpen(s); renderR(s); renderDecisionCounts(s); renderTrades(s); renderDecisions(s);
   renderControls(s); renderRules(s); renderLedger(s); renderLayers(s); renderMarket(s); renderDex(s);
+  renderBrain(s); renderMcpData(s);
   document.getElementById("log").textContent = s.log.length ? s.log.join("\n") : "bot.log is empty or missing.";
 }
 
@@ -749,10 +824,11 @@ async function control(body, confirmText) {
       headers: { "Content-Type": "application/json", "X-Trendbot-Token": CONTROL_TOKEN },
       body: JSON.stringify(body) });
     const j = await r.json();
-    if (r.status === 409 && j.needs_approval) { openApproval(j); toast("Approval required: see the pop-up."); return; }
+    if (r.status === 409 && j.needs_approval) { openApproval(j); toast("Approval required: see the pop-up."); return j; }
     toast((j.ok ? "✓ " : "✕ ") + j.message);
-  } catch (e) { toast("✕ " + e.message); }
-  setTimeout(refresh, 800);
+    setTimeout(refresh, 800);
+    return j;
+  } catch (e) { toast("✕ " + e.message); setTimeout(refresh, 800); return { ok: false, message: e.message }; }
 }
 function openApproval(j) {
   const dlg = document.getElementById("approval"), body = clear(document.getElementById("approval-body"));
@@ -929,6 +1005,174 @@ function renderLedger(s) {
     { label: "lesson", get: (r) => el("span", { class: "secondary" }, r.lesson || (r.status === "open" ? "written when it closes" : "–")) }], rows));
 }
 
+
+// ------------------------------------------------------------------ Chantisimo (the brain)
+function renderBrain(s) {
+  const b = s.brain || {}, m = b.memory;
+  document.getElementById("brain-sub").textContent = "recalls similar trades before every entry, learns from every loss, carries paper-trading lessons into real trading";
+  const mem = clear(document.getElementById("brain-memory"));
+  if (!m) mem.append(el("span", {}, "Chantisimo has no memory yet: it starts remembering when the bot runs."));
+  else {
+    const src = Object.entries(m.by_source || {}).map(([k, v]) => `${v} ${k}`).join(", ") || "none";
+    mem.append(el("span", {}, `Remembers ${m.trades} closed trades (${src}) · ${m.wins} won · avg ${signed(m.avg_r, 2, "R")}` +
+      (b.teachers && b.teachers.length ? ` · learns from paper bots: ${m.teachers.join(", ") || b.teachers.join(", ")}` : " · no paper teachers configured (brain.learn_from)")));
+  }
+  const grad = clear(document.getElementById("brain-grad"));
+  if ((b.graduation || []).some((g) => g.why !== "no graduation needed")) {
+    grad.append(el("div", { class: "subhead" }, "Graduation from paper trading (testnet / live bots trade a pair only after it is proven in paper)"));
+    grad.append(tableView([{ label: "pair", get: (r) => r.pair },
+      { label: "graduated", get: (r) => el("span", { class: "pill " + (r.graduated ? "ok" : "no") }, r.graduated ? "yes" : "not yet") },
+      { label: "paper trades", num: true, get: (r) => r.paper_trades },
+      { label: "paper avg R", num: true, get: (r) => signed(r.paper_avg_r, 2, "R") },
+      { label: "why", get: (r) => el("span", { class: "secondary" }, r.why) }], b.graduation));
+  }
+  const mk = clear(document.getElementById("brain-mistakes"));
+  if (!(b.mistakes || []).length) mk.append(el("div", { class: "empty" }, "No mistakes recorded yet."));
+  else mk.append(tableView([{ label: "mistake", get: (r) => r.mistake },
+    { label: "losses", num: true, get: (r) => r.losses },
+    { label: "R lost", num: true, get: (r) => signed(r.lost_r, 2, "R") },
+    { label: "where", get: (r) => Object.entries(r.sources || {}).map(([k, v]) => `${v} ${k}`).join(", ") },
+    { label: "what Chantisimo does", get: (r) => r.status.startsWith("blocked") ? status("good", r.status) : status("warning", "watching: becomes a rule once enough trades confirm it") }], b.mistakes));
+  const th = clear(document.getElementById("brain-thoughts"));
+  if (!(b.thoughts || []).length) th.append(el("div", { class: "empty" }, "No thoughts yet."));
+  else th.append(tableView([{ label: "signal (UTC)", nowrap: true, get: (r) => (r.signal_utc || "").replace("T", " ").slice(0, 16) },
+    { label: "pair", get: (r) => r.pair },
+    { label: "verdict", get: (r) => el("span", { class: "pill " + (r.verdict === "TAKE" ? "ok" : "no") }, r.verdict) },
+    { label: "memory", get: (r) => el("span", { class: "secondary" }, r.recall_text || "") },
+    { label: "reason", get: (r) => el("span", { class: "secondary" }, r.reason || "") }], b.thoughts));
+  const rf = clear(document.getElementById("brain-reflections"));
+  if (!(b.reflections || []).length) rf.append(el("div", { class: "empty" }, "No closed trades to reflect on yet."));
+  else rf.append(tableView([{ label: "trade", get: (r) => "#" + r.trade_id + " " + r.pair },
+    { label: "result", num: true, get: (r) => signed(r.r, 2, "R") },
+    { label: "recall said", num: true, get: (r) => r.predicted && r.predicted.n ? signed(r.predicted.avg_r, 2, "R") : "–" },
+    { label: "mistakes", get: (r) => el("span", { class: "secondary" }, (r.mistakes || []).join("; ") || "none") },
+    { label: "lesson", get: (r) => el("span", { class: "secondary" }, r.lesson) }], b.reflections));
+}
+function renderMcpData(s) {
+  const host = clear(document.getElementById("mcp-data")), rows = (s.market || {}).mcp || [];
+  if (!rows.length) return;
+  host.append(el("div", { class: "subhead" }, "MCP data sources (latest reply)"));
+  host.append(tableView([{ label: "source", get: (r) => `${r.server}.${r.tool}` }, { label: "pair", get: (r) => r.pair || "–" },
+    { label: "time", nowrap: true, get: (r) => dt(r.ts) },
+    { label: "reply", get: (r) => el("span", { class: "secondary" }, r.error ? "error: " + r.error : r.text) }], rows));
+}
+
+// ------------------------------------------------------------------ connections
+async function refreshConnections() {
+  if (EMBEDDED) { document.getElementById("conn-card").style.display = "none"; return; }
+  try {
+    const r = await fetch("api/connections", { cache: "no-store" });
+    if (r.ok) { state.conn = await r.json(); renderConnections(); }
+  } catch (e) { /* keep the last view */ }
+}
+function renderConnections() {
+  const cst = state.conn; if (!cst) return;
+  const on = controlsOn();
+  const nKeys = cst.exchanges.filter((x) => x.keys === "set").length;
+  if (!state.connOpened) { state.connOpened = true; if (!nKeys && !cst.mcp.length) document.getElementById("conn-details").open = true; }
+  document.getElementById("conn-sub").textContent = `${nKeys} exchange account(s) with keys · ${cst.mcp.length} MCP server(s) · keys file ${cst.env_file}`;
+  const kinds = { set: "good", generic: "warning", missing: "critical" };
+  const ex = clear(document.getElementById("conn-exchanges"));
+  ex.append(tableView([
+    { label: "exchange", get: (r) => el("strong", {}, r.exchange) },
+    { label: "account", get: (r) => r.account },
+    { label: "keys", get: (r) => status(kinds[r.keys], r.keys === "set" ? "saved" : r.keys === "generic" ? "using TRENDBOT_API_KEY" : "not set") },
+    { label: "", get: (r) => { const d = el("span", { style: "display:inline-flex;gap:4px" });
+        const set = el("button", { type: "button", class: "small primary" }, r.keys === "set" ? "Replace keys" : "Add keys");
+        set.disabled = !on; set.addEventListener("click", () => openKeys(r));
+        d.append(set, controlButton("Test", "small", { action: "keys_test", exchange: r.exchange, account: r.account }));
+        if (r.keys === "set") d.append(controlButton("Remove", "small", { action: "keys_clear", exchange: r.exchange, account: r.account }, `Remove the ${r.exchange} ${r.account} keys from .env?`));
+        return d; } }], cst.exchanges));
+  const mh = clear(document.getElementById("conn-mcp"));
+  if (!cst.mcp.length) mh.append(el("div", { class: "empty", style: "padding:10px 0" }, "No MCP server yet: pick TradingView below and press Add server."));
+  else mh.append(tableView([
+    { label: "name", get: (r) => el("strong", {}, r.name) },
+    { label: "URL", get: (r) => el("span", { class: "secondary" }, r.url) },
+    { label: "token", get: (r) => r.token ? "saved" : "none" },
+    { label: "status", get: (r) => r.tested ? status("good", `${r.tools.length} tools · tested ${r.tested.replace("T", " ").slice(0, 16)}`) : status("warning", "not tested") },
+    { label: "collected hourly", get: (r) => (r.sources || []).map((x) => x.tool).join(", ") || "–" },
+    { label: "", get: (r) => { const d = el("span", { style: "display:inline-flex;gap:4px" });
+        const t = el("button", { type: "button", class: "small primary" }, "Test");
+        t.disabled = !on; t.addEventListener("click", async () => { const j = await control({ action: "mcp_test", name: r.name }); await refreshConnections(); if (j && j.ok) openTools(r.name, j.tools); });
+        const tl = el("button", { type: "button", class: "small" }, "Tools");
+        tl.disabled = !on || !r.tools.length; tl.addEventListener("click", () => openTools(r.name, r.tools));
+        const rm = el("button", { type: "button", class: "small" }, "Remove");
+        rm.disabled = !on; rm.addEventListener("click", async () => { await control({ action: "mcp_remove", name: r.name }, `Remove MCP server ${r.name}?`); refreshConnections(); });
+        d.append(t, tl, rm); return d; } }], cst.mcp));
+  document.getElementById("mcp-add").disabled = !on;
+}
+function openKeys(r) {
+  const dlg = document.getElementById("keys-dialog");
+  document.getElementById("keys-title").textContent = `${r.exchange} ${r.account} API keys`;
+  const note = clear(document.getElementById("keys-note"));
+  note.append(el("p", {}, r.account === "testnet"
+    ? (r.exchange === "binance" ? "Binance testnet keys come from testnet.binance.vision." : "Use your exchange's sandbox keys.")
+    : "Real-money keys: give them trade permission only, no withdrawals, and restrict them to your IP if the exchange allows it."));
+  if (r.exchange === "coinbase") note.append(el("p", { class: "muted" }, "Coinbase Advanced Trade: paste the API key name and the private key as the secret."));
+  for (const id of ["keys-key", "keys-secret", "keys-password"]) document.getElementById(id).value = "";
+  document.getElementById("keys-cancel").onclick = () => dlg.close();
+  document.getElementById("keys-ok").onclick = async () => {
+    const body = { action: "keys_save", exchange: r.exchange, account: r.account,
+      key: document.getElementById("keys-key").value, secret: document.getElementById("keys-secret").value,
+      password: document.getElementById("keys-password").value };
+    for (const id of ["keys-key", "keys-secret", "keys-password"]) document.getElementById(id).value = "";
+    dlg.close();
+    await control(body);
+    refreshConnections();
+  };
+  dlg.showModal(); document.getElementById("keys-key").focus();
+}
+function openTools(name, tools) {
+  const dlg = document.getElementById("tools-dialog");
+  document.getElementById("tools-title").textContent = `${name}: ${tools.length} tools`;
+  const tryBox = document.getElementById("tools-try"); tryBox.style.display = "none";
+  const list = clear(document.getElementById("tools-list"));
+  const pairs = Object.keys((state.snap || {}).pairs || {});
+  const sel = clear(document.getElementById("tools-pair"));
+  for (const p of pairs.length ? pairs : ["BTC/USDT"]) sel.append(el("option", { value: p }, p));
+  const pick = (t) => {
+    tryBox.style.display = "";
+    document.getElementById("tools-try-title").textContent = t.name;
+    document.getElementById("tools-args").value = '{"symbol": "{symbol}"}';
+    document.getElementById("tools-out").textContent = t.description || "";
+    const args = () => { try { return JSON.parse(document.getElementById("tools-args").value || "{}"); } catch (e) { toast("✕ arguments are not valid JSON"); return null; } };
+    document.getElementById("tools-run").onclick = async () => {
+      const a = args(); if (a === null) return;
+      document.getElementById("tools-out").textContent = "calling…";
+      const j = await control({ action: "mcp_call", name, tool: t.name, args: a, pair: sel.value, exchange_id: (state.snap || {meta: {}}).meta.exchange || "binance" });
+      document.getElementById("tools-out").textContent = j && j.ok ? (j.text || "(empty reply)") : "✕ " + (j ? j.message : "failed");
+    };
+    document.getElementById("tools-collect").onclick = async () => {
+      const a = args(); if (a === null) return;
+      await control({ action: "mcp_source", name, tool: t.name, args: a, per_pair: document.getElementById("tools-perpair").checked, enabled: true });
+      refreshConnections();
+    };
+    document.getElementById("tools-uncollect").onclick = async () => { await control({ action: "mcp_source", name, tool: t.name, args: {}, enabled: false }); refreshConnections(); };
+  };
+  list.append(tableView([{ label: "tool", get: (t) => el("strong", {}, t.name) },
+    { label: "what it does", get: (t) => el("span", { class: "secondary" }, t.description || "") },
+    { label: "", get: (t) => { const b = el("button", { type: "button", class: "small" }, "Use"); b.addEventListener("click", () => pick(t)); return b; } }], tools));
+  document.getElementById("tools-close").onclick = () => dlg.close();
+  dlg.showModal();
+}
+document.getElementById("mcp-preset").addEventListener("change", (ev) => {
+  const v = ev.currentTarget.value, presets = (state.conn || {}).presets || {};
+  document.getElementById("mcp-name").value = v || "";
+  document.getElementById("mcp-url").value = v && presets[v] ? presets[v].url : "";
+});
+document.getElementById("mcp-add").addEventListener("click", async () => {
+  const tok = document.getElementById("mcp-token");
+  const j = await control({ action: "mcp_save", name: document.getElementById("mcp-name").value,
+    url: document.getElementById("mcp-url").value, token: tok.value });
+  tok.value = "";
+  await refreshConnections();
+  if (j && j.ok) {
+    const t = await control({ action: "mcp_test", name: document.getElementById("mcp-name").value.trim().toLowerCase() });
+    await refreshConnections();
+    if (t && t.ok) openTools(document.getElementById("mcp-name").value.trim().toLowerCase(), t.tools);
+  }
+});
+
 // ------------------------------------------------------------------ data + controls
 async function refresh() {
   const app = document.getElementById("app"), err = document.getElementById("b-error");
@@ -943,6 +1187,7 @@ async function refresh() {
     const j = await r.json();
     if (!r.ok || j.error) throw new Error(j.error || r.statusText);
     state.snap = j; err.textContent = ""; renderAll();
+    refreshConnections();
   } catch (e) { err.textContent = "refresh failed: " + e.message + " (showing last snapshot)"; }
   finally { app.classList.remove("loading"); }
 }
@@ -965,7 +1210,7 @@ document.getElementById("theme").addEventListener("click", (ev) => {
 let resizeTimer = null;
 window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderAll, 150); });
 
-if (EMBEDDED) { state.snap = EMBEDDED; renderAll(); }
+if (EMBEDDED) { state.snap = EMBEDDED; renderAll(); document.getElementById("conn-card").style.display = "none"; }
 else { refresh(); setInterval(refresh, Math.max(5, REFRESH_S) * 1000); }
 </script>
 </body>

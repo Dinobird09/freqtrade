@@ -128,4 +128,5 @@ docker-compose-*.yml
 trendbot_state/
 /fleet.json
 /fleet_approvals.jsonl
+/connections.json
 /bots/

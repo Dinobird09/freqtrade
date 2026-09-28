@@ -41,8 +41,12 @@ up in the repository.
   - `state_dir`: use one folder per exchange/mode.
   - `strategy.fee_rate`: your fee tier.
   - `learning`: see section 6.
-- **`.env`:** only for `testnet` and `live`:
-  - set `TRENDBOT_API_KEY` and `TRENDBOT_API_SECRET`;
+- **API keys:** only for `testnet` and `live`. Add them in the dashboard (**Connections**,
+  see section 4a); it writes them to `.env` for you. Or edit `.env` by hand:
+  - `TRENDBOT_BINANCE_TESTNET_API_KEY` / `_API_SECRET`, `TRENDBOT_BINANCE_API_KEY` /
+    `_API_SECRET`, `TRENDBOT_COINBASE_API_KEY` / `_API_SECRET`;
+  - the generic `TRENDBOT_API_KEY` / `TRENDBOT_API_SECRET` are used for any account without
+    its own keys;
   - use keys with trade permission only, no withdrawals, and IP-restricted if your exchange
     offers it;
   - Binance testnet keys come from testnet.binance.vision.
@@ -89,6 +93,42 @@ Command-line equivalents, if you prefer:
 
 On Windows use `.venv\Scripts\python.exe` in place of `.venv/bin/python`.
 
+## 4a. Connections: exchange keys and MCP servers (TradingView)
+
+The **Connections** card at the top of the dashboard:
+
+| part | what you can do |
+|---|---|
+| Exchange accounts | Binance and Coinbase, testnet and live. **Add keys** opens a pop-up for the key, secret and (optional) passphrase. **Test** logs in and reads your balance; nothing is traded. **Remove** deletes the keys. |
+| MCP servers | Pick **TradingView** (or Custom), optionally paste an access token, press **Add server**. The dashboard connects, lists the server's tools, lets you **Try** a tool with arguments, and **Collect hourly** stores its replies for every pair (shown under Market data). |
+
+How the values are kept:
+
+- keys and tokens go to your local `.env` (file permissions 0600) and are never shown again,
+  not even to the dashboard;
+- the server list goes to `connections.json`;
+- both files are git-ignored;
+- restart a running bot after changing its keys.
+
+Tool arguments may use placeholders:
+
+| placeholder | example value |
+|---|---|
+| `{symbol}` | `BINANCE:BTCUSDT` |
+| `{pair}` | `BTC/USDT` |
+| `{base}` | `BTC` |
+| `{quote}` | `USDT` |
+| `{exchange}` | `BINANCE` |
+
+MCP replies are free-form text. The bot records and shows them, but they never open or block
+a trade on their own.
+
+If a server answers "needs a sign-in", paste the access token it gives you and add the server
+again.
+
+There is no Binance MCP to add: the bot talks to Binance directly through its API, using the
+keys under Exchange accounts.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,
@@ -131,9 +171,58 @@ Set `"learning": {"mode": "advisory"}` to log rules without blocking anything. L
 only veto trades that already passed the nine strategy rules; it never loosens a rule or
 raises risk.
 
+## 6a. Chantisimo: the brain
+
+Chantisimo is the part of the bot that decides whether to take a signal that passed the nine
+rules, and that learns from every trade. Before each entry it:
+
+1. **Recalls** the 12 most similar past trades, by RSI, volume, EMA gap, distance to EMA200,
+   hour and pair, and what happened to them.
+2. **Checks graduation.** A testnet or live bot trades a pair only after its paper bots have
+   at least 20 closed trades on that pair averaging ≥ 0R.
+3. **Applies the learned rules and the validated signal layers.** This includes
+   `chantisimo_recall`, a nearest-neighbour veto that is switched on only after it helps on
+   unseen data.
+4. **Writes its verdict** (TAKE or SKIP, with the reason and the recall) to
+   `chantisimo_thoughts.jsonl`.
+
+After each close it **reflects**:
+
+- what the recall predicted, compared with what happened;
+- which **mistakes** caused a loss: entry conditions unlike the winners' (weak volume,
+  stretched RSI, late entry far above EMA200, …) or a stop-out within 2 candles;
+- the lesson it takes from the trade.
+
+The mistake book counts every mistake. A mistake that keeps losing becomes a blocking rule
+through the learned-rule checks in section 6.
+
+**Learning from paper before real money.** Point a testnet or live bot at your paper bots:
+
+```json
+"brain": {"learn_from": ["trendbot_state/binance-core-paper"], "min_paper_trades": 20}
+```
+
+The bot then remembers the paper bots' trades, including their losses, and learns its rules
+and layers from them. It has lost nothing of its own at that point. Memory is causal: a
+decision only sees trades that had closed by then.
+
+The dashboard's **Chantisimo** card shows:
+
+- its memory;
+- the graduation table;
+- the mistakes and what it does about each;
+- its recent thoughts;
+- a reflection per closed trade.
+
+`chantisimo.md` holds the same in plain English.
+
+Chantisimo only ever skips. It never opens a trade, loosens a rule or raises risk. It lowers
+the number of losing trades, but no rule set removes losses entirely.
+
 ## 7. Running up to 10 bots (fleet)
 
-`setup` also creates `fleet.json` and a `bots/` folder with two example bot settings files.
+`setup` also creates `fleet.json` and a `bots/` folder with three example bots: two paper bots
+and a testnet bot whose brain learns from the paper core bot (section 6a).
 Add up to 10 bots, one settings file each, then start the fleet dashboard:
 
 | OS | command |
@@ -224,7 +313,8 @@ Some layers only start working once their data exists:
 
 | source | key needed? |
 |---|---|
-| exchange (testnet / live trading) | yes: `TRENDBOT_API_KEY`, `TRENDBOT_API_SECRET` in `.env` |
+| exchange (testnet / live trading) | yes: add them in the dashboard (Connections), or in `.env` |
+| TradingView or another MCP server | only if the server asks for a sign-in: paste its token in Connections |
 | Fear & Greed (alternative.me) | no |
 | news RSS feeds, Reddit public JSON | no |
 | CryptoPanic news | optional free key: `CRYPTOPANIC_TOKEN=` in `.env` |
@@ -232,10 +322,10 @@ Some layers only start working once their data exists:
 | Solana holder data | no; optionally `SOLANA_RPC_URL=` a Helius/QuickNode URL for higher limits |
 | Binance aggTrades history (order flow) | no |
 
-**TradingView MCP:** `claude mcp add --transport http mcp-tradingview
-https://mcp.tradingview.com/mcp` connects TradingView to **Claude Code** on your computer, so
-Claude can read charts and data while you work with it. The bot itself runs without Claude,
-so it cannot use an MCP server. It gets its market data from the exchange directly.
+**TradingView MCP:** add it in the dashboard, under Connections → MCP servers → TradingView
+(section 4a). The bot then calls its tools itself; it does not need Claude. Separately,
+`claude mcp add --transport http mcp-tradingview https://mcp.tradingview.com/mcp` connects
+it to **Claude Code**, if you also want Claude to read TradingView while you work.
 
 ## 9. Tests (optional)
 

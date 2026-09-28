@@ -31,7 +31,8 @@
       "hmm_regime",
       "fear_greed",
       "news_sentiment",
-      "orderflow"
+      "orderflow",
+      "chantisimo_recall"
     ],
     "params": {},
     "validation": {
@@ -54,5 +55,13 @@
     "enabled": false,
     "chain": "solana",
     "position_usd": 500
+  },
+  "brain": {
+    "enabled": true,
+    "learn_from": [],
+    "recall_k": 12,
+    "graduation": true,
+    "min_paper_trades": 20,
+    "min_paper_avg_r": 0.0
   }
 }
