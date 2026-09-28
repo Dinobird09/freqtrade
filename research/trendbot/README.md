@@ -106,6 +106,38 @@ through-the-stop paths, fee parsing, the retry and no-resend behaviour, and the 
 bot has not been run against a real exchange from this sandbox, which has no network
 access. Start with `paper`, then `testnet`, to confirm your keys, pairs and exchange limits.
 
+### 0.1 Dashboard (`dashboard.py`)
+
+A read-only web dashboard over the bot's `state_dir`. It needs no exchange keys, can run
+beside the bot, and works the same for paper, testnet and live.
+
+```bash
+python3 -m research.trendbot.dashboard --settings bot.json            # http://127.0.0.1:8050/
+python3 -m research.trendbot.dashboard --state-dir trendbot_state/binance-live --port 8060
+python3 -m research.trendbot.dashboard --settings bot.json --export snapshot.html  # static file
+```
+
+What it shows:
+
+- **Key figures:** realized equity and return, expectancy (avg R), profit factor, max
+  realized drawdown, open risk against the shared R6 budget, and 7-day realized P&L
+  against the halt limit.
+- **Realized equity curve.**
+- **Circuit-breaker status:** R9 benches and halts, each explained in one sentence.
+- **4H price per pair:** close, EMA21 and EMA200. When a pair has an open trade, its
+  entry, stop and target are drawn too, with entry and exit markers.
+- **Open positions,** marked at the last cached close.
+- **R per closed trade.**
+- **Signal outcomes by first failed rule.**
+- **Tables and log:** closed trades, recent decisions with their reasons, and the tail of
+  `bot.log`.
+
+The page refreshes every `--refresh` seconds (default 15). Every chart has a table view,
+and light and dark themes are supported (auto or toggled).
+
+The server binds to 127.0.0.1 and serves only `/` and `/api/snapshot`. It has no write or
+trade endpoints, and it sends a strict Content-Security-Policy.
+
 ## 1. No win rate is promised or targeted
 
 Nothing in this package promises, targets or optimises a win rate:
