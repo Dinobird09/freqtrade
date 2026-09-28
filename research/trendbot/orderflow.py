@@ -71,7 +71,10 @@ Fetch = Callable[[str], bytes]
 # ---------------------------------------------------------------------- trade model
 @dataclass(frozen=True, slots=True)
 class FlowTrade:
-    """One executed trade. ``taker_side`` is the aggressor: 'buy' lifted an ask, 'sell' hit a bid."""
+    """One executed trade. ``taker_side`` is the aggressor: 'buy' lifted an ask, 'sell' hit a bid.
+
+    (Named FlowTrade to avoid confusion with ``models.Trade``, the bot's own positions.)
+    """
 
     ts: int  # ms UTC
     price: float
@@ -172,7 +175,9 @@ class FootprintSummary:
                 kw[name] = float(v)
         lv = d.get("levels")
         if lv:
-            kw["levels"] = tuple(Level(float(x["price"]), float(x["bid"]), float(x["ask"])) for x in lv)
+            kw["levels"] = tuple(
+                Level(float(x["price"]), float(x["bid"]), float(x["ask"])) for x in lv
+            )
         return cls(**kw)
 
     def same_flow(self, other: FootprintSummary) -> bool:
@@ -220,7 +225,9 @@ def _levels(acc: _CandleAcc, size: float) -> tuple[int, dict[int, list[float]]]:
     return min(by_idx), by_idx
 
 
-def _imbalances(lo: int, hi: int, lv: Mapping[int, list[float]], p: FootprintParams) -> tuple[int, int]:
+def _imbalances(
+    lo: int, hi: int, lv: Mapping[int, list[float]], p: FootprintParams
+) -> tuple[int, int]:
     def hit(aggr: float, opposite: float) -> bool:
         if aggr <= 0 or (opposite <= 0 and not p.count_zero_opposite):
             return False
@@ -232,7 +239,9 @@ def _imbalances(lo: int, hi: int, lv: Mapping[int, list[float]], p: FootprintPar
     return buys, sells
 
 
-def _absorption(acc: _CandleAcc, low: float, high: float, volume: float, share: float) -> tuple[bool, bool]:
+def _absorption(
+    acc: _CandleAcc, low: float, high: float, volume: float, share: float
+) -> tuple[bool, bool]:
     rng = high - low
     if rng <= 0 or volume <= 0:
         return False, False
@@ -246,7 +255,9 @@ def _absorption(acc: _CandleAcc, low: float, high: float, volume: float, share: 
     return bull, bear
 
 
-def _finalize(acc: _CandleAcc, pair: str, p: FootprintParams, cum: float, source: str) -> FootprintSummary:
+def _finalize(
+    acc: _CandleAcc, pair: str, p: FootprintParams, cum: float, source: str
+) -> FootprintSummary:
     size = p.bin_size(acc.open)
     lo, lv = _levels(acc, size)
     hi = max(lv)
@@ -328,7 +339,9 @@ def aggregate_trades(
         cum = s.cum_delta
         yield s
     if dropped:
-        log.warning("%s: dropped %d out-of-order trades older than an emitted candle", pair, dropped)
+        log.warning(
+            "%s: dropped %d out-of-order trades older than an emitted candle", pair, dropped
+        )
 
 
 def footprints(
@@ -378,9 +391,9 @@ def fetch_trades(
     Pages ``exchange.fetch_trades(symbol, since=..., limit=...)``. The next ``since`` is the
     last returned timestamp (the same-millisecond overlap is removed by id, or by
     (ts, price, amount, side) when the exchange sends no id), +1 ms if that makes no
-    progress. An empty page advances ``since`` by ``empty_step_ms``: ccxt's Binance
-    implementation answers ``since`` with a bounded time window (assumed ~1h), so a quiet
-    hour must not end the download.
+    progress. An empty page (or one holding only rows older than ``since``) advances
+    ``since`` by ``empty_step_ms``: ccxt's Binance implementation answers ``since`` with a
+    bounded time window (assumed ~1h), so a quiet hour must not end the download.
     """
     if limit <= 0:
         raise ValueError("limit must be > 0")
@@ -399,8 +412,13 @@ def fetch_trades(
             t = _row_to_trade(row)
             if t is not None and since_ms <= t.ts < until:
                 seen[_dedupe_key(t)] = t
-        nxt = max(stamps, default=since)
-        since = nxt if nxt > since else since + 1
+        nxt = max(stamps, default=since - 1)
+        if nxt > since:
+            since = nxt
+        elif nxt == since:
+            since += 1  # everything left at this millisecond was returned (or a full page)
+        else:
+            since += empty_step_ms  # only stale rows before `since`: nothing new here
     else:
         log.warning("%s: fetch_trades stopped after %d pages", pair, max_pages)
     return sorted(seen.values(), key=lambda t: (t.ts, t.trade_id or ""))
@@ -602,7 +620,12 @@ def _history_done_path(state_dir: Path) -> Path:
 
 
 def _backfill_pair(
-    state_dir: Path, pair: str, periods: Sequence[str], of: Mapping[str, Any], fetch: Fetch, params: FootprintParams
+    state_dir: Path,
+    pair: str,
+    periods: Sequence[str],
+    of: Mapping[str, Any],
+    fetch: Fetch,
+    params: FootprintParams,
 ) -> dict[str, Any]:
     done_path = _history_done_path(state_dir)
     done = set(json.loads(done_path.read_text(encoding="utf-8"))) if done_path.exists() else set()
@@ -630,7 +653,12 @@ def _backfill_pair(
 
 
 def _live_pair(
-    state_dir: Path, pair: str, exchange: Any, of: Mapping[str, Any], params: FootprintParams, now: int
+    state_dir: Path,
+    pair: str,
+    exchange: Any,
+    of: Mapping[str, Any],
+    params: FootprintParams,
+    now: int,
 ) -> dict[str, Any]:
     tf = params.timeframe_ms
     have = load_store(state_dir, pair)
@@ -640,10 +668,17 @@ def _live_pair(
     since = max(since, oldest)
     if since >= first_open:
         return {"added": 0, "replaced": 0, "since_utc": ms_to_iso(since)}
-    trades = fetch_trades(exchange, pair, since, first_open, limit=int(of.get("trades_limit", 1000)))
+    trades = fetch_trades(
+        exchange, pair, since, first_open, limit=int(of.get("trades_limit", 1000))
+    )
     fps = [s for s in footprints(trades, pair, params, SOURCE_LIVE) if s.ts + tf <= now]
     m = merge_store(state_dir, pair, fps)
-    return {"added": m["added"], "replaced": m["replaced"], "trades": len(trades), "since_utc": ms_to_iso(since)}
+    return {
+        "added": m["added"],
+        "replaced": m["replaced"],
+        "trades": len(trades),
+        "since_utc": ms_to_iso(since),
+    }
 
 
 def collect(

@@ -92,7 +92,7 @@ def run_collect(settings: Any, *, fetch: Any = None, exchange: Any = None) -> di
     report: dict[str, Any] = {"started_utc": ms_to_iso(started), "sources": {}}
     jobs = [
         ("sentiment", {**settings.sentiment, "events": settings.events}),
-        ("orderflow", {**settings.orderflow, "pairs": list(settings.pairs)}),
+        ("orderflow", {"pairs": list(settings.pairs), "orderflow": dict(settings.orderflow)}),
     ]
     if settings.dex.get("enabled"):
         jobs.append(("dex_scan", dict(settings.dex)))

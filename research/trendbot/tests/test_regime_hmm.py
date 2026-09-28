@@ -10,7 +10,7 @@ import time
 import pytest
 
 from research.trendbot.config import StrategyConfig
-from research.trendbot.layers import LAYER_TYPES, MarketView, STATUSES, validate_layer
+from research.trendbot.layers import LAYER_TYPES, STATUSES, MarketView, validate_layer
 from research.trendbot.models import HOUR_MS, Candle, FeatureRow
 from research.trendbot.regime_hmm import (
     GaussianHMM,
@@ -161,10 +161,12 @@ def test_incremental_cache_equals_batch_filter_and_handles_new_views():
         v = MarketView({"BTC/USDT": cs[: i + 1]}, TF)
         assert layer.filtered_at("BTC/USDT", v, cs[i].ts + TF)[0] == batch[cs[i].ts + TF]
     # rewritten history is detected and rebuilt
-    edited = cs[:1000] + [Candle(c.ts, c.open, c.high, c.low, c.close * 1.5, 1.0) for c in cs[1000:]]
+    edited = cs[:1000] + [
+        Candle(c.ts, c.open, c.high, c.low, c.close * 1.5, 1.0) for c in cs[1000:]
+    ]
     v = MarketView({"BTC/USDT": edited}, TF)
     got = layer.filtered_at("BTC/USDT", v, edited[2500].ts + TF)[0]
-    ts2, obs2 = build_observations(edited[:2501], 12, TF)
+    _, obs2 = build_observations(edited[:2501], 12, TF)
     assert got == hmm.filter(obs2)[0][-1]
 
 

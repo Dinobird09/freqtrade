@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -354,12 +354,32 @@ def _market_view(d: Path) -> dict[str, Any]:
     try:
         from .dex_scan import load_watchlist
 
-        wl = load_watchlist(d)
-        items = wl.get("tokens", wl.get("items", [])) if isinstance(wl, dict) else (wl or [])
-        out["dex"] = list(items)[:50]
+        wl = load_watchlist(d) or {}
+        out["dex"] = [_dex_row(r) for r in list(wl.get("tokens") or [])[:50]]
+        out["dex_scanned"] = wl.get("generated_at")
     except Exception as exc:
         out["dex_error"] = str(exc)
     return out
+
+
+def _dex_row(r: Mapping[str, Any]) -> dict[str, Any]:
+    pair = r.get("pair") or {}
+    holders = r.get("holders") or {}
+    return {
+        "symbol": r.get("symbol") or r.get("name") or (r.get("address") or "?")[:8],
+        "chain": pair.get("chain_id"),
+        "liquidity_usd": pair.get("liquidity_usd"),
+        "volume_h24": (pair.get("volume") or {}).get("h24"),
+        "top10_share": holders.get("top10_share"),
+        "score": r.get("score"),
+        "tradable": bool(r.get("tradable")),
+        "flags": [
+            f.get("code") or f.get("name")
+            for f in r.get("flags") or []
+            if f.get("severity") != "soft"
+        ],
+        "url": pair.get("url"),
+    }
 
 
 def _ledger_view(d: Path, tail: int) -> list[dict[str, Any]]:
@@ -503,14 +523,154 @@ class Controller:
         return True, f"bot started (pid {self.proc.pid})"
 
 
+class FleetRuntime:
+    """One dashboard over 1-10 bots: snapshots, controls and the >5-bot approval flow."""
+
+    def __init__(
+        self, fleet: Any, entries: Mapping[str, tuple[Path, StrategyConfig, Controller | None]]
+    ) -> None:
+        self.fleet = fleet
+        self.entries = dict(entries)
+
+    @property
+    def names(self) -> list[str]:
+        return list(self.entries)
+
+    @property
+    def is_fleet(self) -> bool:
+        return self.fleet is not None and self.fleet.path is not None
+
+    @property
+    def controls(self) -> bool:
+        return any(c is not None for _, _, c in self.entries.values())
+
+    def _ctrl(self, name: str) -> Controller | None:
+        return self.entries[name][2]
+
+    def running(self) -> list[str]:
+        return [n for n in self.names if (c := self._ctrl(n)) and c.bot_status()["running"]]
+
+    def snapshot(self, name: str | None) -> dict[str, Any]:
+        name = name if name in self.entries else self.names[0]
+        state_dir, cfg, ctrl = self.entries[name]
+        snap = build_snapshot(state_dir, cfg)
+        snap["bot"] = ctrl.bot_status() if ctrl else None
+        snap["meta"]["bot_name"] = name
+        return snap
+
+    def summary(self) -> dict[str, Any]:
+        from .fleet import summary_row
+
+        rows = []
+        for n in self.names:
+            try:
+                rows.append(summary_row(n, self.snapshot(n)))
+            except (OSError, ValueError) as exc:
+                rows.append({"name": n, "error": str(exc)})
+        f = self.fleet
+        return {
+            "fleet": self.is_fleet,
+            "bots": rows,
+            "running": sum(1 for r in rows if r.get("running")),
+            "approval_threshold": f.approval_threshold if f else None,
+            "max_bots": f.max_bots if f else 1,
+        }
+
+    def act(self, req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        from .fleet import FleetError
+
+        action = req.get("action")
+        try:
+            if action == "approve":
+                a = self.fleet.take_approval(
+                    str(req.get("approval_id")), str(req.get("confirm", ""))
+                )
+                return self._start_now(a.bots, approved=True)
+            if action == "start_all":
+                return self._start_many([n for n in self.names if n not in self.running()])
+            if action in ("stop_all", "pause_all", "resume_all"):
+                inner = {"stop_all": "stop", "pause_all": "pause", "resume_all": "resume"}[action]
+                msgs = [
+                    f"{n}: {self._ctrl(n).act({'action': inner})[1]}"
+                    for n in self.names
+                    if self._ctrl(n)
+                ]
+                return 200, {"ok": True, "message": "; ".join(msgs) or "no bots"}
+        except FleetError as exc:
+            return 400, {"ok": False, "message": str(exc)}
+        name = str(req.get("bot") or self.names[0])
+        if name not in self.entries:
+            return 400, {"ok": False, "message": f"unknown bot {name!r}"}
+        if action == "start":
+            return self._start_many([name])
+        ctrl = self._ctrl(name)
+        if ctrl is None:
+            return 403, {"ok": False, "message": "controls are off"}
+        ok, msg = ctrl.act(dict(req))
+        return (200 if ok else 400), {"ok": ok, "message": msg}
+
+    def _start_many(self, names: list[str]) -> tuple[int, dict[str, Any]]:
+        running = self.running()
+        names = [n for n in names if n not in running]
+        if not names:
+            return 400, {"ok": False, "message": "already running"}
+        f = self.fleet
+        if f is None:  # single-bot dashboard: no fleet rules
+            return self._start_now(names)
+        room = f.max_bots - len(running)
+        if room <= 0:
+            return 400, {
+                "ok": False,
+                "message": f"{len(running)} bots running: the maximum is {f.max_bots}",
+            }
+        names = names[:room]
+        free = max(0, f.approval_threshold - len(running))
+        now, later = names[:free], names[free:]
+        code, body = self._start_now(now) if now else (200, {"ok": True, "message": ""})
+        if later:
+            a = f.request_approval(later, len(running) + len(now))
+            return 409, {
+                "ok": False,
+                "needs_approval": True,
+                "approval_id": a.id,
+                "bots": f.describe(later),
+                "running": len(running) + len(now),
+                "threshold": f.approval_threshold,
+                "max_bots": f.max_bots,
+                "expires_in_s": int(a.expires - a.created),
+                "message": (body.get("message", "") + " " if now else "")
+                + f"{len(running) + len(now)} bots are running; starting {len(later)} more "
+                f"needs your approval (more than {f.approval_threshold})",
+            }
+        return code, body
+
+    def _start_now(self, names: list[str], approved: bool = False) -> tuple[int, dict[str, Any]]:
+        msgs, ok_all = [], True
+        for n in names:
+            ctrl = self._ctrl(n)
+            if ctrl is None:
+                ok, msg = False, "controls are off"
+            else:
+                ok, msg = ctrl.act({"action": "start"})
+            ok_all = ok_all and ok
+            msgs.append(f"{n}: {msg}")
+        prefix = "approved; " if approved else ""
+        return (200 if ok_all else 400), {"ok": ok_all, "message": prefix + "; ".join(msgs)}
+
+
 def make_handler(  # noqa: C901 - one closure per HTTP verb
-    state_dir: Path,
-    cfg: StrategyConfig,
+    state_dir: Path | None,
+    cfg: StrategyConfig | None,
     refresh_s: int,
     controller: Controller | None = None,
     token: str | None = None,
     allowed_hosts: Sequence[str] = (),
+    runtime: FleetRuntime | None = None,
 ) -> type:
+    if runtime is None:
+        runtime = FleetRuntime(None, {"bot": (Path(state_dir), cfg, controller)})
+    controls = runtime.controls
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, body: bytes, ctype: str) -> None:
             self.send_response(status)
@@ -534,30 +694,34 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
             host = (self.headers.get("Host") or "").lower()
             return not allowed_hosts or host in allowed_hosts
 
+        def _query(self) -> dict[str, str]:
+            from urllib.parse import parse_qs, urlsplit
+
+            return {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+
         def do_GET(self) -> None:
             if not self._host_ok():
                 self._send(HTTPStatus.FORBIDDEN, b"bad host", "text/plain")
                 return
             path = self.path.split("?", 1)[0]
-            if path in ("/", "/index.html"):
-                page = render_html(None, refresh_s, token if controller else None)
-                self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8")
-            elif path == "/api/snapshot":
-                try:
-                    snap = build_snapshot(state_dir, cfg)
-                except (OSError, ValueError) as exc:
-                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
-                    return
-                snap["bot"] = controller.bot_status() if controller else None
-                self._json(HTTPStatus.OK, snap)
-            else:
-                self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
+            try:
+                if path in ("/", "/index.html"):
+                    page = render_html(None, refresh_s, token if controls else None)
+                    self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8")
+                elif path == "/api/snapshot":
+                    self._json(HTTPStatus.OK, runtime.snapshot(self._query().get("bot")))
+                elif path == "/api/fleet":
+                    self._json(HTTPStatus.OK, runtime.summary())
+                else:
+                    self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
+            except (OSError, ValueError) as exc:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
 
         def do_POST(self) -> None:
             if not self._host_ok() or self.path.split("?", 1)[0] != "/api/control":
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
                 return
-            if controller is None:
+            if not controls:
                 self._json(HTTPStatus.FORBIDDEN, {"ok": False, "message": "controls are off"})
                 return
             if not token or not hmac.compare_digest(
@@ -568,10 +732,10 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
             try:
                 size = min(int(self.headers.get("Content-Length") or 0), 10_000)
                 req = json.loads(self.rfile.read(size) or b"{}")
-                ok, msg = controller.act(req if isinstance(req, dict) else {})
+                code, body = runtime.act(req if isinstance(req, dict) else {})
             except (ValueError, OSError) as exc:
-                ok, msg = False, str(exc)
-            self._json(HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, {"ok": ok, "message": msg})
+                code, body = 400, {"ok": False, "message": str(exc)}
+            self._json(code, body)
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -587,6 +751,7 @@ def _parser() -> argparse.ArgumentParser:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--settings", help="bot settings JSON (uses its state_dir and strategy)")
     src.add_argument("--state-dir", help="the bot's state directory")
+    src.add_argument("--fleet", help="fleet JSON listing up to 10 bot settings files")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8050)
     p.add_argument("--refresh", type=int, default=15, help="page refresh interval, seconds")
@@ -596,8 +761,40 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _serve(args: argparse.Namespace, runtime: FleetRuntime, label: str) -> int:
+    token = secrets.token_urlsafe(24)
+    hosts = [f"{h}:{args.port}" for h in {args.host, "127.0.0.1", "localhost"}]
+    handler = make_handler(
+        None, None, args.refresh, token=token, allowed_hosts=hosts, runtime=runtime
+    )
+    server = ThreadingHTTPServer((args.host, args.port), handler)
+    mode = "with controls" if runtime.controls else "read-only"
+    print(f"dashboard ({mode}) for {label} on http://{args.host}:{args.port}/ (Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+def _fleet_main(args: argparse.Namespace) -> int:
+    from .fleet import Fleet
+
+    fleet = Fleet.load(args.fleet)
+    entries = {}
+    for name, b in fleet.bots.items():
+        b.state_dir.mkdir(parents=True, exist_ok=True)
+        ctrl = None if args.read_only else Controller(b.state_dir, b.settings_path)
+        entries[name] = (b.state_dir, b.settings.strategy_config(), ctrl)
+    return _serve(args, FleetRuntime(fleet, entries), f"fleet {args.fleet} ({len(entries)} bots)")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.fleet:
+        return _fleet_main(args)
     if args.settings:
         from .live_bot import BotSettings
 
@@ -621,19 +818,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.read_only
         else Controller(state_dir, Path(args.settings).resolve() if args.settings else None)
     )
-    token = secrets.token_urlsafe(24)
-    hosts = [f"{h}:{args.port}" for h in {args.host, "127.0.0.1", "localhost"}]
-    handler = make_handler(state_dir, cfg, args.refresh, controller, token, hosts)
-    server = ThreadingHTTPServer((args.host, args.port), handler)
-    mode = "read-only" if controller is None else "with controls"
-    print(f"dashboard ({mode}) for {state_dir} on http://{args.host}:{args.port}/ (Ctrl-C to stop)")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-    return 0
+    runtime = FleetRuntime(None, {"bot": (state_dir, cfg, controller)})
+    return _serve(args, runtime, str(state_dir))
 
 
 if __name__ == "__main__":

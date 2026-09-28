@@ -20,6 +20,11 @@ rl    A contextual bandit with tabular Q-learning: state = tercile bins (fitted 
       ``n_min`` outcomes and ``mean + 1.645 * SE < 0``. ``observe`` keeps learning online.
 
 A layer that cannot score a signal (missing features or history) never vetoes it.
+
+gbm defaults (100 trees, depth 2, learning rate 0.05, >= 10 rows per leaf, leaf ridge l2 = 10,
+subsample 0.8) were chosen among 8 settings on synthetic seeds 1-6 and checked on seeds 7-12:
+``validate_layer`` activated it on 6 of 12 "hour_edge" worlds and 0 of 12 "null" worlds
+(with l2 = 1 it was active on 2 of 6 null worlds: too little shrinkage for ~250 labels).
 """
 
 from __future__ import annotations
@@ -340,7 +345,7 @@ _GBM_DEFAULTS: dict[str, Any] = {
     "learning_rate": 0.05,
     "max_depth": 2,
     "min_samples_leaf": 10,
-    "l2": 1.0,
+    "l2": 10.0,  # strong leaf ridge: a few hundred noisy labels (see module docstring)
     "subsample": 0.8,
     "seed": 0,
     "margin": 0.0,
@@ -536,7 +541,9 @@ class LSTMLayer(Layer):
     def _normalise(self, seqs: Sequence[list[list[float]]]) -> list[list[list[float]]]:
         assert self.norm is not None
         mu, sd = self.norm["mean"], self.norm["std"]
-        return [[[(v - m) / s for v, m, s in zip(st, mu, sd, strict=True)] for st in q] for q in seqs]
+        return [
+            [[(v - m) / s for v, m, s in zip(st, mu, sd, strict=True)] for st in q] for q in seqs
+        ]
 
     def fit(self, ctx: TrainContext) -> None:
         import torch
@@ -643,7 +650,7 @@ class LSTMLayer(Layer):
                 sd = torch.load(raw, map_location="cpu", weights_only=True)
             except TypeError:  # torch < 1.13 has no weights_only
                 raw.seek(0)
-                sd = torch.load(raw, map_location="cpu")  # noqa: S614 - our own weights
+                sd = torch.load(raw, map_location="cpu")
             net = _torch_net(torch, int(self.params["hidden"]))
             net.load_state_dict(sd)
             net.eval()

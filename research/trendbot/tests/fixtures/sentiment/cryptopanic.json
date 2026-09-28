@@ -1,0 +1,11 @@
+{
+  "count": 2,
+  "next": null,
+  "results": [
+    {"kind": "news", "id": 991, "slug": "doge-rallies", "title": "Dogecoin rallies 20%",
+     "published_at": "2024-03-01T07:00:00Z", "url": "https://cryptopanic.com/news/991/doge-rallies",
+     "currencies": [{"code": "DOGE", "title": "Dogecoin", "slug": "dogecoin"}]},
+    {"kind": "news", "id": 992, "title": "Regulators weigh stablecoin rules",
+     "published_at": "2024-03-01T06:00:00Z"}
+  ]
+}

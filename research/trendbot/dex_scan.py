@@ -58,7 +58,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -671,7 +671,7 @@ def _enrich_solana(
     try:
         rug = parse_rugcheck(fetch_json(fetch, url))
     except FetchError as exc:
-        errors.append({"source": "rugcheck", "url": url, "error": str(exc)})
+        errors.append({"source": "rugcheck", "url": url, "error": f"{c.address}: {exc}"})
     try:
         holders = fetch_top_holder_share(
             fetch, rpc_url, c.address, pair.pair_address if pair else None
@@ -925,3 +925,30 @@ def main(argv: list[str] | None = None, fetch: Fetch | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def collect(
+    state_dir: str | Path, settings: Mapping[str, Any] | None = None, fetch: Fetch | None = None
+) -> dict[str, Any]:
+    """Scheduled-job entry point (retrain.py collect): scan and write the watchlist.
+
+    ``settings`` is the bot settings' ``dex`` block: chain, queries, from_profiles,
+    from_boosts, position_usd, max_tokens.
+    """
+    s = dict(settings or {})
+    wl = scan(
+        chain=str(s.get("chain", "solana")),
+        queries=list(s.get("queries", [])),
+        from_profiles=bool(s.get("from_profiles", True)),
+        from_boosts=bool(s.get("from_boosts", True)),
+        position_usd=float(s.get("position_usd", 500.0)),
+        fetch=fetch,
+        max_tokens=int(s.get("max_tokens", 30)),
+    )
+    write_watchlist(wl, state_dir)
+    tokens = wl.get("tokens", [])
+    return {
+        "tokens": len(tokens),
+        "tradable": sum(1 for t in tokens if t.get("tradable")),
+        "errors": wl.get("errors", []),
+    }

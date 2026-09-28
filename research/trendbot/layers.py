@@ -195,6 +195,8 @@ class ValidationSettings:
     min_gain_r: float = 0.05
     max_veto_share: float = 0.6
     train_frac: float = 0.7
+    max_p_value: float = 0.05  # vs random vetoes of the same number of trades
+    n_permutations: int = 4000
 
 
 def build_context(
@@ -223,6 +225,24 @@ def build_context(
 
 def _avg(rs: Sequence[float]) -> float:
     return statistics.fmean(rs) if rs else 0.0
+
+
+def random_veto_p_value(
+    base: Sequence[float], kept_avg: float, n_kept: int, n_perm: int = 4000, seed: int = 7
+) -> float:
+    """P(a random veto keeping ``n_kept`` of ``base`` averages >= ``kept_avg``).
+
+    Null hypothesis: the layer knows nothing and removes trades at random. Dropping a few
+    losers by luck is easy, so a layer must beat almost every random removal of that size.
+    """
+    import random
+
+    if not base or n_kept <= 0 or n_kept >= len(base):
+        return 1.0
+    rng = random.Random(seed)
+    pool = list(base)
+    hits = sum(1 for _ in range(n_perm) if _avg(rng.sample(pool, n_kept)) >= kept_avg - 1e-12)
+    return (hits + 1) / (n_perm + 1)
 
 
 def validate_layer(
@@ -264,20 +284,24 @@ def validate_layer(
     ]
     gain = _avg(with_layer) - _avg(base)
     vetoed = 1 - len(with_layer) / len(base) if base else 0.0
+    p_value = random_veto_p_value(
+        base, _avg(with_layer), min(len(with_layer), len(base)), vs.n_permutations
+    )
     ok = (
         len(with_layer) >= vs.min_test_trades
         and gain >= vs.min_gain_r
         and vetoed <= vs.max_veto_share
+        and p_value <= vs.max_p_value
     )
     reason = (
         f"on the unseen newer {1 - vs.train_frac:.0%}: avg R {_avg(base):+.3f} -> "
         f"{_avg(with_layer):+.3f} ({gain:+.3f}R) over {len(with_layer)} of {len(base)} "
-        f"trades ({vetoed:.0%} vetoed)"
+        f"trades ({vetoed:.0%} vetoed), p={p_value:.3f} vs random vetoes"
     )
     if not ok:
         reason += (
-            f"; needs >= {vs.min_test_trades} trades, a gain >= {vs.min_gain_r}R and "
-            f"<= {vs.max_veto_share:.0%} vetoed"
+            f"; needs >= {vs.min_test_trades} trades, a gain >= {vs.min_gain_r}R, "
+            f"<= {vs.max_veto_share:.0%} vetoed and p <= {vs.max_p_value}"
         )
     return {
         "status": "active" if ok else "rejected",
@@ -289,6 +313,7 @@ def validate_layer(
         "test_layer_avg_r": round(_avg(with_layer), 4),
         "gain_r": round(gain, 4),
         "vetoed_share": round(vetoed, 4),
+        "p_value": round(p_value, 4),
         "fit_seconds": round(time.time() - t0, 2),
     }
 

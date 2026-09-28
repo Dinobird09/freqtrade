@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Example crypto news</title>
+    <link>https://example.com/</link>
+    <item>
+      <title>Bitcoin surges to record high as ETF inflows jump</title>
+      <link>https://example.com/btc-record</link>
+      <guid isPermaLink="false">ex-1001</guid>
+      <pubDate>Fri, 01 Mar 2024 10:15:00 +0000</pubDate>
+    </item>
+    <item>
+      <title>Binance halts withdrawals after &amp;quot;hot wallet&amp;quot; exploit</title>
+      <link>https://example.com/binance-halt</link>
+      <guid>ex-1002</guid>
+      <pubDate>Fri, 01 Mar 2024 11:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>SEC sues Solana-based DeFi protocol over unregistered offering</title>
+      <link>https://example.com/sec-sol</link>
+      <pubDate>not a date</pubDate>
+    </item>
+    <item>
+      <link>https://example.com/no-title</link>
+    </item>
+  </channel>
+</rss>

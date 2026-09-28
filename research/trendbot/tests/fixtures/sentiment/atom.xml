@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Atom feed</title>
+  <id>urn:example:feed</id>
+  <updated>2024-03-01T12:00:00Z</updated>
+  <entry>
+    <title>Ether slides as ETH staking outflows grow</title>
+    <link rel="alternate" href="https://example.org/eth-slides"/>
+    <link rel="enclosure" href="https://example.org/eth.jpg"/>
+    <id>urn:example:entry:1</id>
+    <published>2024-03-01T09:30:00Z</published>
+  </entry>
+  <entry>
+    <title type="html">Cardano upgrade launches &lt;b&gt;on time&lt;/b&gt;</title>
+    <link href="https://example.org/ada-upgrade"/>
+    <id>urn:example:entry:2</id>
+    <updated>2024-03-01T08:00:00+01:00</updated>
+  </entry>
+</feed>

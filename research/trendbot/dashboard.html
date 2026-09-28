@@ -122,6 +122,13 @@ button.danger { color: var(--critical); border-color: var(--critical); font-weig
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button.small { padding: 1px 8px; font-size: 12px; }
 .toast { font-size: 12.5px; color: var(--text-secondary); }
+dialog#approval { border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; max-width: 520px;
+  background: var(--surface-1); color: var(--text-primary); box-shadow: 0 12px 40px rgba(0,0,0,0.35); }
+dialog#approval::backdrop { background: rgba(0,0,0,0.45); }
+dialog#approval h3 { margin: 0 0 8px; font-size: 17px; }
+dialog#approval input { font: inherit; padding: 5px 8px; border: 1px solid var(--baseline); border-radius: 6px;
+  background: var(--page); color: var(--text-primary); width: 100%; margin: 8px 0 12px; }
+tr.selected td { background: var(--wash); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -136,6 +143,25 @@ button.small { padding: 1px 8px; font-size: 12px; }
     <span class="muted" id="b-error"></span>
     <button type="button" id="theme" title="Theme">Theme: auto</button>
   </header>
+
+  <section class="card" id="fleet-card" style="display:none;margin-bottom:12px" aria-label="Bots">
+    <div class="card-head"><h2>Bots</h2><span class="muted" id="fleet-sub"></span><span class="spacer"></span>
+      <button type="button" class="primary" id="btn-start-all">&#9654; Start all</button>
+      <button type="button" id="btn-pause-all">&#10074;&#10074; Pause all entries</button>
+      <button type="button" id="btn-stop-all">&#9632; Stop all</button></div>
+    <div class="scroll" id="fleet"></div>
+  </section>
+
+  <dialog id="approval" aria-labelledby="approval-title">
+    <h3 id="approval-title">Approval required</h3>
+    <div id="approval-body" class="secondary"></div>
+    <label for="approval-input" class="secondary">Type <strong>APPROVE</strong> to start them:</label>
+    <input id="approval-input" autocomplete="off" spellcheck="false">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button type="button" id="approval-cancel">Cancel</button>
+      <button type="button" class="danger" id="approval-ok">Approve and start</button>
+    </div>
+  </dialog>
 
   <section class="controls" id="controls" aria-label="Bot controls">
     <span id="bot-status"></span>
@@ -239,6 +265,8 @@ button.small { padding: 1px 8px; font-size: 12px; }
 const EMBEDDED = /*__SNAPSHOT__*/null;
 const REFRESH_S = __REFRESH_S__;
 const CONTROL_TOKEN = "__CONTROL_TOKEN__";
+state.bot = new URLSearchParams(location.search).get("bot");
+state.fleet = null;
 const SVGNS = "http://www.w3.org/2000/svg";
 const state = { snap: null, pair: null, tables: {}, theme: "auto" };
 
@@ -700,7 +728,8 @@ function renderAll() {
   const s = state.snap;
   if (!s) return;
   const mt = s.meta;
-  const bm = clear(document.getElementById("b-mode")); bm.append(document.createTextNode("mode "), el("strong", {}, mt.mode));
+  const bm = clear(document.getElementById("b-mode")); if (state.fleet && state.fleet.fleet && mt.bot_name) bm.append(document.createTextNode("bot "), el("strong", {}, mt.bot_name), document.createTextNode(" · "));
+  bm.append(document.createTextNode("mode "), el("strong", {}, mt.mode));
   const be = clear(document.getElementById("b-exchange")); be.append(document.createTextNode("exchange "), el("strong", {}, mt.exchange));
   document.getElementById("b-updated").textContent = "snapshot " + dt(mt.generated_at) + (EMBEDDED ? " (static export)" : "");
   renderTiles(s); renderBreakers(s); renderEquity(s); renderPairTabs(s); renderPrice(s);
@@ -716,13 +745,61 @@ async function control(body, confirmText) {
   if (!controlsOn()) { toast("Controls are off (static export or --read-only)."); return; }
   if (confirmText && !window.confirm(confirmText)) return;
   try {
+    if (state.bot && body.bot === undefined && !String(body.action).endsWith("_all") && body.action !== "approve") body = { ...body, bot: state.bot };
     const r = await fetch("api/control", { method: "POST", cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Trendbot-Token": CONTROL_TOKEN },
       body: JSON.stringify(body) });
     const j = await r.json();
+    if (r.status === 409 && j.needs_approval) { openApproval(j); toast("Approval required: see the pop-up."); return; }
     toast((j.ok ? "✓ " : "✕ ") + j.message);
   } catch (e) { toast("✕ " + e.message); }
   setTimeout(refresh, 800);
+}
+function openApproval(j) {
+  const dlg = document.getElementById("approval"), body = clear(document.getElementById("approval-body"));
+  body.append(el("p", {}, `${j.running} of ${j.max_bots} bots are already running. Starting more than ${j.threshold} bots at the same time needs your approval.`));
+  const ul = el("ul");
+  for (const b of j.bots) ul.append(el("li", {}, `${b.name}: ${b.mode.toUpperCase()} on ${b.exchange} (${b.pairs.join(", ")})`));
+  body.append(el("p", {}, "These bots will start:"), ul);
+  if (j.bots.some((b) => b.mode === "live")) body.append(el("p", { style: "color:var(--critical);font-weight:600" }, "At least one of them trades LIVE with real funds."));
+  body.append(el("p", { class: "muted" }, `This approval expires in ${j.expires_in_s}s and is logged to fleet_approvals.jsonl.`));
+  const input = document.getElementById("approval-input");
+  input.value = "";
+  const ok = document.getElementById("approval-ok"), cancel = document.getElementById("approval-cancel");
+  ok.onclick = async () => { dlg.close(); await control({ action: "approve", approval_id: j.approval_id, confirm: input.value }); };
+  cancel.onclick = () => { dlg.close(); toast("Not approved: nothing was started."); };
+  dlg.showModal(); input.focus();
+}
+function renderFleet() {
+  const f = state.fleet, card = document.getElementById("fleet-card");
+  if (!f || !f.fleet) { card.style.display = "none"; return; }
+  card.style.display = "";
+  document.getElementById("fleet-sub").textContent = `${f.running} of ${f.bots.length} running · max ${f.max_bots} · approval pop-up above ${f.approval_threshold} running`;
+  const on = controlsOn();
+  const sa = document.getElementById("btn-start-all"), pa = document.getElementById("btn-pause-all"), so = document.getElementById("btn-stop-all");
+  sa.disabled = pa.disabled = so.disabled = !on;
+  sa.onclick = () => control({ action: "start_all" }, "Start every stopped bot?");
+  pa.onclick = () => control({ action: "pause_all" });
+  so.onclick = () => control({ action: "stop_all" }, "Stop every bot? Open positions stay open.");
+  const host = clear(document.getElementById("fleet"));
+  const t = tableView([
+    { label: "bot", get: (r) => el("strong", {}, r.name) },
+    { label: "status", get: (r) => r.error ? status("serious", "error") : r.running ? status("good", r.paused ? "running · entries paused" : "running") : status("critical", "stopped") },
+    { label: "mode", get: (r) => r.mode || "–" }, { label: "exchange", get: (r) => r.exchange || "–" },
+    { label: "equity", num: true, get: (r) => money(r.equity) },
+    { label: "return", num: true, get: (r) => signed(r.return_pct, 2, "%") },
+    { label: "trades", num: true, get: (r) => r.closed_trades ?? "–" },
+    { label: "avg R", num: true, get: (r) => signed(r.avg_r, 2, "R") },
+    { label: "open", num: true, get: (r) => r.open_positions ?? 0 },
+    { label: "", get: (r) => { const d = el("span", { style: "display:inline-flex;gap:4px" });
+        d.append(controlButton(r.running ? "Stop" : "Start", r.running ? "small" : "small primary", { action: r.running ? "stop" : "start", bot: r.name },
+          r.running ? `Stop ${r.name}?` : (r.mode === "live" ? `Start ${r.name} in LIVE mode?` : null)));
+        const v = el("button", { type: "button", class: "small" }, state.bot === r.name ? "Viewing" : "View");
+        v.addEventListener("click", () => { state.bot = r.name; history.replaceState(null, "", "?bot=" + encodeURIComponent(r.name)); refresh(); });
+        d.append(v); return d; } }], f.bots);
+  const rows = t.querySelectorAll("tbody tr");
+  f.bots.forEach((b, i) => { if (b.name === state.bot) rows[i].classList.add("selected"); });
+  host.append(t);
 }
 function controlButton(label, cls, body, confirmText) {
   const b = el("button", { type: "button", class: cls }, label);
@@ -858,7 +935,12 @@ async function refresh() {
   const app = document.getElementById("app"), err = document.getElementById("b-error");
   app.classList.add("loading");
   try {
-    const r = await fetch("api/snapshot", { cache: "no-store" });
+    try {
+      const fr = await fetch("api/fleet", { cache: "no-store" });
+      if (fr.ok) { state.fleet = await fr.json(); if (!state.bot && state.fleet.bots.length) state.bot = state.fleet.bots[0].name; }
+    } catch (e) { state.fleet = null; }
+    renderFleet();
+    const r = await fetch("api/snapshot" + (state.bot ? "?bot=" + encodeURIComponent(state.bot) : ""), { cache: "no-store" });
     const j = await r.json();
     if (!r.ok || j.error) throw new Error(j.error || r.statusText);
     state.snap = j; err.textContent = ""; renderAll();
