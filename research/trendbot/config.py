@@ -38,6 +38,8 @@ RULE_IDS = {
     ),
     "L_expectancy_guard": "Layer: halve a pair's risk while its last-N-trade expectancy < 0",
     "X_capital": "Execution: not enough free capital / size below minimum",
+    "X_operator": "Execution: new entries paused by the operator (exits keep running)",
+    "L_learned_rule": "Layer: veto from a learned rule (learning.py), evidence- and backtest-gated",
     # Adoption-path gates (adoption.py); mirrored there as ADOPTION_RULE_IDS.
     "ADOPT_record": "The adoption record names the variant it tracks",
     "ADOPT_fingerprint": "The config (and ML model, if any) promoted is exactly the one tested",

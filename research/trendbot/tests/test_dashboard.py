@@ -154,7 +154,7 @@ def test_export_embeds_escaped_snapshot(state_dir, tmp_path):
     assert '"mode": "live"' in out.read_text()
 
 
-def test_http_endpoints_are_read_only(state_dir):
+def test_http_endpoints_without_controls_are_read_only(state_dir):
     from http.server import ThreadingHTTPServer
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state_dir, StrategyConfig(), 15))
@@ -162,20 +162,24 @@ def test_http_endpoints_are_read_only(state_dir):
     th.start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
     try:
-        with urllib.request.urlopen(base + "/") as r:  # noqa: S310 - local test server
+        with urllib.request.urlopen(base + "/") as r:
             page = r.read().decode()
             assert "trendbot" in page and "const EMBEDDED = null" in page
             assert "default-src 'none'" in r.headers["Content-Security-Policy"]
-        with urllib.request.urlopen(base + "/api/snapshot") as r:  # noqa: S310
+        with urllib.request.urlopen(base + "/api/snapshot") as r:
             snap = json.loads(r.read())
             assert snap["stats"]["closed_trades"] == 2
         with pytest.raises(urllib.error.HTTPError) as e:
-            urllib.request.urlopen(base + "/journal.csv")  # noqa: S310
+            urllib.request.urlopen(base + "/journal.csv")
         assert e.value.code == 404
-        req = urllib.request.Request(base + "/api/snapshot", data=b"x", method="POST")  # noqa: S310
+        req = urllib.request.Request(base + "/api/snapshot", data=b"x", method="POST")
         with pytest.raises(urllib.error.HTTPError) as e:
-            urllib.request.urlopen(req)  # noqa: S310
-        assert e.value.code == 501
+            urllib.request.urlopen(req)
+        assert e.value.code == 404
+        ctl = urllib.request.Request(base + "/api/control", data=b"{}", method="POST")
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(ctl)
+        assert e.value.code == 403  # no controller: controls are off
     finally:
         srv.shutdown()
         srv.server_close()
@@ -184,3 +188,66 @@ def test_http_endpoints_are_read_only(state_dir):
 def test_cli_requires_a_state_dir(tmp_path):
     with pytest.raises(SystemExit):
         main(["--state-dir", str(tmp_path / "missing"), "--export", str(tmp_path / "x.html")])
+
+
+def test_controls_need_the_token_and_write_request_files(state_dir):
+    from http.server import ThreadingHTTPServer
+
+    from research.trendbot.dashboard import Controller
+    from research.trendbot.live_bot import pop_requests, read_control
+
+    ctl = Controller(state_dir, None)
+    srv = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(state_dir, StrategyConfig(), 15, ctl, "tok", [f"127.0.0.1:{0}"]),
+    )
+    port = srv.server_address[1]
+    srv.RequestHandlerClass = make_handler(
+        state_dir, StrategyConfig(), 15, ctl, "tok", [f"127.0.0.1:{port}"]
+    )
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+
+    def post(body, token="tok", host=None):
+        req = urllib.request.Request(
+            base + "/api/control",
+            data=json.dumps(body).encode(),
+            method="POST",
+            headers={"X-Trendbot-Token": token},
+        )
+        if host:
+            req.add_header("Host", host)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, None
+
+    try:
+        assert post({"action": "pause"}, token="wrong")[0] == 403
+        assert post({"action": "pause"}, host="evil.example:80")[0] == 404
+        code, body = post({"action": "pause"})
+        assert code == 200 and body["ok"] and read_control(state_dir)["entries_paused"] is True
+        assert post({"action": "resume"})[0] == 200
+        assert read_control(state_dir)["entries_paused"] is False
+        assert post({"action": "close", "pair": "ETH/USDT"})[0] == 200
+        assert post({"action": "stop"})[0] == 200
+        assert post({"action": "rule", "rule_id": "L1", "status": "disabled"})[0] == 200
+        assert post({"action": "rule", "rule_id": "L1", "status": "bogus"})[0] == 400
+        assert post({"action": "start"})[0] == 400  # no --settings: start is unavailable
+        reqs = [r for _, r in pop_requests(state_dir)]
+        assert [r["action"] for r in reqs] == ["close", "stop", "rule"]
+        assert reqs[0]["pair"] == "ETH/USDT"
+        with urllib.request.urlopen(base + "/") as r:
+            assert 'const CONTROL_TOKEN = "tok"' in r.read().decode()
+        with urllib.request.urlopen(base + "/api/snapshot") as r:
+            snap = json.loads(r.read())
+        assert snap["bot"]["running"] is False and snap["bot"]["can_start"] is False
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_export_never_contains_a_control_token(state_dir):
+    html = render_html(build_snapshot(state_dir, StrategyConfig(), now_ms=T0), 15)
+    assert "const CONTROL_TOKEN = null" in html

@@ -51,6 +51,7 @@ from .data import load_candles_csv, save_candles_csv, timeframe_to_ms
 from .gatekeeper import DecisionRecord, EntryDecision, LiveSession
 from .journal import ms_to_iso, read_journal, write_journal
 from .journal_rules import audit, render_markdown
+from .learning import LearningBook, LearningSettings, entry_context, expected_outcome
 from .live_exchange import CcxtGateway, Fill, OrderError, PaperBroker, quote_of
 from .models import EXIT_END, EXIT_SL, EXIT_TP, Candle, Trade, base_of
 from .news import NewsCalendar, load_events
@@ -76,6 +77,7 @@ class BotSettings:
     entry_buffer_pct: float = 0.3  # pre-size for a fill this much worse than the ask
     strategy: dict[str, Any] = field(default_factory=dict)  # StrategyConfig overrides
     adoption_record: str | None = None  # if set, live mode requires this record to pass LIVE
+    learning: dict[str, Any] = field(default_factory=dict)  # learning.LearningSettings fields
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -133,6 +135,7 @@ class TrendBot:
         self.state: dict[str, Any] = {}
         self._decisions_saved = 0
         self._cache: dict[str, list[Candle]] = {}
+        self.book = LearningBook(self.dir, self.cfg, LearningSettings(**settings.learning))
 
     # ------------------------------------------------------------------ paths
     @property
@@ -180,6 +183,8 @@ class TrendBot:
             path = self._candle_path(pair)
             self._cache[pair] = load_candles_csv(path) if path.exists() else []
         self._reconcile()
+        self.state.setdefault("trade_context", {})
+        self._relearn()
         self._save()
         log.info(
             "started %s/%s: equity %.2f %s, open %s",
@@ -223,6 +228,7 @@ class TrendBot:
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=1, sort_keys=True), encoding="utf-8")
         tmp.replace(self.state_path)
+        self.book.write(sess.journal_trades(), self.state.get("trade_context", {}))
         new = sess.decision_log[self._decisions_saved :]
         if new:
             append_decisions(new, self.decisions_path)
@@ -258,12 +264,62 @@ class TrendBot:
             if not self.stop_requested and (max_steps is None or steps < max_steps):
                 self.sleep(self.s.poll_seconds)
         self._save()
+        self._heartbeat("stopped")
         log.info("stopped")
 
     def step(self) -> None:
-        """One iteration: exits first, then entry decisions on newly closed candles."""
+        """One iteration: operator requests, exits, then entries on newly closed candles."""
+        self.handle_requests()
         self.manage_exits()
-        self.process_closed_candles()
+        if not self.stop_requested:
+            self.process_closed_candles()
+        self._heartbeat("running")
+
+    # ------------------------------------------------------------------ operator controls
+    @property
+    def entries_paused(self) -> bool:
+        return bool(read_control(self.dir).get("entries_paused", False))
+
+    def handle_requests(self) -> None:
+        """Apply dashboard requests (stop, close, rule on/off); each file is consumed once."""
+        for path, req in pop_requests(self.dir):
+            action = req.get("action")
+            log.info("operator request %s: %s", path.name, req)
+            if action == "stop":
+                self.stop_requested = True
+            elif action == "close":
+                self._close_request(str(req.get("pair", "ALL")))
+            elif action == "rule":
+                self.book.set_override(str(req["rule_id"]), req.get("status"))
+                self._relearn()
+                self._save()
+            else:
+                log.warning("unknown operator request %r ignored", action)
+
+    def _close_request(self, pair: str) -> None:
+        for p, t in sorted(self._sess().open_positions.items()):
+            if pair in ("ALL", p):
+                self.exit_position(t, EXIT_END, self.gw.bid(p))
+
+    def _heartbeat(self, status: str) -> None:
+        beat = {
+            "pid": os.getpid(),
+            "ts": self.gw.now_ms(),
+            "wall_ts": int(time.time() * 1000),
+            "status": status,
+            "mode": self.s.mode,
+            "exchange": self.s.exchange,
+        }
+        tmp = self.dir / "heartbeat.json.tmp"
+        tmp.write_text(json.dumps(beat), encoding="utf-8")
+        tmp.replace(self.dir / "heartbeat.json")
+
+    # ------------------------------------------------------------------ learning
+    def _relearn(self) -> None:
+        sess = self._sess()
+        self.book.relearn(sess.journal_trades(), self._cache)
+        sess.entry_filter = self.book.filter()
+        self.book.write(sess.journal_trades(), self.state.get("trade_context", {}))
 
     # ------------------------------------------------------------------ exits
     def manage_exits(self) -> None:
@@ -303,6 +359,8 @@ class TrendBot:
         )
         for _, msg in sess.breaker_log[-3:]:
             log.info("breaker: %s", msg)
+        self._relearn()
+        log.info("LESSON %s", self.book.lessons.get(str(t.trade_id), ""))
         self._save()
         return closed
 
@@ -334,7 +392,11 @@ class TrendBot:
             dec = sess.on_candle_close(pair, candles)
             last[pair] = signal_ts
             log.info("SIGNAL %s %s: %s", pair, dec.rule, dec.reason)
-            if dec.allowed:
+            if dec.allowed and self.entries_paused:
+                sess.on_fill_skipped(
+                    pair, dec, f"{pair}: new entries paused by the operator", rule="X_operator"
+                )
+            elif dec.allowed:
                 self.enter(pair, dec)
             self._save()
 
@@ -425,6 +487,18 @@ class TrendBot:
             return None
         if fill.fee_quote is not None:
             self.state["entry_fees"][str(trade.trade_id)] = fill.fee_quote
+        expected = expected_outcome(pair, trade.features, sess.closed, self.cfg)
+        note = (
+            "; ".join(
+                f"advisory rule {r.id} matched"
+                for r in self.book.rules
+                if r.status != "active" and r.matches(pair, trade.features)
+            )
+            or "no learned rule matched (all active rules were checked before entry)"
+        )
+        self.state["trade_context"][str(trade.trade_id)] = entry_context(
+            dec.check, dec.reason, trade.features, expected, note
+        )
         log.info(
             "ENTRY %s #%d qty %.8g at %.8g, stop %.8g, target %.8g, risk %.2f%%",
             pair,
@@ -453,6 +527,52 @@ class TrendBot:
         adaptations = audit(sess.journal_trades(), self.cfg, self.gw.now_ms(), sess.equity)
         lines.append(render_markdown(adaptations))
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------- control files
+def read_control(state_dir: Path) -> dict[str, Any]:
+    """Persistent operator flags written by the dashboard (control.json)."""
+    path = Path(state_dir) / "control.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_control(state_dir: Path, **flags: Any) -> dict[str, Any]:
+    current = read_control(state_dir)
+    current.update(flags)
+    tmp = Path(state_dir) / "control.json.tmp"
+    tmp.write_text(json.dumps(current, indent=1), encoding="utf-8")
+    tmp.replace(Path(state_dir) / "control.json")
+    return current
+
+
+def post_request(state_dir: Path, **request: Any) -> Path:
+    """Queue a one-shot request (stop / close / rule) for the running bot."""
+    d = Path(state_dir) / "requests"
+    d.mkdir(parents=True, exist_ok=True)
+    name = f"{time.time_ns()}-{request.get('action', 'x')}.json"
+    tmp = d / (name + ".tmp")
+    tmp.write_text(json.dumps(request), encoding="utf-8")
+    final = d / name
+    tmp.replace(final)
+    return final
+
+
+def pop_requests(state_dir: Path) -> list[tuple[Path, dict[str, Any]]]:
+    d = Path(state_dir) / "requests"
+    if not d.exists():
+        return []
+    out = []
+    for path in sorted(d.glob("*.json")):
+        try:
+            req = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            req = {"action": "invalid"}
+        path.unlink(missing_ok=True)
+        out.append((path, req))
+    return out
 
 
 # ---------------------------------------------------------------------- helpers

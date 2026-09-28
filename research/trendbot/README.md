@@ -17,6 +17,12 @@ real data, 4.4 journal convert, 4.5 invariants CLI, 4.6 review pack); 5 how to r
 8 freqtrade and FreqAI; 9 verification notes; 10 where the outputs live; 11 adoption path;
 12 disclaimer.
 
+> **New computer?** See [`SETUP.md`](SETUP.md). It covers:
+> - the one-command setup scripts (macOS/Linux/Windows) and `.env` for keys;
+> - the dashboard with Start / Stop / Pause / Close buttons;
+> - keeping the bot running 24/7;
+> - the learning loop (`ledger.json`, `learnings.md`, learned-rule vetoes).
+
 ## 0. Running the trading bot (`live_bot.py`)
 
 `live_bot.py` trades the strategy on Binance or Coinbase Advanced Trade through ccxt. Every
@@ -135,8 +141,18 @@ What it shows:
 The page refreshes every `--refresh` seconds (default 15). Every chart has a table view,
 and light and dark themes are supported (auto or toggled).
 
-The server binds to 127.0.0.1 and serves only `/` and `/api/snapshot`. It has no write or
-trade endpoints, and it sends a strict Content-Security-Policy.
+Operator controls are covered in SETUP.md §4:
+
+- start and stop the bot;
+- pause and resume new entries;
+- close one position or all of them;
+- switch a learned rule on or off.
+
+Each button posts to `/api/control`. That endpoint needs the per-session token embedded in
+the page, and requests addressed to a host other than 127.0.0.1 / localhost are refused.
+The dashboard never places orders itself: it writes request files in `state_dir`, and the
+bot consumes them on its next step. `--read-only` hides the controls, and a static
+`--export` never contains a token.
 
 ## 1. No win rate is promised or targeted
 

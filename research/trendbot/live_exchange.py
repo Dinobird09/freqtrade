@@ -38,6 +38,31 @@ ENV_PASSWORD = "TRENDBOT_API_PASSWORD"  # noqa: S105 - env var name, not a secre
 TIMEFRAME = "4h"
 
 
+def load_env_file(path: str | os.PathLike[str] | None = None) -> list[str]:
+    """Load ``KEY=VALUE`` lines from a .env file into ``os.environ`` (existing vars win).
+
+    Default file: ``$TRENDBOT_ENV_FILE`` or ``./.env``. Returns the names loaded (never the
+    values). Lines starting with ``#`` and blank lines are ignored; quotes are stripped.
+    """
+    from pathlib import Path
+
+    p = Path(path or os.environ.get("TRENDBOT_ENV_FILE") or ".env")
+    if not p.is_file():
+        return []
+    loaded = []
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
+
+
 class OrderError(RuntimeError):
     """An order could not be placed or its outcome could not be established."""
 
@@ -132,6 +157,7 @@ class CcxtGateway:
             import ccxt
         except ImportError as exc:
             raise SystemExit("ccxt is not installed: pip install ccxt") from exc
+        load_env_file()
         key, secret = os.environ.get(ENV_KEY), os.environ.get(ENV_SECRET)
         if not key or not secret:
             raise SystemExit(f"set {ENV_KEY} and {ENV_SECRET} in the environment for {mode}")

@@ -1,0 +1,5 @@
+# The trendbot package itself is pure Python 3.11+ standard library.
+# Only the exchange connection needs ccxt (paper, testnet and live modes).
+ccxt>=4.3
+# Optional, for running the test suite:
+# pytest>=8

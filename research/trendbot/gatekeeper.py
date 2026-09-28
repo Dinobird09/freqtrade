@@ -241,7 +241,8 @@ class Gatekeeper:
         if entry_filter is not None:
             ok, ml_prob, why = entry_filter(pair, rows[i], check)
             if not ok:
-                return self._deny(ML, why, check, decision_ts, plan, ml_prob)
+                rule = getattr(entry_filter, "rule_id", ML)  # e.g. L_learned_rule
+                return self._deny(rule, why, check, decision_ts, plan, ml_prob)
         mult = self.guard_multiplier(pair, decision_ts, closed_trades)
         risk = min(cap, allowed_risk) * mult
         reason = (

@@ -16,8 +16,13 @@ file with the current snapshot embedded.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import math
+import os
+import secrets
+import subprocess
+import sys
 import time
 from collections import Counter
 from collections.abc import Sequence
@@ -254,6 +259,9 @@ def build_snapshot(
         ][::-1],
         "unmanaged": state.get("unmanaged", []),
         "log": _log_tail(d / "bot.log", log_tail),
+        "control": _read_json(d / "control.json"),
+        "learning": _learning_view(d),
+        "ledger": _ledger_view(d, trades_tail),
     }
 
 
@@ -262,45 +270,213 @@ def _quote(trades: Sequence[Trade], pairs: dict[str, Any]) -> str:
     return names[0].split("/", 1)[1] if names and "/" in names[0] else "USDT"
 
 
-def render_html(snapshot: dict[str, Any] | None, refresh_s: int) -> str:
+def _learning_view(d: Path) -> dict[str, Any]:
+    raw = _read_json(d / "learnings.json")
+    return {
+        "mode": raw.get("mode"),
+        "rules": [
+            {k: r.get(k) for k in ("id", "text", "status", "why", "n", "wins", "avg_r")}
+            | {
+                "validation": (r.get("validation") or {}).get("reason"),
+                "override": (raw.get("overrides") or {}).get(r.get("id")),
+            }
+            for r in raw.get("rules", [])
+        ],
+        "overrides": raw.get("overrides", {}),
+    }
+
+
+def _ledger_view(d: Path, tail: int) -> list[dict[str, Any]]:
+    path = d / "ledger.json"
+    if not path.exists():
+        return []
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return []
+    return list(reversed(rows[-tail:]))
+
+
+def render_html(snapshot: dict[str, Any] | None, refresh_s: int, token: str | None = None) -> str:
     """The page; with a snapshot embedded it is self-contained (``--export``)."""
     html = HTML_PATH.read_text(encoding="utf-8")
     embedded = "null" if snapshot is None else json.dumps(snapshot).replace("</", "<\\/")
-    return html.replace(SNAPSHOT_TOKEN, embedded).replace("__REFRESH_S__", str(int(refresh_s)))
+    html = html.replace(SNAPSHOT_TOKEN, embedded).replace("__REFRESH_S__", str(int(refresh_s)))
+    return html.replace('"__CONTROL_TOKEN__"', json.dumps(token))
 
 
-def make_handler(state_dir: Path, cfg: StrategyConfig, refresh_s: int) -> type:
+def _pid_alive(pid: Any) -> bool:
+    """True if ``pid`` is a live process (POSIX); on Windows trust the fresh heartbeat."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class Controller:
+    """Operator actions behind the dashboard buttons (all go through files the bot reads)."""
+
+    def __init__(self, state_dir: Path, settings_path: Path | None) -> None:
+        self.dir = state_dir
+        self.settings_path = settings_path
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.poll_s = 10.0
+        if settings_path is not None:
+            from .live_bot import BotSettings
+
+            self.poll_s = BotSettings.load(settings_path).poll_seconds
+
+    def bot_status(self) -> dict[str, Any]:
+        beat = _read_json(self.dir / "heartbeat.json")
+        age_s = (time.time() * 1000 - beat.get("wall_ts", 0)) / 1000 if beat else None
+        alive = self.proc is not None and self.proc.poll() is None
+        fresh = age_s is not None and age_s <= max(90.0, 3 * self.poll_s + 30)
+        running = alive or (
+            fresh and beat.get("status") == "running" and _pid_alive(beat.get("pid"))
+        )
+        return {
+            "running": bool(running),
+            "pid": beat.get("pid"),
+            "heartbeat_age_s": None if age_s is None else round(age_s, 1),
+            "last_status": beat.get("status"),
+            "can_start": self.settings_path is not None,
+            "pending_requests": len(list((self.dir / "requests").glob("*.json")))
+            if (self.dir / "requests").exists()
+            else 0,
+        }
+
+    def act(self, req: dict[str, Any]) -> tuple[bool, str]:
+        from .live_bot import post_request, write_control
+
+        action = req.get("action")
+        if action == "start":
+            return self._start()
+        if action == "stop":
+            post_request(self.dir, action="stop")
+            return True, "stop requested: the bot finishes its current step and exits"
+        if action in ("pause", "resume"):
+            write_control(self.dir, entries_paused=action == "pause")
+            return True, (
+                "new entries paused (open trades are still managed)"
+                if action == "pause"
+                else "new entries resumed"
+            )
+        if action == "close":
+            pair = str(req.get("pair") or "ALL")
+            post_request(self.dir, action="close", pair=pair)
+            return True, f"close requested for {pair}: market sell at the next bot step"
+        if action == "rule":
+            status = req.get("status")
+            if status not in ("active", "disabled", None):
+                return False, "rule status must be active, disabled or null"
+            post_request(self.dir, action="rule", rule_id=str(req.get("rule_id")), status=status)
+            return True, f"rule {req.get('rule_id')} -> {status or 'automatic'}"
+        return False, f"unknown action {action!r}"
+
+    def _start(self) -> tuple[bool, str]:
+        if self.settings_path is None:
+            return False, "start needs the dashboard to be launched with --settings"
+        if self.bot_status()["running"]:
+            return False, "the bot is already running"
+        repo_root = Path(__file__).resolve().parents[2]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH")]))
+        cmd = [
+            sys.executable,
+            "-m",
+            "research.trendbot.live_bot",
+            "run",
+            "--settings",
+            str(self.settings_path),
+        ]
+        kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True  # keeps running if the dashboard stops
+        err = (self.dir / "bot.stderr.log").open("ab")
+        self.proc = subprocess.Popen(
+            cmd, cwd=Path.cwd(), env=env, stdout=subprocess.DEVNULL, stderr=err, **kwargs
+        )
+        return True, f"bot started (pid {self.proc.pid})"
+
+
+def make_handler(  # noqa: C901 - one closure per HTTP verb
+    state_dir: Path,
+    cfg: StrategyConfig,
+    refresh_s: int,
+    controller: Controller | None = None,
+    token: str | None = None,
+    allowed_hosts: Sequence[str] = (),
+) -> type:
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, body: bytes, ctype: str) -> None:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'none'; script-src 'unsafe-inline'; "
-                "style-src 'unsafe-inline'; connect-src 'self'",
+                "style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
             )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def _json(self, status: int, obj: Any) -> None:
+            self._send(status, json.dumps(obj).encode(), "application/json")
+
+        def _host_ok(self) -> bool:
+            host = (self.headers.get("Host") or "").lower()
+            return not allowed_hosts or host in allowed_hosts
+
         def do_GET(self) -> None:
+            if not self._host_ok():
+                self._send(HTTPStatus.FORBIDDEN, b"bad host", "text/plain")
+                return
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
-                self._send(
-                    HTTPStatus.OK, render_html(None, refresh_s).encode(), "text/html; charset=utf-8"
-                )
+                page = render_html(None, refresh_s, token if controller else None)
+                self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8")
             elif path == "/api/snapshot":
                 try:
-                    body = json.dumps(build_snapshot(state_dir, cfg)).encode()
+                    snap = build_snapshot(state_dir, cfg)
                 except (OSError, ValueError) as exc:
-                    body = json.dumps({"error": str(exc)}).encode()
-                    self._send(HTTPStatus.SERVICE_UNAVAILABLE, body, "application/json")
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
                     return
-                self._send(HTTPStatus.OK, body, "application/json")
+                snap["bot"] = controller.bot_status() if controller else None
+                self._json(HTTPStatus.OK, snap)
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
+
+        def do_POST(self) -> None:
+            if not self._host_ok() or self.path.split("?", 1)[0] != "/api/control":
+                self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
+                return
+            if controller is None:
+                self._json(HTTPStatus.FORBIDDEN, {"ok": False, "message": "controls are off"})
+                return
+            if not token or not hmac.compare_digest(
+                self.headers.get("X-Trendbot-Token", ""), token
+            ):
+                self._json(HTTPStatus.FORBIDDEN, {"ok": False, "message": "bad token"})
+                return
+            try:
+                size = min(int(self.headers.get("Content-Length") or 0), 10_000)
+                req = json.loads(self.rfile.read(size) or b"{}")
+                ok, msg = controller.act(req if isinstance(req, dict) else {})
+            except (ValueError, OSError) as exc:
+                ok, msg = False, str(exc)
+            self._json(HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, {"ok": ok, "message": msg})
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -311,7 +487,7 @@ def make_handler(state_dir: Path, cfg: StrategyConfig, refresh_s: int) -> type:
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python3 -m research.trendbot.dashboard",
-        description="read-only web dashboard for the trendbot live bot",
+        description="web dashboard (with start/stop controls) for the trendbot live bot",
     )
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--settings", help="bot settings JSON (uses its state_dir and strategy)")
@@ -320,6 +496,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8050)
     p.add_argument("--refresh", type=int, default=15, help="page refresh interval, seconds")
     p.add_argument("--export", metavar="HTML", help="write a static snapshot page and exit")
+    p.add_argument("--read-only", action="store_true", help="hide the control buttons")
     p.add_argument("--now", help="evaluate breakers at this ISO-8601 time (replays/exports)")
     return p
 
@@ -344,8 +521,17 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(render_html(snap, args.refresh), encoding="utf-8")
         print(f"wrote {out}")
         return 0
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(state_dir, cfg, args.refresh))
-    print(f"dashboard for {state_dir} on http://{args.host}:{args.port}/ (Ctrl-C to stop)")
+    controller = (
+        None
+        if args.read_only
+        else Controller(state_dir, Path(args.settings).resolve() if args.settings else None)
+    )
+    token = secrets.token_urlsafe(24)
+    hosts = [f"{h}:{args.port}" for h in {args.host, "127.0.0.1", "localhost"}]
+    handler = make_handler(state_dir, cfg, args.refresh, controller, token, hosts)
+    server = ThreadingHTTPServer((args.host, args.port), handler)
+    mode = "read-only" if controller is None else "with controls"
+    print(f"dashboard ({mode}) for {state_dir} on http://{args.host}:{args.port}/ (Ctrl-C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

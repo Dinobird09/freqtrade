@@ -114,6 +114,14 @@ pre.log { margin: 0; font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, mono
 .bar-hit:hover rect.mark, .bar-hit:focus rect.mark { opacity: 0.75; }
 .bar-hit:focus { outline: none; }
 .bar-hit:focus rect.hit { stroke: var(--text-primary); stroke-width: 1; }
+.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 14px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 12px; }
+.controls .spacer { flex: 1; }
+button.primary { background: var(--series-1); color: #fff; border-color: transparent; font-weight: 600; }
+button.danger { color: var(--critical); border-color: var(--critical); font-weight: 600; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.small { padding: 1px 8px; font-size: 12px; }
+.toast { font-size: 12.5px; color: var(--text-secondary); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -128,6 +136,16 @@ pre.log { margin: 0; font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, mono
     <span class="muted" id="b-error"></span>
     <button type="button" id="theme" title="Theme">Theme: auto</button>
   </header>
+
+  <section class="controls" id="controls" aria-label="Bot controls">
+    <span id="bot-status"></span>
+    <button type="button" class="primary" id="btn-start">&#9654; Start bot</button>
+    <button type="button" id="btn-stop">&#9632; Stop bot</button>
+    <button type="button" id="btn-pause">&#10074;&#10074; Pause new entries</button>
+    <button type="button" class="danger" id="btn-close-all">Close all positions</button>
+    <span class="spacer"></span>
+    <span class="toast" id="toast" role="status" aria-live="polite"></span>
+  </section>
 
   <section class="tiles" id="tiles" aria-label="Key figures"></section>
 
@@ -168,6 +186,16 @@ pre.log { margin: 0; font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, mono
       <div class="chart" id="chart-dc"></div>
     </div>
 
+    <div class="card span-12">
+      <div class="card-head"><h2>Learned rules</h2><span class="muted" id="learn-sub"></span></div>
+      <div id="rules"></div>
+    </div>
+
+    <div class="card span-12">
+      <div class="card-head"><h2>Trade ledger</h2><span class="muted">why each trade was taken, what was expected, what happened, the lesson</span></div>
+      <div class="scroll" id="ledger"></div>
+    </div>
+
     <div class="card span-6">
       <div class="card-head"><h2>Closed trades</h2><span class="muted" id="trades-sub"></span></div>
       <div class="scroll" id="trades"></div>
@@ -188,6 +216,7 @@ pre.log { margin: 0; font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, mono
 "use strict";
 const EMBEDDED = /*__SNAPSHOT__*/null;
 const REFRESH_S = __REFRESH_S__;
+const CONTROL_TOKEN = "__CONTROL_TOKEN__";
 const SVGNS = "http://www.w3.org/2000/svg";
 const state = { snap: null, pair: null, tables: {}, theme: "auto" };
 
@@ -596,7 +625,9 @@ function renderOpen(s) {
     { label: "unrealized", num: true, get: (r) => signed(r.unrealized, 2) },
     { label: "R now", num: true, get: (r) => signed(r.r_now, 2, "R") },
     { label: "risk", num: true, get: (r) => nf(2).format(r.risk_pct) + "%" },
-    { label: "stop → target", get: prog }], rows));
+    { label: "stop → target", get: prog },
+    { label: "", get: (r) => controlButton("Close", "small danger", { action: "close", pair: r.pair },
+      `Market-sell ${r.pair} (trade #${r.id}) now?`) }], rows));
 }
 
 function renderR(s) {
@@ -652,7 +683,83 @@ function renderAll() {
   document.getElementById("b-updated").textContent = "snapshot " + dt(mt.generated_at) + (EMBEDDED ? " (static export)" : "");
   renderTiles(s); renderBreakers(s); renderEquity(s); renderPairTabs(s); renderPrice(s);
   renderOpen(s); renderR(s); renderDecisionCounts(s); renderTrades(s); renderDecisions(s);
+  renderControls(s); renderRules(s); renderLedger(s);
   document.getElementById("log").textContent = s.log.length ? s.log.join("\n") : "bot.log is empty or missing.";
+}
+
+// ------------------------------------------------------------------ operator controls
+function controlsOn() { return !EMBEDDED && typeof CONTROL_TOKEN === "string" && CONTROL_TOKEN.length > 0; }
+function toast(msg) { document.getElementById("toast").textContent = msg; }
+async function control(body, confirmText) {
+  if (!controlsOn()) { toast("Controls are off (static export or --read-only)."); return; }
+  if (confirmText && !window.confirm(confirmText)) return;
+  try {
+    const r = await fetch("api/control", { method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Trendbot-Token": CONTROL_TOKEN },
+      body: JSON.stringify(body) });
+    const j = await r.json();
+    toast((j.ok ? "✓ " : "✕ ") + j.message);
+  } catch (e) { toast("✕ " + e.message); }
+  setTimeout(refresh, 800);
+}
+function controlButton(label, cls, body, confirmText) {
+  const b = el("button", { type: "button", class: cls }, label);
+  b.disabled = !controlsOn();
+  b.addEventListener("click", () => control(body, confirmText));
+  return b;
+}
+function renderControls(s) {
+  const bot = s.bot, on = controlsOn(), live = s.meta.mode === "live";
+  const st = clear(document.getElementById("bot-status"));
+  if (!bot) st.append(status("warning", EMBEDDED ? "Static snapshot: no live status" : "Read-only dashboard"));
+  else if (bot.running) st.append(status("good", `Bot running (pid ${bot.pid ?? "?"}, heartbeat ${bot.heartbeat_age_s ?? "–"}s ago)`));
+  else st.append(status("critical", "Bot stopped" + (bot.heartbeat_age_s ? ` (last heartbeat ${Math.round(bot.heartbeat_age_s)}s ago)` : "")));
+  const paused = !!(s.control && s.control.entries_paused);
+  const start = document.getElementById("btn-start"), stop = document.getElementById("btn-stop");
+  const pause = document.getElementById("btn-pause"), closeAll = document.getElementById("btn-close-all");
+  start.disabled = !on || !bot || bot.running || !bot.can_start;
+  start.title = bot && !bot.can_start ? "Launch the dashboard with --settings to enable Start" : "";
+  stop.disabled = !on || !bot || !bot.running;
+  pause.disabled = !on;
+  pause.textContent = paused ? "▶ Resume new entries" : "❚❚ Pause new entries";
+  closeAll.disabled = !on || !s.open_positions.length;
+  start.onclick = () => control({ action: "start" }, live ? "Start the bot in LIVE mode with real funds?" : null);
+  stop.onclick = () => control({ action: "stop" }, "Stop the bot? Open positions stay open and are managed again on the next start.");
+  pause.onclick = () => control({ action: paused ? "resume" : "pause" });
+  closeAll.onclick = () => control({ action: "close", pair: "ALL" }, "Market-sell ALL open positions now?");
+  if (paused && !document.getElementById("toast").textContent) toast("New entries are paused; exits keep running.");
+}
+function renderRules(s) {
+  const host = clear(document.getElementById("rules")), L = s.learning || { rules: [] };
+  document.getElementById("learn-sub").textContent = L.mode ? `mode ${L.mode} · rules veto entries that already passed R1–R9` : "";
+  if (!L.rules.length) { host.append(el("div", { class: "empty" }, "No learned rules yet: a rule needs enough losing trades behind it.")); return; }
+  const kind = { active: "critical", candidate: "warning", rejected: "good", disabled: "good" };
+  host.append(tableView([
+    { label: "status", get: (r) => status(kind[r.status] || "warning", r.status) },
+    { label: "rule", get: (r) => el("span", {}, r.text) },
+    { label: "trades", num: true, get: (r) => r.n },
+    { label: "avg R", num: true, get: (r) => signed(r.avg_r, 2, "R") },
+    { label: "why this status", get: (r) => el("span", { class: "secondary" }, r.why + (r.validation ? " · " + r.validation : "")) },
+    { label: "", get: (r) => r.status === "active"
+      ? controlButton("Disable", "small", { action: "rule", rule_id: r.id, status: "disabled" })
+      : r.override ? controlButton("Automatic", "small", { action: "rule", rule_id: r.id, status: null })
+      : controlButton("Force on", "small", { action: "rule", rule_id: r.id, status: "active" }) }], L.rules));
+}
+function renderLedger(s) {
+  const host = clear(document.getElementById("ledger")), rows = s.ledger || [];
+  if (!rows.length) { host.append(el("div", { class: "empty" }, "The ledger fills as the bot trades.")); return; }
+  const list = (items) => { const d = el("div", { class: "secondary" }); for (const x of items || []) d.append(el("div", {}, x)); return d; };
+  const expect = (e) => e && e.at_target_r !== undefined
+    ? `target ${signed(e.at_target_r, 1, "R")} / stop −1R` + (e.similar_trades ? ` · ${e.similar_trades} similar: avg ${signed(e.similar_avg_r, 2, "R")}` : "")
+    : "–";
+  host.append(tableView([
+    { label: "trade", get: (r) => "#" + r.trade_id }, { label: "pair", get: (r) => r.pair },
+    { label: "signal (UTC)", nowrap: true, get: (r) => (r.signal_time || "").replace("T", " ").slice(0, 16) },
+    { label: "entry", num: true, get: (r) => px(r.entry_price) }, { label: "exit", num: true, get: (r) => px(r.exit_price) },
+    { label: "result", num: true, get: (r) => r.status === "open" ? "open" : `${r.exit_reason} ${signed(r.r_multiple, 2, "R")}` },
+    { label: "expected", get: (r) => expect(r.expected_outcome) },
+    { label: "why triggered", get: (r) => list((r.why_triggered || []).slice(0, 4)) },
+    { label: "lesson", get: (r) => el("span", { class: "secondary" }, r.lesson || (r.status === "open" ? "written when it closes" : "–")) }], rows));
 }
 
 // ------------------------------------------------------------------ data + controls

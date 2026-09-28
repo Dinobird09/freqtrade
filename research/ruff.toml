@@ -8,5 +8,7 @@ extend = "../pyproject.toml"
 ]
 "trendbot/tests/**.py" = [
   "S101",  # allow assert in tests
+  "S105", "S106", "S107",  # fixed test tokens are not secrets
+  "S310",  # urllib against the local test server
   "S311",
 ]

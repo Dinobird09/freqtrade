@@ -388,3 +388,39 @@ def test_flatten_closes_everything_as_end(tmp_path, world):
     closed = bot.flatten()
     assert closed and all(t.exit_reason == EXIT_END for t in closed)
     assert bot.session.open_positions == {}
+
+
+def test_operator_pause_close_stop_and_learning_files(tmp_path, world):
+    from research.trendbot.adoption_evidence import read_decisions_log
+    from research.trendbot.live_bot import post_request, write_control
+
+    data, _ = world
+    ex = FakeExchange(data, _start_ts(data))
+    bot = _bot(_settings(tmp_path), ex)
+    bot.start()
+    write_control(bot.dir, entries_paused=True)
+    for _ in range(6 * 90):  # 90 days of hourly polls with entries paused
+        bot.step()
+        ex.advance(3600)
+    decisions = read_decisions_log(bot.decisions_path)
+    assert any(d.rule == "X_operator" for d in decisions)
+    assert bot.session.open_positions == {}
+    write_control(bot.dir, entries_paused=False)
+    while not bot.session.open_positions:
+        bot.step()
+        ex.advance(3600)
+    (pair,) = bot.session.open_positions
+    post_request(bot.dir, action="close", pair=pair)
+    bot.step()
+    assert bot.session.open_positions == {}
+    ledger = json.loads((bot.dir / "ledger.json").read_text())
+    closed = [r for r in ledger if r["status"] == "closed"]
+    assert closed and closed[-1]["exit_reason"] == EXIT_END
+    assert closed[-1]["why_triggered"] and closed[-1]["expected_outcome"]["at_target_r"] == 2.0
+    assert closed[-1]["lesson"].startswith(f"Trade #{closed[-1]['trade_id']}")
+    assert (bot.dir / "learnings.md").exists() and (bot.dir / "learnings.json").exists()
+    post_request(bot.dir, action="stop")
+    bot.run(max_steps=5)
+    assert bot.stop_requested
+    beat = json.loads((bot.dir / "heartbeat.json").read_text())
+    assert beat["status"] == "stopped" and beat["mode"] == "testnet"

@@ -122,3 +122,7 @@ target/
 !config_examples/config_freqai.example.json
 
 docker-compose-*.yml
+
+# trendbot local runtime files
+/bot.json
+trendbot_state/
