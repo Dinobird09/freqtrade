@@ -1,0 +1,5 @@
+[
+  {"url": "https://dexscreener.com/solana/hotmint1111", "chainId": "solana", "tokenAddress": "HotMint1111", "amount": 100, "totalAmount": 500, "description": "Hot new thing"},
+  {"url": "https://dexscreener.com/solana/goodmint1111", "chainId": "solana", "tokenAddress": "GoodMint1111", "amount": 10, "totalAmount": 50},
+  {"chainId": "solana", "tokenAddress": "MidMint1111", "amount": "oops"}
+]

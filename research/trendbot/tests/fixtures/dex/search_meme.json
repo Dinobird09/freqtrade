@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "1.0.0",
+  "pairs": [
+    {
+      "chainId": "solana", "dexId": "raydium", "url": "https://dexscreener.com/solana/nrpair1111",
+      "pairAddress": "NoRugPair1111",
+      "baseToken": {"address": "NoRugMint1111", "name": "No Rug Report", "symbol": "NORR"},
+      "quoteToken": {"address": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL"},
+      "priceNative": "0.0001", "priceUsd": "0.015",
+      "txns": {"m5": {"buys": 5, "sells": 4}, "h1": {"buys": 60, "sells": 50}, "h6": {"buys": 300, "sells": 280}, "h24": {"buys": 1000, "sells": 900}},
+      "volume": {"m5": 1000, "h1": 12000, "h6": 72000, "h24": 288000},
+      "priceChange": {"m5": 0.1, "h1": 1.5, "h6": 3.0, "h24": 10.0},
+      "liquidity": {"usd": 150000, "base": 5000000, "quote": 500},
+      "fdv": 1500000, "marketCap": 1500000, "pairCreatedAt": 1759827200000
+    },
+    {
+      "chainId": "ethereum", "dexId": "uniswap", "pairAddress": "0xpair",
+      "baseToken": {"address": "0xEthMeme", "symbol": "EMEME"}
+    },
+    {
+      "chainId": "solana", "dexId": "orca", "pairAddress": "MidPairOrca",
+      "baseToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
+      "quoteToken": {"address": "MidMint1111", "symbol": "MID"}
+    }
+  ]
+}

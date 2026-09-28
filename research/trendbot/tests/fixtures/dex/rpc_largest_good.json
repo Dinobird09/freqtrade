@@ -1,0 +1,16 @@
+{"jsonrpc": "2.0", "result": {"context": {"slot": 1114}, "value": [
+  {"address": "PoolVaultGood", "amount": "500000000000000", "decimals": 6, "uiAmount": 500000000.0, "uiAmountString": "500000000"},
+  {"address": "GoodPair1111", "amount": "50000000000000", "decimals": 6, "uiAmount": 50000000.0, "uiAmountString": "50000000"},
+  {"address": "HolderA", "amount": "30000000000000", "decimals": 6, "uiAmount": 30000000.0, "uiAmountString": "30000000"},
+  {"address": "HolderB", "amount": "20000000000000", "decimals": 6, "uiAmount": 20000000.0, "uiAmountString": "20000000"},
+  {"address": "HolderC", "amount": "10000000000000", "decimals": 6},
+  {"address": "HolderD", "amount": "10000000000000", "decimals": 6},
+  {"address": "HolderE", "amount": "10000000000000", "decimals": 6},
+  {"address": "HolderF", "amount": "10000000000000", "decimals": 6},
+  {"address": "HolderG", "amount": "10000000000000", "decimals": 6},
+  {"address": "HolderH", "amount": "10000000000000", "decimals": 6},
+  {"address": "HolderI", "amount": "10000000000000", "decimals": 6},
+  {"address": "HolderJ", "amount": "5000000000000", "decimals": 6},
+  {"address": "BadAmount", "amount": null, "decimals": 6},
+  {"amount": "1"}
+]}, "id": 1}

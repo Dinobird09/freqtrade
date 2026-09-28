@@ -1,0 +1,6 @@
+{"jsonrpc": "2.0", "result": {"context": {"slot": 1114}, "value": [
+  {"data": {"parsed": {"info": {"isNative": false, "mint": "GoodMint1111", "owner": "GoodPair1111", "state": "initialized", "tokenAmount": {"amount": "500000000000000", "decimals": 6}}, "type": "account"}, "program": "spl-token", "space": 165}, "executable": false, "lamports": 2039280, "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+  null,
+  {"data": {"parsed": {"info": {"owner": "WalletA"}}}},
+  {"data": ["base64-not-parsed", "base64"]}
+]}, "id": 1}

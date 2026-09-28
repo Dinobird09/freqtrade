@@ -1,0 +1,7 @@
+[
+  {"url": "https://dexscreener.com/solana/goodmint1111", "chainId": "solana", "tokenAddress": "GoodMint1111", "icon": "https://example.invalid/i.png", "header": null, "description": "A good token", "links": [{"type": "twitter", "url": "https://x.com/good"}]},
+  {"url": "https://dexscreener.com/solana/rugmint1111", "chainId": "solana", "tokenAddress": "RugMint1111", "description": "Totally safe"},
+  {"url": "https://dexscreener.com/base/0xabc", "chainId": "base", "tokenAddress": "0xAbC0000000000000000000000000000000000001"},
+  {"chainId": "solana"},
+  "not-an-object"
+]

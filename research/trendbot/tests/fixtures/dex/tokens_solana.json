@@ -1,0 +1,60 @@
+[
+  {
+    "chainId": "solana", "dexId": "raydium", "url": "https://dexscreener.com/solana/goodpair1111",
+    "pairAddress": "GoodPair1111",
+    "baseToken": {"address": "GoodMint1111", "name": "Good Token", "symbol": "GOOD"},
+    "quoteToken": {"address": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL"},
+    "priceNative": "0.00002", "priceUsd": "0.0031",
+    "txns": {"m5": {"buys": 20, "sells": 15}, "h1": {"buys": 400, "sells": 350}, "h6": {"buys": 1500, "sells": 1300}, "h24": {"buys": 5000, "sells": 4000}},
+    "volume": {"m5": 8000, "h1": 60000, "h6": 120000, "h24": 400000},
+    "priceChange": {"m5": 1.2, "h1": 12.0, "h6": 25.0, "h24": 80.0},
+    "liquidity": {"usd": 200000, "base": 30000000, "quote": 700},
+    "fdv": 3100000, "marketCap": 3000000, "pairCreatedAt": 1759740800000,
+    "boosts": {"active": 1}
+  },
+  {
+    "chainId": "solana", "dexId": "orca", "url": "https://dexscreener.com/solana/goodpairorca",
+    "pairAddress": "GoodPairOrca",
+    "baseToken": {"address": "GoodMint1111", "name": "Good Token", "symbol": "GOOD"},
+    "quoteToken": {"address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "symbol": "USDC"},
+    "priceUsd": "0.0031",
+    "liquidity": {"usd": 9000},
+    "pairCreatedAt": 1759740800000
+  },
+  {
+    "chainId": "solana", "dexId": "pumpswap", "url": "https://dexscreener.com/solana/hotpair1111",
+    "pairAddress": "HotPair1111",
+    "baseToken": {"address": "HotMint1111", "name": "Hot Token", "symbol": "HOT"},
+    "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
+    "priceUsd": "0.0009",
+    "txns": {"m5": {"buys": 90, "sells": 70}, "h1": {"buys": 900, "sells": 700}, "h6": {"buys": 1500, "sells": 1200}, "h24": {"buys": 1500, "sells": 1200}},
+    "volume": {"m5": 30000, "h1": 250000, "h6": 400000, "h24": 400000},
+    "priceChange": {"m5": 5.0, "h1": 90.0, "h6": 300.0, "h24": 300.0},
+    "liquidity": {"usd": 120000, "base": 90000000, "quote": 400},
+    "fdv": 900000, "marketCap": 900000, "pairCreatedAt": 1759992800000
+  },
+  {
+    "chainId": "solana", "dexId": "raydium", "url": "https://dexscreener.com/solana/rugpair1111",
+    "pairAddress": "RugPair1111",
+    "baseToken": {"address": "RugMint1111", "name": "Rug Token", "symbol": "RUG"},
+    "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
+    "priceUsd": "0.02",
+    "txns": {"m5": {"buys": 10, "sells": 8}, "h1": {"buys": 200, "sells": 180}, "h6": {"buys": 900, "sells": 800}, "h24": {"buys": 3000, "sells": 2800}},
+    "volume": {"m5": 3000, "h1": 40000, "h6": 150000, "h24": 500000},
+    "priceChange": {"m5": 0.5, "h1": 8.0, "h6": 10.0, "h24": 40.0},
+    "liquidity": {"usd": 300000, "base": 10000000, "quote": 1000},
+    "fdv": 20000000, "marketCap": 20000000, "pairCreatedAt": 1759740800000
+  },
+  {
+    "chainId": "solana", "dexId": "meteora", "url": "https://dexscreener.com/solana/midpair1111",
+    "pairAddress": "MidPair1111",
+    "baseToken": {"address": "MidMint1111", "name": "Mid Token", "symbol": "MID"},
+    "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
+    "priceUsd": "0.5",
+    "txns": {"m5": {"buys": 2, "sells": 2}, "h1": {"buys": 40, "sells": 38}, "h6": {"buys": 250, "sells": 240}, "h24": {"buys": 1000, "sells": 950}},
+    "volume": {"m5": 500, "h1": 10000, "h6": 60000, "h24": 240000},
+    "priceChange": {"m5": 0.0, "h1": 0.5, "h6": 1.0, "h24": 2.0},
+    "liquidity": {"usd": 250000, "base": 250000, "quote": 800},
+    "fdv": 50000000, "marketCap": 45000000, "pairCreatedAt": 1759740800000
+  }
+]
