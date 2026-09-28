@@ -17,6 +17,95 @@ real data, 4.4 journal convert, 4.5 invariants CLI, 4.6 review pack); 5 how to r
 8 freqtrade and FreqAI; 9 verification notes; 10 where the outputs live; 11 adoption path;
 12 disclaimer.
 
+## 0. Running the trading bot (`live_bot.py`)
+
+`live_bot.py` trades the strategy on Binance or Coinbase Advanced Trade through ccxt. Every
+entry goes through `gatekeeper.LiveSession`, the same decision path the backtester uses, so
+R1-R9 apply exactly as backtested. Stops and targets are software-managed: the bot polls
+the bid every `poll_seconds` and sends a market sell when either is crossed. Exits are
+never paused.
+
+```bash
+pip install ccxt
+cp research/trendbot/bot_settings.example.json bot.json      # edit pairs, mode, fees
+python3 -m research.trendbot.live_bot run --settings bot.json              # paper (default)
+
+export TRENDBOT_API_KEY=... TRENDBOT_API_SECRET=...   # (+ TRENDBOT_API_PASSWORD if needed)
+python3 -m research.trendbot.live_bot run --settings bot.json --mode testnet
+python3 -m research.trendbot.live_bot run --settings bot.json --mode live
+python3 -m research.trendbot.live_bot status  --settings bot.json   # equity, open trades, breakers
+python3 -m research.trendbot.live_bot flatten --settings bot.json   # market-sell every position
+```
+
+| mode | market data | orders | keys |
+|---|---|---|---|
+| `paper` | the exchange's live public data | simulated at ask/bid +- slippage, fee_rate charged | none |
+| `testnet` | exchange sandbox (`set_sandbox_mode(True)`) | real sandbox orders | testnet keys |
+| `live` | exchange | real market orders | live keys (trade permission only; no withdrawals) |
+
+Each 4H cycle works like this:
+
+1. At every poll, exits come first. If the bid is at or below the stop, or at or above the
+   target, the bot sends a market sell for `min(journal qty, free balance)`.
+2. At each 4H close (plus `close_delay_seconds`), the bot tops up the cached candle history
+   and evaluates each pair in sorted order. A candle not yet published is retried on the
+   next poll.
+3. For an allowed signal:
+   - it pre-sizes on a pessimistic fill (`ask * (1 + slippage) * (1 + entry_buffer_pct)`),
+     rounds the quantity down to the exchange precision, and checks the market minimums;
+   - it sends a market buy and re-sizes on the ACTUAL average fill. If the fill came in
+     worse than planned, the surplus is sold back, so risk never exceeds the R7 cap;
+   - a fill at or through the stop is flattened immediately.
+4. Stop, target and all-in risk are always computed from the actual fill (CONTRACT A1).
+
+**Candle history.** The whole cached history is evaluated, not a short window. EMA200 is
+seeded with an SMA, and a 300-candle window gives a visibly different EMA200 from the
+backtest. The end-to-end test caught exactly that: two entries were made below the true
+EMA200. The bot downloads `history_candles` (default 1500) once. After that it fetches only
+the new candles, and re-downloads whenever the cache has a gap.
+
+**Restarts.** Kill the process at any time: SIGINT or SIGTERM stops it after the current
+step. On restart, `journal.csv` and `state.json` rebuild the open positions, the R6
+reservations, the equity and the R9 breakers. `tests/test_live_bot.py` checks that a run
+interrupted halfway produces a journal and balances identical to an uninterrupted run.
+
+**Orders.** Order submission is never retried blindly. A network error during
+`create_order` is reported as "outcome unknown" and the entry is skipped. Market-data and
+balance calls retry with backoff (1 s, 2 s, 4 s).
+
+**Fees.** Fees paid in quote currency are journaled exactly. A fee paid in the base asset
+reduces the quantity held. A fee paid in a third asset (e.g. BNB) is replaced by the
+configured `fee_rate`. For Coinbase, set `strategy.fee_rate` to your tier.
+
+**Files in `state_dir`:**
+
+| file | contents |
+|---|---|
+| `journal.csv` | the trade journal |
+| `decisions.csv` | every evaluated signal, allowed or denied, with rule and reason (append-only) |
+| `state.json` | persisted bot state |
+| `candles/` | the candles evaluated |
+| `bot.log` | the log |
+
+`decisions.csv`, the journal and the candles are exactly the evidence files the adoption
+TESTNET check consumes.
+
+A state dir is bound to one exchange and mode; the bot refuses to reuse it for another. If
+`adoption_record` is set, `--mode live` refuses to start unless that record passes the LIVE
+stage. It is off by default.
+
+**Tested:** `tests/test_live_bot.py` runs the bot against a fake ccxt exchange that replays
+a 2-year synthetic world through an intra-candle O→L→H→C price path. That run produced:
+
+- 40 trades (22 SL, 18 TP), 80 exchange orders;
+- a clean `invariants.live_journal_violations` audit;
+- exchange balances equal to 10,000 plus the journal's pnl after flattening.
+
+The tests also cover restart parity, paper-broker accounting, the surplus-sell and
+through-the-stop paths, fee parsing, the retry and no-resend behaviour, and the CLI. The
+bot has not been run against a real exchange from this sandbox, which has no network
+access. Start with `paper`, then `testnet`, to confirm your keys, pairs and exchange limits.
+
 ## 1. No win rate is promised or targeted
 
 Nothing in this package promises, targets or optimises a win rate:

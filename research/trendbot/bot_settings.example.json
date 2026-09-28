@@ -1,0 +1,14 @@
+{
+  "exchange": "binance",
+  "mode": "paper",
+  "pairs": ["BTC/USDT", "ETH/USDT", "BNB/USDT"],
+  "state_dir": "trendbot_state/binance-paper",
+  "events": "research/trendbot/events_example.csv",
+  "starting_equity": 10000,
+  "poll_seconds": 10,
+  "close_delay_seconds": 5,
+  "history_candles": 1500,
+  "entry_buffer_pct": 0.3,
+  "strategy": {"fee_rate": 0.001, "slippage_pct": 0.05, "weekly_loss_limit_pct": 3.0},
+  "adoption_record": null
+}
