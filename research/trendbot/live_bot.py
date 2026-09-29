@@ -468,11 +468,15 @@ class TrendBot:
             dec = sess.on_candle_close(pair, candles)
             last[pair] = signal_ts
             log.info("SIGNAL %s %s: %s", pair, dec.rule, dec.reason)
-            if dec.allowed and self.entries_paused:
+            armed = armed_pairs(self.dir, self.gw.now_ms())
+            if dec.allowed and self.entries_paused and pair not in armed:
                 sess.on_fill_skipped(
                     pair, dec, f"{pair}: new entries paused by the operator", rule="X_operator"
                 )
             elif dec.allowed:
+                if pair in armed:  # "execute trade": the operator asked for this pair's next one
+                    log.info("%s: armed by the operator; taking this rule-passing signal", pair)
+                    disarm_pair(self.dir, pair)
                 self.enter(pair, dec)
             self._save()
 
@@ -638,6 +642,24 @@ def write_control(state_dir: Path, **flags: Any) -> dict[str, Any]:
     tmp.write_text(json.dumps(current, indent=1), encoding="utf-8")
     tmp.replace(Path(state_dir) / "control.json")
     return current
+
+
+def arm_pair(state_dir: Path, pair: str, until_ms: int) -> dict[str, Any]:
+    """Take ``pair``'s next signal that passes every rule, even while entries are paused."""
+    armed = dict(read_control(state_dir).get("armed_pairs") or {})
+    armed[pair] = int(until_ms)
+    return write_control(state_dir, armed_pairs=armed)
+
+
+def disarm_pair(state_dir: Path, pair: str) -> dict[str, Any]:
+    armed = dict(read_control(state_dir).get("armed_pairs") or {})
+    armed.pop(pair, None)
+    return write_control(state_dir, armed_pairs=armed)
+
+
+def armed_pairs(state_dir: Path, now_ms: int) -> dict[str, int]:
+    armed = read_control(state_dir).get("armed_pairs") or {}
+    return {p: int(u) for p, u in armed.items() if int(u) > now_ms}
 
 
 def post_request(state_dir: Path, **request: Any) -> Path:

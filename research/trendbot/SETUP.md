@@ -129,6 +129,29 @@ again.
 There is no Binance MCP to add: the bot talks to Binance directly through its API, using the
 keys under Exchange accounts.
 
+## 4b. The terminal: talk to the bot
+
+The **Terminal** card at the top of the dashboard takes plain-word commands. It works
+offline; no API key is needed. Type `help` or `pull out commands` to list them all:
+
+| you type | what happens |
+|---|---|
+| `status` | running or stopped, entries open or paused, equity, today's P&L, open positions |
+| `earnings today` / `yesterday` / `week` / `month` / `all` | realized P&L for the period, per pair, plus unrealized P&L of open positions (add `all bots` in a fleet) |
+| `positions`, `trades` | open positions, and the last closed trades |
+| `start day` | starts the bot if it is stopped and opens new entries |
+| `end day` | pauses new entries (stops and targets keep running) and prints the day's summary; `end day and close all` also sells every position |
+| `execute trade BTC` | takes BTC's next signal that passes all nine rules, even after `end day`; stays armed for 24h |
+| `close BTC` / `close all` | market-sells a position |
+| `why BTC` | BTC's latest decision and the rule behind it |
+| `brain` | what Chantisimo has learned |
+| `pause`, `resume`, `start bot`, `stop bot`, `bots`, `use <bot>`, `retrain`, `collect` | as the buttons |
+
+Commands that sell, stop a bot, arm a trade or start a live bot ask first: type `yes` (or
+press **Yes**) to go ahead, or `no` to cancel. `execute trade` never skips the nine rules: if
+the latest candle failed them, the bot waits for a candle that passes. Times are UTC, and
+`today` starts at 00:00 UTC.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,

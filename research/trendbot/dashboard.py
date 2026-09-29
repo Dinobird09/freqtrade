@@ -762,6 +762,9 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
     if runtime is None:
         runtime = FleetRuntime(None, {"bot": (Path(state_dir), cfg, controller)})
     controls = runtime.controls
+    from .assistant import Terminal
+
+    terminal = Terminal(runtime)
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, body: bytes, ctype: str) -> None:
@@ -814,7 +817,8 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
 
         def do_POST(self) -> None:
-            if not self._host_ok() or self.path.split("?", 1)[0] != "/api/control":
+            path = self.path.split("?", 1)[0]
+            if not self._host_ok() or path not in ("/api/control", "/api/terminal"):
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
                 return
             if not controls:
@@ -828,7 +832,11 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
             try:
                 size = min(int(self.headers.get("Content-Length") or 0), 10_000)
                 req = json.loads(self.rfile.read(size) or b"{}")
-                code, body = runtime.act(req if isinstance(req, dict) else {})
+                req = req if isinstance(req, dict) else {}
+                if path == "/api/terminal":
+                    code, body = 200, terminal.handle(str(req.get("text", "")), req.get("bot"))
+                else:
+                    code, body = runtime.act(req)
             except (ValueError, OSError) as exc:
                 code, body = 400, {"ok": False, "message": str(exc)}
             self._json(code, body)
