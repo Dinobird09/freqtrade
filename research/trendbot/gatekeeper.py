@@ -192,6 +192,7 @@ class Gatekeeper:
                 breakers.exit_time_uncertainty_ms if breakers is not None else cfg.timeframe_ms
             )
         self.exit_time_uncertainty_ms = validate_uncertainty_ms(exit_time_uncertainty_ms)
+        self.risk_scale = 1.0  # live capital guard (capital.py): <= 1, only ever shrinks risk
         if breakers is None:
             breakers = CircuitBreakers(cfg, exit_time_uncertainty_ms=self.exit_time_uncertainty_ms)
         elif breakers.exit_time_uncertainty_ms != self.exit_time_uncertainty_ms:
@@ -244,6 +245,7 @@ class Gatekeeper:
                 rule = getattr(entry_filter, "rule_id", ML)  # e.g. L_learned_rule
                 return self._deny(rule, why, check, decision_ts, plan, ml_prob)
         mult = self.guard_multiplier(pair, decision_ts, closed_trades)
+        mult *= min(1.0, max(0.0, self.risk_scale))
         risk = min(cap, allowed_risk) * mult
         reason = (
             f"{pair} passes R1-R6, R8 and R9: risk {risk:g}% = min(cap {cap:g}%, R6 "

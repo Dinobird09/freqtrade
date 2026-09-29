@@ -205,9 +205,11 @@ def build_snapshot(
 
     pairs: dict[str, Any] = {}
     last: dict[str, Candle] = {}
+    all_candles: dict[str, list[Candle]] = {}
     for path in sorted((d / "candles").glob("*-4h.csv")) if (d / "candles").exists() else []:
         pair = path.name[: -len("-4h.csv")].replace("_", "/", 1)
         candles = load_candles_csv(path)
+        all_candles[pair] = candles
         if candles:
             last[pair] = candles[-1]
         pairs[pair] = _pair_series(
@@ -265,12 +267,133 @@ def build_snapshot(
         "layers": _layers_view(d),
         "market": _market_view(d),
         "brain": _brain_view(d),
+        "verify": _read_json(d / "verify_status.json"),
+        "regime": state.get("regime"),
+        "scanner": _read_json(d / "scanner.json"),
+        "lab": _lab_view(d),
+        "correlations": _correlations(all_candles),
+        "capital": {
+            **(state.get("capital") or {}),
+            "halted": _read_json(d / "trading_halted.lock")
+            or (
+                {"reason": "trading_halted.lock exists"}
+                if (d / "trading_halted.lock").exists()
+                else None
+            ),
+        },
     }
+
+
+def _lab_view(d: Path) -> dict[str, Any]:
+    from .lab import load_approved
+
+    board = _read_json(d / "lab" / "leaderboard.json")
+    rows = [
+        {k: r.get(k) for k in ("strategy", "pair", "timeframe", "status", "why", "windows")}
+        | {"oos": r.get("oos") or {}, "stress": (r.get("stress") or {}).get("worst_max_dd_pct")}
+        for r in board.get("leaderboard", [])
+    ]
+    try:
+        approved = load_approved()
+    except (OSError, ValueError):
+        approved = {}
+    return {
+        "run_ms": board.get("run_ms"),
+        "seconds": board.get("seconds"),
+        "rows": rows,
+        "proposals": board.get("proposals", []),
+        "approved": approved,
+    }
+
+
+def _correlations(candles: Mapping[str, Sequence[Candle]]) -> dict[str, Any]:
+    from .allocation import correlation_table
+
+    try:
+        return correlation_table(candles)
+    except Exception:  # display only
+        return {}
 
 
 def _quote(trades: Sequence[Trade], pairs: dict[str, Any]) -> str:
     names = [t.pair for t in trades] or list(pairs)
     return names[0].split("/", 1)[1] if names and "/" in names[0] else "USDT"
+
+
+# ---------------------------------------------------------------------- 1-second refresh
+_VOLATILE = {"live.json", "heartbeat.json"}  # rewritten every second: overlaid, never cached
+_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+LIVE_STALE_MS = 15_000
+
+
+def _signature(d: Path, now_ms: int) -> tuple[Any, ...]:
+    """Changes whenever a file the snapshot reads changes (and once a minute for the clock)."""
+    sig: list[Any] = [now_ms // 60_000]
+    for sub in (d, d / "candles", d / "mcp", d / "models"):
+        if not sub.is_dir():
+            continue
+        for e in os.scandir(sub):
+            if e.is_file() and e.name not in _VOLATILE and not e.name.endswith(".tmp"):
+                st = e.stat()
+                sig.append((sub.name, e.name, st.st_mtime_ns, st.st_size))
+    return tuple(sorted(sig, key=str))
+
+
+def live_snapshot(
+    state_dir: str | Path, cfg: StrategyConfig | None = None, now_ms: int | None = None
+) -> dict[str, Any]:
+    """``build_snapshot`` re-built only when a file changed, plus the live prices of this
+    second: cheap enough to refresh the page every second."""
+    d = Path(state_dir)
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    key = f"{d.resolve()}|{id(cfg)}"
+    sig = _signature(d, now)
+    hit = _CACHE.get(key)
+    if hit is None or hit[0] != sig:
+        hit = (sig, build_snapshot(d, cfg, now_ms=now))
+        _CACHE[key] = hit
+    return overlay_live(hit[1], d, cfg, now)
+
+
+def overlay_live(
+    base: dict[str, Any], d: Path, cfg: StrategyConfig | None, now: int
+) -> dict[str, Any]:
+    snap = dict(base)  # shallow: the cached parts are never mutated
+    snap["meta"] = {**base["meta"], "generated_at": now}
+    live = _read_json(d / "live.json")
+    age = now - int(live.get("wall_ts") or 0)
+    fresh = bool(live) and 0 <= age <= LIVE_STALE_MS
+    snap["live"] = {
+        "fresh": fresh,
+        "age_ms": age if live else None,
+        "prices": live.get("prices", {}) if fresh else {},
+        "forming": live.get("forming", {}) if fresh else {},
+    }
+    if fresh and live.get("capital"):
+        snap["capital"] = {
+            **(base.get("capital") or {}),
+            **{k: v for k, v in live["capital"].items() if v is not None},
+        }
+    fee = cfg.fee_rate if cfg is not None else 0.001
+    rows = []
+    for p in base.get("open_positions") or []:
+        bid = ((snap["live"]["prices"].get(p["pair"]) or {}).get("bid")) if fresh else None
+        if bid and p.get("qty") and p.get("entry"):
+            unreal = p["qty"] * (bid - p["entry"]) - fee * p["qty"] * (p["entry"] + bid)
+            p = {
+                **p,
+                "last": _num(bid, 8),
+                "unrealized": _num(unreal, 2),
+                "r_now": _num(unreal / p["risk_amount"], 3) if p.get("risk_amount") else None,
+                "progress": _num((bid - p["stop"]) / (p["target"] - p["stop"]), 4),
+                "live": True,
+            }
+        rows.append(p)
+    snap["open_positions"] = rows
+    from .traders import read_status
+
+    snap["traders"] = read_status()  # global (all bots), small: read every second
+    return snap
 
 
 def _learning_view(d: Path) -> dict[str, Any]:
@@ -473,7 +596,7 @@ class Controller:
             else 0,
         }
 
-    def act(self, req: dict[str, Any]) -> tuple[bool, str]:
+    def act(self, req: dict[str, Any]) -> tuple[bool, str]:  # noqa: C901 - one branch per button
         from .live_bot import post_request, write_control
 
         action = req.get("action")
@@ -493,6 +616,62 @@ class Controller:
             pair = str(req.get("pair") or "ALL")
             post_request(self.dir, action="close", pair=pair)
             return True, f"close requested for {pair}: market sell at the next bot step"
+        if action == "verify":
+            from .verify import run_all, run_for_settings
+
+            if self.settings_path is not None:
+                from .live_bot import BotSettings
+
+                st = run_for_settings(BotSettings.load(self.settings_path))
+            else:
+                state = _read_json(self.dir / "state.json")
+                st = run_all(
+                    self.dir,
+                    config_from_overrides({"exchange_id": state.get("exchange", "binance")}),
+                )
+            bad = [a["agent"] for a in st["agents"] if a["status"] == "fail"]
+            return True, f"verification {st['overall']}" + (
+                f": {', '.join(bad)} failed" if bad else ""
+            )
+        if action == "lab_run":
+            if self.settings_path is None:
+                return False, "the lab needs the dashboard to be launched with --settings"
+            from .live_bot import spawn_job
+
+            proc = spawn_job("lab", self.settings_path, self.dir)
+            self.jobs["lab"] = proc
+            return (
+                True,
+                f"strategy research started (pid {proc.pid}); results in the Strategy lab card",
+            )
+        if action == "lab_approve":
+            from .lab import approve
+
+            a = approve(self.dir, str(req.get("id")))
+            return True, (
+                f"{a['id']} approved: run it on a paper bot (engine lab); it can trade real "
+                "money after 30 days of paper incubation"
+            )
+        if action == "scan":
+            import ccxt
+
+            from .live_bot import BotSettings
+            from .scanner import ScannerSettings, scan
+
+            settings = BotSettings.load(self.settings_path) if self.settings_path else None
+            ex_id = (
+                settings.exchange
+                if settings
+                else _read_json(self.dir / "state.json").get("exchange", "binance")
+            )
+            ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
+            res = scan(
+                ex, self.dir, ScannerSettings(**((settings.scanner if settings else {}) or {}))
+            )
+            return (
+                True,
+                f"scanned {res['tickers']} tickers: {len(res['passing'])} pass every filter",
+            )
         if action in ("retrain", "collect"):
             if self.settings_path is None:
                 return False, f"{action} needs the dashboard to be launched with --settings"
@@ -520,6 +699,13 @@ class Controller:
             return False, "start needs the dashboard to be launched with --settings"
         if self.bot_status()["running"]:
             return False, "the bot is already running"
+        if (self.dir / "trading_halted.lock").exists():
+            lock = _read_json(self.dir / "trading_halted.lock")
+            return False, (
+                "trading is halted by the kill switch "
+                f"({lock.get('reason', 'see the lock file')}). "
+                f"Review it, then delete {self.dir / 'trading_halted.lock'} by hand to restart"
+            )
         repo_root = Path(__file__).resolve().parents[2]
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH")]))
@@ -573,7 +759,7 @@ class FleetRuntime:
     def snapshot(self, name: str | None) -> dict[str, Any]:
         name = name if name in self.entries else self.names[0]
         state_dir, cfg, ctrl = self.entries[name]
-        snap = build_snapshot(state_dir, cfg)
+        snap = live_snapshot(state_dir, cfg)
         snap["bot"] = ctrl.bot_status() if ctrl else None
         snap["meta"]["bot_name"] = name
         bot = self.fleet.bots.get(name) if self.fleet is not None else None
@@ -604,7 +790,7 @@ class FleetRuntime:
         from .fleet import FleetError
 
         action = req.get("action")
-        if str(action).startswith(("keys_", "mcp_")):
+        if str(action).startswith(("keys_", "mcp_", "trader")):
             return connection_action(req)
         try:
             if action == "approve":
@@ -689,6 +875,8 @@ def connection_action(req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
     from . import connections as c
 
     a = str(req.get("action"))
+    if a.startswith("trader"):
+        return trader_action(req)
     ex, acc = str(req.get("exchange", "")), str(req.get("account", ""))
     try:
         if a == "keys_save":
@@ -746,6 +934,36 @@ def connection_action(req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
             )
             return 200, {"ok": True, "message": msg}
     except c.ConnectionSetupError as exc:
+        return 400, {"ok": False, "message": str(exc)}
+    return 400, {"ok": False, "message": f"unknown action {a!r}"}
+
+
+def trader_action(req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Smart-money card: add / remove / follow traders, refresh the ranking."""
+    from . import traders as tr
+
+    a, name = str(req.get("action")), str(req.get("name", ""))
+    try:
+        if a == "trader_add":
+            msg = tr.add_trader(name, str(req.get("kind", "")), str(req.get("value", "")))
+            tr.refresh()
+            return 200, {"ok": True, "message": msg + "; ranked"}
+        if a == "trader_remove":
+            msg = tr.remove_trader(name)
+            tr.refresh()
+            return 200, {"ok": True, "message": msg}
+        if a == "trader_follow":
+            msg = tr.set_follow(name, bool(req.get("follow", True)))
+            tr.refresh()
+            return 200, {"ok": True, "message": msg}
+        if a == "traders_refresh":
+            st = tr.refresh()
+            q = sum(1 for r in st["traders"] if r.get("qualified"))
+            return 200, {
+                "ok": True,
+                "message": f"{len(st['traders'])} traders ranked, {q} qualified",
+            }
+    except (tr.TraderError, OSError, ValueError) as exc:
         return 400, {"ok": False, "message": str(exc)}
     return 400, {"ok": False, "message": f"unknown action {a!r}"}
 
@@ -858,7 +1076,7 @@ def _parser() -> argparse.ArgumentParser:
     src.add_argument("--fleet", help="fleet JSON listing up to 10 bot settings files")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8050)
-    p.add_argument("--refresh", type=int, default=15, help="page refresh interval, seconds")
+    p.add_argument("--refresh", type=int, default=1, help="page refresh interval, seconds")
     p.add_argument("--export", metavar="HTML", help="write a static snapshot page and exit")
     p.add_argument("--read-only", action="store_true", help="hide the control buttons")
     p.add_argument("--now", help="evaluate breakers at this ISO-8601 time (replays/exports)")

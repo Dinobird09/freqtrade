@@ -247,4 +247,4 @@ def test_validate_on_null_world_and_performance():
     assert elapsed < 30.0
     series = regime_series(MarketView(data, TF), data["BTC/USDT"][-1].ts + TF)
     assert len(series) == len(data["BTC/USDT"]) - 12
-    assert {lab for _, lab, _ in series} <= set(state_labels(4))
+    assert {lab for _, lab, _ in series} <= set(state_labels(5))

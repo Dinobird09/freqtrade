@@ -38,19 +38,33 @@ CONFIRM_TTL_S = 120
 TF_MS = 4 * 3_600_000
 ARM_HOURS = 24
 COIN_NAMES = {
-    "bitcoin": "BTC", "btc": "BTC", "xbt": "BTC",
-    "ethereum": "ETH", "ether": "ETH", "eth": "ETH",
-    "bnb": "BNB", "binance coin": "BNB",
-    "solana": "SOL", "sol": "SOL",
-    "ripple": "XRP", "xrp": "XRP",
-    "cardano": "ADA", "ada": "ADA",
-    "dogecoin": "DOGE", "doge": "DOGE",
-    "avalanche": "AVAX", "avax": "AVAX",
-    "chainlink": "LINK", "link": "LINK",
-    "polkadot": "DOT", "dot": "DOT",
-    "litecoin": "LTC", "ltc": "LTC",
-    "tron": "TRX", "trx": "TRX",
-}  # fmt: skip
+    "bitcoin": "BTC",
+    "btc": "BTC",
+    "xbt": "BTC",
+    "ethereum": "ETH",
+    "ether": "ETH",
+    "eth": "ETH",
+    "bnb": "BNB",
+    "binance coin": "BNB",
+    "solana": "SOL",
+    "sol": "SOL",
+    "ripple": "XRP",
+    "xrp": "XRP",
+    "cardano": "ADA",
+    "ada": "ADA",
+    "dogecoin": "DOGE",
+    "doge": "DOGE",
+    "avalanche": "AVAX",
+    "avax": "AVAX",
+    "chainlink": "LINK",
+    "link": "LINK",
+    "polkadot": "DOT",
+    "dot": "DOT",
+    "litecoin": "LTC",
+    "ltc": "LTC",
+    "tron": "TRX",
+    "trx": "TRX",
+}
 
 HELP = """Things you can type (plain words are fine):
   status                       how the bot is doing right now
@@ -63,9 +77,14 @@ HELP = """Things you can type (plain words are fine):
   close BTC / close all        market-sell a position (asks you to confirm)
   why BTC                      the latest decision on BTC and its reason
   brain                        what Chantisimo has learned: mistakes, graduation
+  traders / follow <name>      smart money: other traders ranked; follow = copy their buys
   pause / resume               new entries off / on (exits always keep running)
   start bot / stop bot         the bot process
   bots / use <bot name>        the fleet, and which bot the terminal talks to
+  regime                       the market regime (HMM) and its exposure cap
+  scan                         today's movers: +10%, 5x volume, catalyst, float < 10M
+  lab                          the strategy lab: NNFX, Sneaky Pivot, Fib/FVG research
+  verify                       run the verification agents on the charts and the ledger
   retrain / collect            the weekly retrain / hourly data job, now
   help / pull out commands     this list"""
 
@@ -354,6 +373,19 @@ class Terminal:
             "how much",
         ):
             return "earnings", {"period": detect_period(t), "all_bots": bool(all_bots)}
+        m = re.match(r"^(un)?follow (?:trader )?([a-z0-9_-]+)$", t)
+        if m:
+            return "follow", {"name": m.group(2), "follow": not m.group(1)}
+        if has(
+            "traders",
+            "trader",
+            "leaderboard",
+            "smart money",
+            "copy trad\\w*",
+            "whales?",
+            "wallets?",
+        ):
+            return "traders", {}
         if has("position", "positions", "open trades", "holding", "holdings", "exposure"):
             return "positions", {}
         if has("trades", "history", "closed", "last trade", "recent"):
@@ -370,6 +402,24 @@ class Terminal:
             "graduat\\w*",
         ):
             return "brain", {}
+        if has(
+            "lab",
+            "research",
+            "strateg(y|ies)",
+            "nnfx",
+            "sneaky",
+            "fibonacci",
+            "fib",
+            "fvg",
+            "backtests?",
+        ):
+            return "lab", {}
+        if has("scan", "scanner", "movers", "gainers", "pumps?", "low ?caps?", "watchlist"):
+            return "scan", {}
+        if has("regime", "market (state|condition|mood)", "bull market", "bear market", "hmm"):
+            return "regime", {}
+        if has("verify", "verification", "check (the )?(data|charts?)", "agents?", "audit"):
+            return "verify", {}
         if has("retrain", "train"):
             return "retrain", {}
         if has("collect"):
@@ -440,10 +490,18 @@ class Terminal:
         )
         if breakers:
             text += " Circuit breaker: " + breakers[0]
-        return text, {"bot": bot, "running": bool(b.get("running")), "paused": bool(paused),
-                      "equity": st.get("equity"), "return_pct": st.get("return_pct"),
-                      "today_pnl": today["pnl"], "open_positions": len(opn), "unrealized": unreal,
-                      "quote": q, "mode": meta.get("mode")}  # fmt: skip
+        return text, {
+            "bot": bot,
+            "running": bool(b.get("running")),
+            "paused": bool(paused),
+            "equity": st.get("equity"),
+            "return_pct": st.get("return_pct"),
+            "today_pnl": today["pnl"],
+            "open_positions": len(opn),
+            "unrealized": unreal,
+            "quote": q,
+            "mode": meta.get("mode"),
+        }
 
     def tool_status(self, args: dict[str, Any], bot: str) -> Reply:
         bots = self.rt.names if args.get("all_bots") else [bot]
@@ -519,7 +577,7 @@ class Terminal:
         rows = [
             [
                 p["pair"],
-                f"{p.get('entry_price', 0):.6g}",
+                f"{p.get('entry') or 0:.6g}",
                 f"{p.get('last') or 0:.6g}",
                 f"{p.get('stop', 0):.6g}",
                 f"{p.get('target', 0):.6g}",
@@ -542,19 +600,33 @@ class Terminal:
             return Reply("No closed trades yet.")
         q = self._quote(bot)
         rows = [
-            [f"#{t.trade_id}", t.pair, _hm(t.exit_ts or 0), t.exit_reason,
-             f"{t.r_multiple or 0:+.2f}R", _money(t.pnl, q)]
+            [
+                f"#{t.trade_id}",
+                t.pair,
+                _hm(t.exit_ts or 0),
+                t.exit_reason,
+                f"{t.r_multiple or 0:+.2f}R",
+                _money(t.pnl, q),
+            ]
             for t in reversed(closed)
-        ]  # fmt: skip
+        ]
         return Reply(
             f"Last {len(closed)} closed trades.",
             _table(["trade", "pair", "closed (UTC)", "exit", "R", "P&L"], rows),
-            data={"trades": [
-                {"id": t.trade_id, "pair": t.pair, "r": t.r_multiple, "pnl": t.pnl,
-                 "exit": t.exit_reason, "exit_utc": ms_to_iso(t.exit_ts or 0)}
-                for t in closed
-            ]},
-        )  # fmt: skip
+            data={
+                "trades": [
+                    {
+                        "id": t.trade_id,
+                        "pair": t.pair,
+                        "r": t.r_multiple,
+                        "pnl": t.pnl,
+                        "exit": t.exit_reason,
+                        "exit_utc": ms_to_iso(t.exit_ts or 0),
+                    }
+                    for t in closed
+                ]
+            },
+        )
 
     def _latest_decisions(self, bot: str) -> dict[str, Any]:
         from .adoption_evidence import read_decisions_log
@@ -582,14 +654,61 @@ class Terminal:
         if not pairs:
             return Reply("No decisions yet: the bot decides at each 4H candle close.")
         rows = [
-            [p, ms_to_iso(latest[p].signal_ts + TF_MS)[:16].replace("T", " "),
-             "allowed" if latest[p].allowed else "denied", latest[p].rule, latest[p].reason]
+            [
+                p,
+                ms_to_iso(latest[p].signal_ts + TF_MS)[:16].replace("T", " "),
+                "allowed" if latest[p].allowed else "denied",
+                latest[p].rule,
+                latest[p].reason,
+            ]
             for p in pairs
-        ]  # fmt: skip
+        ]
         head = f"Latest decision per pair. Next 4H close: {self._next_close()}."
         table = _table(["pair", "decided (UTC)", "result", "rule", "reason"], rows)
         data = {"decisions": [dict(zip(DEC_COLS, r, strict=True)) for r in rows]}
         return Reply(head, table, data=data)
+
+    def tool_traders(self, args: dict[str, Any], bot: str) -> Reply:
+        from .traders import read_status
+
+        st = read_status()
+        rows = st.get("traders") or []
+        if not rows:
+            return Reply(
+                "No traders yet. Add one in the Smart money card: a trade-history export, a feed "
+                "URL, another bot's folder, or a Solana wallet."
+            )
+        table = [
+            [
+                r.get("rank"),
+                r["name"],
+                r.get("trades"),
+                f"{(r.get('win_rate') or 0) * 100:.1f}%",
+                f"{(r.get('win_rate_lb') or 0) * 100:.1f}%",
+                r.get("profit_factor"),
+                "yes" if r.get("following") else "",
+                "qualified" if r.get("qualified") else (r.get("why") or r.get("error") or ""),
+            ]
+            for r in rows
+        ]
+        sigs = st.get("copy_signals") or []
+        text = f"{len(rows)} traders, {sum(1 for r in rows if r.get('qualified'))} qualified. "
+        if sigs:
+            text += "Copy signals: " + ", ".join(f"{x['trader']} bought {x['pair']}" for x in sigs)
+        else:
+            text += "No open copy signals."
+        cols = ["#", "trader", "trades", "win", "95% low", "PF", "following", "status"]
+        return Reply(text, _table(cols, table), data={"traders": rows})
+
+    def tool_follow(self, args: dict[str, Any], bot: str) -> Reply:
+        from .traders import TraderError, refresh, set_follow
+
+        try:
+            msg = set_follow(args["name"], bool(args.get("follow", True)))
+        except TraderError as exc:
+            return Reply(str(exc))
+        refresh()
+        return Reply(msg + ". Their buys on this bot's pairs now arm the pair (rules still apply).")
 
     def tool_brain(self, args: dict[str, Any], bot: str) -> Reply:
         b = self._snap(bot).get("brain") or {}
@@ -615,8 +734,14 @@ class Terminal:
 
     # -------------------------------------------------------------- actions (confirmed when risky)
     def _prepare(self, name: str, args: dict[str, Any], bot: str, prompt: str) -> Reply:
-        self.pending = {"id": secrets.token_urlsafe(8), "tool": name, "args": args, "bot": bot,
-                        "prompt": prompt, "expires": time.time() + CONFIRM_TTL_S}  # fmt: skip
+        self.pending = {
+            "id": secrets.token_urlsafe(8),
+            "tool": name,
+            "args": args,
+            "bot": bot,
+            "prompt": prompt,
+            "expires": time.time() + CONFIRM_TTL_S,
+        }
         end = "" if prompt.rstrip().endswith((".", "?", "!")) else "."
         return Reply(
             prompt.rstrip() + end + " Type yes to confirm or no to cancel.",
@@ -690,8 +815,11 @@ class Terminal:
                 for t in (read_journal(j) if j.exists() else [])
                 if t.is_closed and (t.exit_ts or 0) >= lo
             ]
-            e = {"trades": len(sel), "pnl": round(sum(t.pnl or 0 for t in sel), 2),
-                 "wins": sum(1 for t in sel if (t.pnl or 0) > 0)}  # fmt: skip
+            e = {
+                "trades": len(sel),
+                "pnl": round(sum(t.pnl or 0 for t in sel), 2),
+                "wins": sum(1 for t in sel if (t.pnl or 0) > 0),
+            }
         opn = self._snap(bot).get("open_positions") or []
         unreal = sum(p.get("unrealized") or 0 for p in opn)
         text = (
@@ -739,6 +867,101 @@ class Terminal:
 
     def tool_resume(self, args: dict[str, Any], bot: str) -> Reply:
         return Reply(self._act({"action": "resume", "bot": bot})[1])
+
+    def tool_lab(self, args: dict[str, Any], bot: str) -> Reply:
+        L = self._snap(bot).get("lab") or {}
+        rows = L.get("rows") or []
+        if not rows:
+            return Reply(
+                "The strategy lab hasn't run yet: it runs nightly at 02:00 UTC "
+                "(or press Run research now)."
+            )
+        table = [
+            [
+                r["strategy"],
+                r["pair"],
+                r["oos"].get("sharpe"),
+                f"{r['oos'].get('return_pct') or 0:+.1f}%",
+                r["oos"].get("trades"),
+                r["status"],
+            ]
+            for r in rows
+        ]
+        props = L.get("proposals") or []
+        text = (
+            (
+                f"{len(props)} proposal(s): "
+                + ", ".join(p["id"] for p in props)
+                + ". Approve on the dashboard."
+            )
+            if props
+            else ("No proposal: nothing beat an out-of-sample Sharpe of 1.5.")
+        )
+        return Reply(
+            text,
+            _table(["strategy", "pair", "OOS Sharpe", "OOS return", "trades", "status"], table),
+        )
+
+    def tool_scan(self, args: dict[str, Any], bot: str) -> Reply:
+        sc = self._snap(bot).get("scanner") or {}
+        if not sc.get("rows"):
+            return Reply("No scan yet: it runs with the hourly collect job (or press Scan now).")
+        rows = [
+            [
+                r["symbol"],
+                f"{r.get('day_change_pct', 0):+.1f}%",
+                f"{r.get('rvol') or 0:.1f}x",
+                f"{r['circulating_supply']:,.0f}" if r.get("circulating_supply") else "?",
+                len(r.get("catalysts") or []),
+                "PASSES" if r.get("passes") else r.get("why", r.get("error", "")),
+            ]
+            for r in sc["rows"][:12]
+        ]
+        passing = sc.get("passing") or []
+        text = f"Scanned {sc.get('tickers')} tickers at {sc.get('scanned_utc', '')[:16]}Z: "
+        text += (
+            (", ".join(passing) + " pass every filter.")
+            if passing
+            else "nothing passes every filter."
+        )
+        cols = ["pair", "today", "RVOL", "float", "catalysts", "result"]
+        return Reply(text + " Watch-only: add a pair to a bot to trade it.", _table(cols, rows))
+
+    def tool_regime(self, args: dict[str, Any], bot: str) -> Reply:
+        r = self._snap(bot).get("regime")
+        if not r:
+            return Reply("No regime yet: it needs 1,200+ BTC candles (fitted at start and weekly).")
+        probs = ", ".join(f"{k} {v * 100:.0f}%" for k, v in (r.get("probs") or {}).items())
+        return Reply(
+            f"The market regime is {r['confirmed'].upper()}: new entries may use up to "
+            f"{r['cap_pct']:g}% of equity. The latest bar reads {r['raw']} ({r['streak']} in a "
+            f"row; a change needs 3). Probabilities: {probs}."
+        )
+
+    def tool_verify(self, args: dict[str, Any], bot: str) -> Reply:
+        _, msg, _ = self._act({"action": "verify", "bot": bot})
+        st = self._snap(bot).get("verify") or {}
+        rows = [
+            [
+                a["agent"],
+                a["status"],
+                "; ".join(
+                    f"{p}: {r['detail']}"
+                    for p, r in (a.get("pairs") or {}).items()
+                    if r["status"] != "pass"
+                )
+                or a.get("note")
+                or "all good",
+            ]
+            for a in st.get("agents") or []
+        ]
+        blocked = st.get("blocked_pairs") or []
+        text = msg + (
+            f". Entries blocked on {', '.join(blocked)} until the data checks out."
+            if blocked
+            else "."
+        )
+        return Reply(text, _table(["agent", "result", "notes"], rows) if rows else None)
 
     def tool_retrain(self, args: dict[str, Any], bot: str) -> Reply:
         return Reply(self._act({"action": "retrain", "bot": bot})[1])

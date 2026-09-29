@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="jarvis">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>trendbot dashboard</title>
+<title>Chantisimo · trendbot</title>
 <style>
 .viz-root {
   color-scheme: light;
@@ -35,6 +35,77 @@
   --pos: #3987e5; --neg: #e66767; --wash: rgba(255,255,255,0.05);
   --good-text: #0ca30c;
 }
+/* ---------------------------------------------------------------- Jarvis HUD theme */
+:root[data-theme="jarvis"] .viz-root {
+  color-scheme: dark;
+  --page: #03070d; --surface-1: rgba(8, 22, 36, 0.78);
+  --text-primary: #d9f7ff; --text-secondary: #8fc9da; --text-muted: #5b8796;
+  --grid: rgba(0, 229, 255, 0.10); --baseline: rgba(0, 229, 255, 0.35); --border: rgba(0, 229, 255, 0.28);
+  --series-1: #00e5ff; --series-2: #ffb347; --series-3: #7cff9e;
+  --pos: #00e5ff; --neg: #ff5b6b; --wash: rgba(0, 229, 255, 0.07);
+  --good: #3dffa2; --warning: #ffcc4d; --serious: #ff9a5a; --critical: #ff4d5e;
+  --good-text: #3dffa2; --glow: 0 0 12px rgba(0, 229, 255, 0.35);
+}
+:root[data-theme="jarvis"] body.viz-root {
+  background:
+    radial-gradient(ellipse at 50% -10%, rgba(0, 170, 255, 0.22), transparent 55%),
+    radial-gradient(ellipse at 100% 100%, rgba(0, 229, 255, 0.10), transparent 45%),
+    linear-gradient(rgba(0, 229, 255, 0.045) 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, rgba(0, 229, 255, 0.045) 1px, transparent 1px) 0 0 / 32px 32px,
+    #03070d;
+  background-attachment: fixed;
+  font-family: "Rajdhani", "Orbitron", "Segoe UI", system-ui, sans-serif;
+}
+:root[data-theme="jarvis"] .card, :root[data-theme="jarvis"] .tile, :root[data-theme="jarvis"] .controls {
+  position: relative; border: 1px solid var(--border); border-radius: 4px;
+  box-shadow: inset 0 0 24px rgba(0, 229, 255, 0.06), var(--glow); backdrop-filter: blur(3px);
+  background: var(--surface-1);
+}
+:root[data-theme="jarvis"] .card::before, :root[data-theme="jarvis"] .card::after {
+  content: ""; position: absolute; width: 14px; height: 14px; border: 2px solid #00e5ff; pointer-events: none;
+}
+:root[data-theme="jarvis"] .card::before { top: -2px; left: -2px; border-right: 0; border-bottom: 0; }
+:root[data-theme="jarvis"] .card::after { bottom: -2px; right: -2px; border-left: 0; border-top: 0; }
+:root[data-theme="jarvis"] .card-head h2, :root[data-theme="jarvis"] header h1, :root[data-theme="jarvis"] .subhead,
+:root[data-theme="jarvis"] .tile .label, :root[data-theme="jarvis"] th {
+  text-transform: uppercase; letter-spacing: 0.12em; color: #7fefff;
+  font-family: "Orbitron", "Rajdhani", ui-monospace, monospace; text-shadow: 0 0 8px rgba(0, 229, 255, 0.55);
+}
+:root[data-theme="jarvis"] header h1 { font-size: 22px; }
+:root[data-theme="jarvis"] .tile .value { color: #e8fdff; text-shadow: 0 0 10px rgba(0, 229, 255, 0.6); }
+:root[data-theme="jarvis"] button { background: rgba(0, 40, 60, 0.6); border-color: var(--border); color: var(--text-primary); }
+:root[data-theme="jarvis"] button:hover:not(:disabled) { box-shadow: var(--glow); border-color: #00e5ff; }
+:root[data-theme="jarvis"] button.primary { background: linear-gradient(180deg, #00b8d4, #007c99); color: #001018;
+  box-shadow: 0 0 14px rgba(0, 229, 255, 0.55); }
+:root[data-theme="jarvis"] button.danger { color: #ff7a86; border-color: #ff4d5e; }
+:root[data-theme="jarvis"] .badge { background: rgba(0, 40, 60, 0.5); }
+:root[data-theme="jarvis"] .term { background: rgba(0, 10, 18, 0.85); border: 1px solid var(--border); color: #bff6ff;
+  box-shadow: inset 0 0 30px rgba(0, 229, 255, 0.08); }
+:root[data-theme="jarvis"] .term .you { color: #7cff9e; }
+:root[data-theme="jarvis"] dialog.modal, :root[data-theme="jarvis"] dialog#approval {
+  background: rgba(4, 16, 28, 0.96); border: 1px solid #00e5ff; box-shadow: 0 0 40px rgba(0, 229, 255, 0.35); }
+:root[data-theme="jarvis"] tr:hover td { background: rgba(0, 229, 255, 0.05); }
+:root[data-theme="jarvis"] .meter > div { background: #00e5ff; box-shadow: 0 0 8px #00e5ff; }
+@keyframes hudscan { from { transform: translateY(-100%); } to { transform: translateY(100vh); } }
+:root[data-theme="jarvis"] .scanline { position: fixed; left: 0; right: 0; top: 0; height: 120px; pointer-events: none; z-index: 0;
+  background: linear-gradient(180deg, transparent, rgba(0, 229, 255, 0.05), transparent); animation: hudscan 7s linear infinite; }
+.scanline { display: none; }
+:root[data-theme="jarvis"] .scanline { display: block; }
+@media (prefers-reduced-motion: reduce) { :root[data-theme="jarvis"] .scanline { animation: none; display: none; } }
+
+/* ---------------------------------------------------------------- voice reactor */
+.reactor { width: 46px; height: 46px; border-radius: 50%; padding: 0; position: relative; flex: none;
+  border: 2px solid var(--series-1); background: radial-gradient(circle, #bff9ff 0 14%, #00e5ff 16% 26%, rgba(0,229,255,.15) 28% 60%, transparent 62%);
+  box-shadow: 0 0 14px rgba(0, 229, 255, 0.6); cursor: pointer; }
+.reactor::after { content: ""; position: absolute; inset: 4px; border-radius: 50%; border: 2px dashed rgba(0, 229, 255, 0.7); }
+.reactor.listening { box-shadow: 0 0 26px 6px rgba(0, 229, 255, 0.85); }
+.reactor.listening::after { animation: spin 2.5s linear infinite; }
+.reactor.speaking { box-shadow: 0 0 22px 4px rgba(124, 255, 158, 0.8); border-color: #7cff9e; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.voice-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 12.5px; }
+.voice-bar label { display: inline-flex; gap: 4px; align-items: center; }
+#voice-heard { font-style: italic; }
+
 * { box-sizing: border-box; }
 html, body { margin: 0; }
 body.viz-root { background: var(--page); color: var(--text-primary);
@@ -156,14 +227,16 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
 </head>
 <body class="viz-root">
 <div class="wrap" id="app">
+  <div class="scanline" aria-hidden="true"></div>
   <header>
-    <h1>trendbot</h1>
+    <button type="button" class="reactor" id="voice-btn" title="Talk to Chantisimo (click, then speak)" aria-label="Talk to Chantisimo"></button>
+    <h1>Chantisimo</h1>
     <span class="badge" id="b-mode"></span>
     <span class="badge" id="b-exchange"></span>
     <span class="badge" id="b-updated"></span>
     <span class="spacer"></span>
     <span class="muted" id="b-error"></span>
-    <button type="button" id="theme" title="Theme">Theme: auto</button>
+    <button type="button" id="theme" title="Theme">Theme: jarvis</button>
   </header>
 
   <section class="card" id="fleet-card" style="display:none;margin-bottom:12px" aria-label="Bots">
@@ -203,6 +276,12 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
       <button type="button" class="primary" id="term-send">Send</button>
     </div>
     <div class="chips" id="term-chips"></div>
+    <div class="voice-bar" style="margin-top:8px">
+      <button type="button" class="small" id="voice-btn2">🎙 Push to talk</button>
+      <label><input type="checkbox" id="voice-hands"> hands-free (say "Jarvis" or "Chantisimo" first)</label>
+      <label><input type="checkbox" id="voice-speak" checked> speak replies</label>
+      <span class="muted" id="voice-heard"></span>
+    </div>
   </section>
 
   <section class="card" id="conn-card" style="margin-bottom:12px" aria-label="Connections">
@@ -312,6 +391,52 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
       </div>
     </div>
 
+    <div class="card span-12" id="regime-card">
+      <div class="card-head"><h2>Market regime</h2><span class="muted" id="regime-sub"></span></div>
+      <div class="brain-grid">
+        <div><div id="regime-now"></div><div id="regime-probs"></div><div id="regime-strip" style="margin-top:8px"></div></div>
+        <div><div class="subhead">Correlation of 4H returns (last ~90 days)</div><div class="scroll" id="correlations"></div></div>
+      </div>
+    </div>
+
+    <div class="card span-12" id="lab-card">
+      <div class="card-head"><h2>Strategy lab</h2><span class="muted" id="lab-sub"></span>
+        <span class="spacer"></span><button type="button" id="btn-lab">Run research now</button></div>
+      <div class="muted" style="font-size:12px">Nightly research on NNFX, Sneaky Pivot (15m) and Fib / FVG / liquidity-grab strategies: rolling walk-forward (252 days in-sample, 6 months out-of-sample), look-ahead detector, crash stress test. A proposal needs an out-of-sample Sharpe above 1.5 and your approval, then 30 days of paper trading before real money.</div>
+      <div class="scroll" id="lab"></div>
+      <div class="subhead">Proposals and approved strategies</div>
+      <div class="scroll" id="lab-props"></div>
+    </div>
+
+    <div class="card span-12" id="scanner-card">
+      <div class="card-head"><h2>Market scanner</h2><span class="muted" id="scanner-sub"></span>
+        <span class="spacer"></span><button type="button" id="btn-scan">Scan now</button></div>
+      <div class="muted" style="font-size:12px">Today's movers: up 10%+ since 00:00 UTC, volume 5x its 50-day average, a news / social / unlock catalyst, and under 10 million tokens circulating. Watch-only: add a pair to a bot to trade it (the nine rules still apply).</div>
+      <div class="scroll" id="scanner"></div>
+    </div>
+
+    <div class="card span-12" id="verify-card">
+      <div class="card-head"><h2>Verification agents</h2><span class="muted" id="verify-sub"></span>
+        <span class="spacer"></span><button type="button" id="btn-verify">Verify now</button></div>
+      <div class="muted" style="font-size:12px">Independent checkers re-derive what the charts and the bot show. A pair failed by the data, exchange, indicator or price agent gets no new entries until it checks out again.</div>
+      <div class="scroll" id="verify"></div>
+    </div>
+
+    <div class="card span-12" id="traders-card">
+      <div class="card-head"><h2>Smart money: other traders</h2><span class="muted" id="traders-sub"></span>
+        <span class="spacer"></span><button type="button" id="btn-traders-refresh">Refresh ranking</button></div>
+      <div class="muted" style="font-size:12px">Ranked by win rate (95% lower bound, so a few lucky wins don't count), profit factor, drawdown and style. Following a qualified trader arms a pair when they buy it: the bot takes that pair's next signal that passes all nine rules. Every trader's losses feed Chantisimo's memory. Solana wallets are watch-only.</div>
+      <div class="scroll" id="traders"></div>
+      <div class="subhead">Copy signals (followed, qualified traders' open positions)</div>
+      <div class="scroll" id="copy-signals"></div>
+      <div class="conn-form">
+        <input id="tr-name" placeholder="name" aria-label="Trader name" autocomplete="off">
+        <select id="tr-kind" aria-label="Source"><option value="file">trade history file (CSV/JSON)</option><option value="url">feed URL (https)</option><option value="bot">another trendbot folder</option><option value="solana">Solana wallet address</option></select>
+        <input id="tr-value" placeholder="path, URL or wallet address" size="40" aria-label="Source" autocomplete="off">
+        <button type="button" class="primary" id="tr-add">Add trader</button>
+      </div>
+    </div>
+
     <div class="card span-12">
       <div class="card-head"><h2>Signal layers</h2><span class="muted" id="layers-sub"></span>
         <span class="spacer"></span>
@@ -362,7 +487,7 @@ const EMBEDDED = /*__SNAPSHOT__*/null;
 const REFRESH_S = __REFRESH_S__;
 const CONTROL_TOKEN = "__CONTROL_TOKEN__";
 const SVGNS = "http://www.w3.org/2000/svg";
-const state = { snap: null, pair: null, tables: {}, theme: "auto",
+const state = { snap: null, pair: null, tables: {}, theme: "jarvis",
   bot: new URLSearchParams(location.search).get("bot"), fleet: null };
 
 // ------------------------------------------------------------------ helpers
@@ -648,6 +773,10 @@ function renderTiles(s) {
   const eqv = el("span"); eqv.append(document.createTextNode(money(st.equity) + " "), el("span", { class: "unit" }, q));
   host.append(tile("Realized equity", eqv,
     el("div", { class: "sub " + (ret > 0 ? "up" : "") }, `${signed(ret, 2, "%")} vs start ${money(st.starting_equity)}`)));
+  const opn = s.open_positions, unreal = opn.reduce((a, p) => a + (p.unrealized || 0), 0);
+  const isLive = opn.some((p) => p.live);
+  host.append(tile("Open P&L" + (isLive ? " (live)" : ""), opn.length ? signed(unreal, 2) : "–",
+    el("div", { class: "sub" + (unreal > 0 ? " up" : "") }, opn.length ? `${opn.length} open · ${isLive ? "live bid, updated every second" : "at the last candle close"}` : "no open positions")));
   host.append(tile("Expectancy", st.avg_r === null ? "–" : signed(st.avg_r, 3, "R"),
     `${st.closed_trades} closed · total ${signed(st.total_r, 2, "R")}`));
   host.append(tile("Profit factor", st.profit_factor === null ? "–" : nf(2).format(st.profit_factor),
@@ -675,6 +804,28 @@ function renderBreakers(s) {
   else if (benched.length) head.append(status("serious", `${benched.length} pair(s) benched`));
   else head.append(status("good", "No breaker active: entries allowed"));
   host.append(head);
+  const c = s.capital || {}, cs = c.settings || {};
+  if (c.halted) {
+    const d = el("div", { style: "padding:8px 10px;margin-bottom:8px;border:1px solid var(--critical);border-radius:6px" });
+    d.append(status("critical", "KILL SWITCH: trading halted"), el("div", { class: "secondary", style: "font-size:12.5px;margin-top:4px" },
+      `${c.halted.reason || ""} ${c.halted.halted_utc ? "(" + c.halted.halted_utc + ")" : ""}. Review what happened, then delete trading_halted.lock in the bot's state folder by hand to restart.`));
+    host.append(d);
+  }
+  if (cs.enabled !== undefined) {
+    const d = el("div", { style: "padding:8px 0;border-top:1px solid var(--grid)" });
+    const dd = c.daily_dd_pct || 0, pk = c.peak_dd_pct || 0;
+    const kind = pk >= cs.peak_kill_pct * 0.8 || dd >= cs.daily_reduce_pct ? "serious" : "good";
+    d.append(el("div", { style: "font-weight:600" }, "Capital protection"));
+    d.append(status(kind, `today's drawdown ${nf(2).format(dd)}% · from peak ${nf(2).format(pk)}%`));
+    const notes = [`halve size above ${cs.daily_reduce_pct}% today`, `sell all + freeze ${cs.freeze_hours}h above ${cs.daily_flatten_pct}%`,
+      `kill switch above ${cs.peak_kill_pct}% from peak`, `stop for the day after ${cs.max_consecutive_losses} losses in a row`];
+    d.append(el("div", { class: "secondary", style: "font-size:12.5px" }, notes.join(" · ")));
+    if (c.day_reduced) d.append(status("warning", "position sizes halved for the rest of today"));
+    if (c.frozen_until && c.frozen_until > Date.now()) d.append(status("critical", "entries frozen until " + dt(c.frozen_until)));
+    if (c.day_stopped) d.append(status("serious", "stopped for the day after a losing streak"));
+    if (c.fee_warning) d.append(status("warning", c.fee_warning));
+    host.append(d);
+  }
   for (const b of s.breakers) {
     const d = el("div", { style: "padding:8px 0;border-top:1px solid var(--grid)" });
     d.append(el("div", { style: "font-weight:600" }, `${b.scope} · ${b.action}`));
@@ -722,8 +873,13 @@ function renderPrice(s) {
   const host = document.getElementById("chart-price"), leg = clear(document.getElementById("price-legend"));
   const data = s.pairs[state.pair];
   if (!data) { clear(host).append(el("div", { class: "empty" }, "No candles cached yet: the bot writes them at each 4H close.")); return; }
-  const cs = data.candles, pos = s.open_positions.find((p) => p.pair === state.pair);
-  document.getElementById("price-sub").textContent = `${state.pair} · last ${cs.length} candles`;
+  const live = s.live || {}, f = (live.forming || {})[state.pair], q = (live.prices || {})[state.pair];
+  let cs = data.candles;
+  const lastTs = cs.length ? cs[cs.length - 1].ts : 0;
+  if (f && f.ts > lastTs) cs = cs.concat([{ ts: f.ts, close: f.close, ema21: null, ema200: null, forming: true }]);
+  const pos = s.open_positions.find((p) => p.pair === state.pair);
+  document.getElementById("price-sub").textContent = `${state.pair} · last ${data.candles.length} candles` +
+    (q && q.last ? ` · live ${px(q.last)} (bid ${px(q.bid)} / ask ${px(q.ask)}, ${Math.round((live.age_ms || 0) / 1000)}s ago)` : " · no live price");
   const series = [
     { label: "Close", color: "var(--series-1)", values: cs.map((c) => c.close) },
     { label: "EMA21", color: "var(--series-2)", values: cs.map((c) => c.ema21), width: 1.5 },
@@ -819,7 +975,7 @@ function renderDecisions(s) {
     { label: "rule", get: (r) => r.rule }, { label: "reason", get: (r) => el("span", { class: "secondary" }, r.reason) }], s.decisions));
 }
 
-function renderAll() {
+function renderAll(force) {
   const s = state.snap;
   if (!s) return;
   const mt = s.meta;
@@ -827,11 +983,34 @@ function renderAll() {
   bm.append(document.createTextNode("mode "), el("strong", {}, mt.mode));
   const be = clear(document.getElementById("b-exchange")); be.append(document.createTextNode("exchange "), el("strong", {}, mt.exchange));
   document.getElementById("b-updated").textContent = "snapshot " + dt(mt.generated_at) + (EMBEDDED ? " (static export)" : "");
-  renderTiles(s); renderBreakers(s); renderEquity(s); renderPairTabs(s); renderPrice(s);
-  renderOpen(s); renderR(s); renderDecisionCounts(s); renderTrades(s); renderDecisions(s);
-  renderControls(s); renderRules(s); renderLedger(s); renderLayers(s); renderMarket(s); renderDex(s);
-  renderBrain(s); renderMcpData(s);
-  document.getElementById("log").textContent = s.log.length ? s.log.join("\n") : "bot.log is empty or missing.";
+  // 1-second refresh: redraw a section only when its data changed (keeps scroll and hover)
+  const T = state.tables, P = state.pair, live = s.live || {};
+  const sections = [
+    [renderTiles, [s.stats, s.risk, s.open_positions]],
+    [renderBreakers, [s.breakers, s.capital]],
+    [renderEquity, [s.equity_curve, T]],
+    [renderPairTabs, [Object.keys(s.pairs), P]],
+    [renderPrice, [s.pairs[P], (live.forming || {})[P], (live.prices || {})[P], s.open_positions, P, T]],
+    [renderOpen, [s.open_positions]],
+    [renderR, [s.trades, T]],
+    [renderDecisionCounts, [s.decision_counts, T]],
+    [renderTrades, [s.trades]],
+    [renderDecisions, [s.decisions]],
+    [renderControls, [s.bot && { ...s.bot, heartbeat_age_s: Math.round((s.bot.heartbeat_age_s || 0) / 5) }, s.control, s.meta.mode, s.open_positions.length]],
+    [renderRules, [s.learning]], [renderLedger, [s.ledger]], [renderLayers, [s.layers, s.bot && s.bot.jobs_running]],
+    [renderMarket, [s.market, s.layers && s.layers.collect_status]], [renderDex, [s.market]],
+    [renderBrain, [s.brain]], [renderLab, [s.lab]], [renderScanner, [s.scanner]], [renderRegime, [s.regime, s.correlations]], [renderTraders, [s.traders]], [renderMcpData, [s.market && s.market.mcp]], [renderVerify, [s.verify]],
+  ];
+  state.drawn = state.drawn || new Map();
+  for (const [fn, inputs] of sections) {
+    const key = JSON.stringify(inputs);
+    if (!force && state.drawn.get(fn) === key) continue;
+    state.drawn.set(fn, key);
+    fn(s);
+  }
+  const logText = s.log.length ? s.log.join("\n") : "bot.log is empty or missing.";
+  const logEl = document.getElementById("log");
+  if (logEl.textContent !== logText) logEl.textContent = logText;
 }
 
 // ------------------------------------------------------------------ operator controls
@@ -1195,6 +1374,177 @@ document.getElementById("mcp-add").addEventListener("click", async () => {
   }
 });
 
+// ------------------------------------------------------------------ strategy lab
+function renderLab(s) {
+  const L = s.lab || {}, rows = L.rows || [], host = clear(document.getElementById("lab"));
+  document.getElementById("lab-sub").textContent = L.run_ms ? `last run ${dt(L.run_ms)} (${L.seconds}s) · runs nightly at 02:00 UTC` : "not run yet";
+  const b = document.getElementById("btn-lab"); b.disabled = !controlsOn(); b.onclick = () => control({ action: "lab_run" }, "Run the strategy research now? It can take a few minutes.");
+  if (!rows.length) host.append(el("div", { class: "empty" }, "No research yet: it runs every night, or press Run research now."));
+  else host.append(tableView([
+    { label: "strategy", get: (r) => el("strong", {}, r.strategy) }, { label: "pair", get: (r) => r.pair }, { label: "tf", get: (r) => r.timeframe },
+    { label: "OOS Sharpe", num: true, get: (r) => r.oos.sharpe ?? "–" },
+    { label: "OOS return", num: true, get: (r) => signed(r.oos.return_pct, 1, "%") },
+    { label: "max DD", num: true, get: (r) => r.oos.max_dd_pct == null ? "–" : nf(1).format(r.oos.max_dd_pct) + "%" },
+    { label: "win rate", num: true, get: (r) => r.oos.win_rate == null ? "–" : nf(0).format(r.oos.win_rate * 100) + "%" },
+    { label: "trades", num: true, get: (r) => r.oos.trades ?? "–" },
+    { label: "crash test DD", num: true, get: (r) => r.stress == null ? "–" : nf(1).format(r.stress) + "%" },
+    { label: "status", get: (r) => r.status === "proposal" ? status("good", "proposal") : el("span", { class: "secondary" }, r.why || r.status) }], rows));
+  const ph = clear(document.getElementById("lab-props")), appr = L.approved || {};
+  const props = (L.proposals || []).concat(Object.values(appr).filter((a) => !(L.proposals || []).some((p) => p.id === a.id)));
+  if (!props.length) { ph.append(el("div", { class: "empty", style: "padding:10px 0" }, "No proposal has beaten the bar on unseen data yet.")); return; }
+  ph.append(tableView([{ label: "strategy", get: (p) => el("strong", {}, p.id) }, { label: "params", get: (p) => el("span", { class: "secondary" }, JSON.stringify(p.params)) },
+    { label: "OOS Sharpe", num: true, get: (p) => p.sharpe },
+    { label: "state", get: (p) => { const a = appr[p.id]; if (!a) return controlButton("Approve for paper", "small primary", { action: "lab_approve", id: p.id }, `Approve ${p.id}? It starts paper trading only; real money after 30 days of incubation.`);
+        const days = a.paper_since_ms ? Math.floor((Date.now() - a.paper_since_ms) / 864e5) : 0;
+        return a.paper_since_ms ? status(days >= 30 ? "good" : "warning", `incubating: ${days} of 30 paper days`) : status("warning", "approved: start a paper lab bot"); } }], props));
+}
+
+// ------------------------------------------------------------------ market scanner
+function renderScanner(s) {
+  const sc = s.scanner || {}, rows = sc.rows || [], host = clear(document.getElementById("scanner"));
+  document.getElementById("scanner-sub").textContent = sc.scanned_ms ? `${sc.tickers} tickers on ${sc.exchange} · ${(sc.passing || []).length} pass · scanned ${dt(sc.scanned_ms)}` : "not scanned yet";
+  const b = document.getElementById("btn-scan"); b.disabled = !controlsOn(); b.onclick = () => control({ action: "scan" });
+  if (!rows.length) { host.append(el("div", { class: "empty" }, "The scan runs with the hourly collect job, or press Scan now.")); return; }
+  host.append(tableView([
+    { label: "pair", get: (r) => el("strong", {}, r.symbol) },
+    { label: "today", num: true, get: (r) => signed(r.day_change_pct, 1, "%") },
+    { label: "24h", num: true, get: (r) => signed(r.change_24h_pct, 1, "%") },
+    { label: "RVOL", num: true, get: (r) => r.rvol == null ? "–" : nf(1).format(r.rvol) + "x" },
+    { label: "float", num: true, get: (r) => r.circulating_supply == null ? "?" : nf(0).format(r.circulating_supply) },
+    { label: "catalyst", get: (r) => el("span", { class: "secondary" }, (r.catalysts || []).map((c) => `${c.kind}: ${c.title}`).slice(0, 2).join(" · ") || "–") },
+    { label: "result", get: (r) => r.error ? status("serious", r.error) : r.passes ? status("good", "passes") : el("span", { class: "secondary" }, r.why) }], rows));
+}
+
+// ------------------------------------------------------------------ market regime
+const REGIME_COLOR = { crash: "var(--critical)", bear: "var(--serious)", neutral: "var(--text-muted)", bull: "var(--good)", euphoria: "var(--series-1)" };
+function renderRegime(s) {
+  const r = s.regime, now = clear(document.getElementById("regime-now")), pr = clear(document.getElementById("regime-probs"));
+  const strip = clear(document.getElementById("regime-strip"));
+  document.getElementById("regime-sub").textContent = r ? `5-state HMM on ${r.ref} · forward-filtered (no look-ahead) · a change needs 3 bars in a row` : "";
+  if (!r) now.append(el("div", { class: "empty" }, "The regime appears once the bot has 1,200+ BTC candles (fitted at start and every week)."));
+  else {
+    const big = el("div", { style: "font-size:24px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:" + (REGIME_COLOR[r.confirmed] || "inherit") }, r.confirmed);
+    now.append(big, el("div", { class: "secondary" }, `exposure cap ${r.cap_pct}% of equity · latest bar says ${r.raw} (${r.streak} bar${r.streak === 1 ? "" : "s"} in a row) · ${dt(r.at)}`));
+    for (const [lab, p] of Object.entries(r.probs || {})) {
+      const row = el("div", { style: "display:flex;align-items:center;gap:8px;margin-top:4px;font-size:12.5px" });
+      const bar = el("div", { style: "flex:1;height:8px;background:var(--wash);border-radius:4px;overflow:hidden" });
+      bar.append(el("div", { style: `height:100%;width:${Math.round(p * 100)}%;background:${REGIME_COLOR[lab] || "var(--series-1)"}` }));
+      row.append(el("span", { style: "width:70px" }, lab), bar, el("span", { class: "num", style: "width:44px;text-align:right" }, Math.round(p * 100) + "%"));
+      pr.append(row);
+    }
+    const hs = r.history || [];
+    const line = el("div", { style: "display:flex;gap:1px;height:14px", title: "confirmed regime, last 60 bars" });
+    for (const h of hs) line.append(el("div", { style: `flex:1;background:${REGIME_COLOR[h.confirmed] || "var(--wash)"}`, title: `${dt(h.ts)}: ${h.confirmed} (raw ${h.raw})` }));
+    strip.append(el("div", { class: "muted", style: "font-size:12px" }, "confirmed regime, last 60 bars"), line);
+  }
+  const c = s.correlations || {}, pairs = Object.keys(c), ch = clear(document.getElementById("correlations"));
+  if (!pairs.length) { ch.append(el("div", { class: "empty" }, "Needs cached candles.")); return; }
+  ch.append(tableView([{ label: "", get: (p) => el("strong", {}, p) },
+    ...pairs.map((q) => ({ label: q.split("/")[0], num: true, get: (p) => c[p][q] == null ? "–" : nf(2).format(c[p][q]) }))], pairs));
+}
+
+// ------------------------------------------------------------------ verification agents
+const AGENT_KIND = { pass: "good", warn: "warning", fail: "critical", skip: "warning" };
+function renderVerify(s) {
+  const v = s.verify || {}, host = clear(document.getElementById("verify"));
+  document.getElementById("verify-sub").textContent = v.checked_ms ? `overall ${v.overall} · checked ${dt(v.checked_ms)} in ${v.seconds}s` + ((v.blocked_pairs || []).length ? ` · entries blocked: ${v.blocked_pairs.join(", ")}` : "") : "not run yet";
+  const b = document.getElementById("btn-verify"); b.disabled = !controlsOn(); b.onclick = () => control({ action: "verify" });
+  if (!(v.agents || []).length) { host.append(el("div", { class: "empty" }, "The agents run every 15 minutes while the bot runs, or press Verify now.")); return; }
+  host.append(tableView([
+    { label: "agent", get: (a) => el("strong", {}, a.agent) },
+    { label: "result", get: (a) => status(AGENT_KIND[a.status] || "warning", a.status) },
+    { label: "per pair", get: (a) => { const d = el("div", { class: "secondary" });
+        const pairs = Object.entries(a.pairs || {});
+        if (!pairs.length) d.append(el("div", {}, a.note || "–"));
+        for (const [p, r] of pairs) d.append(el("div", {}, `${r.status === "pass" ? "✓" : r.status === "fail" ? "✕" : "•"} ${p}: ${r.detail}`));
+        return d; } }], v.agents));
+}
+
+
+// ------------------------------------------------------------------ voice (Web Speech API)
+const VOICE = (() => {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const heard = () => document.getElementById("voice-heard");
+  const btns = () => [document.getElementById("voice-btn"), document.getElementById("voice-btn2")];
+  const wake = /^\s*(hey\s+)?(jarvis|chantisimo|chanti\w*)[,.!\s]*/i;
+  let rec = null, listening = false, handsFree = false, voice = null;
+  const speakOn = () => document.getElementById("voice-speak").checked;
+  function pickVoice() {
+    const vs = (window.speechSynthesis && speechSynthesis.getVoices()) || [];
+    voice = vs.find((v) => /en-GB/i.test(v.lang) && /male|daniel|arthur|george/i.test(v.name))
+      || vs.find((v) => /en-GB/i.test(v.lang)) || vs.find((v) => /^en/i.test(v.lang)) || null;
+  }
+  if (window.speechSynthesis) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
+  function mark(cls, on) { for (const b of btns()) if (b) b.classList.toggle(cls, on); }
+  function say(text) {
+    if (!speakOn() || !window.speechSynthesis || !text) return;
+    const clean = String(text).replace(/https?:\/\/\S+/g, "").replace(/[─│›•✓✕]/g, " ").slice(0, 400);
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(clean);
+    if (voice) u.voice = voice;
+    u.rate = 1.03; u.pitch = 0.9;
+    u.onstart = () => mark("speaking", true); u.onend = () => mark("speaking", false);
+    speechSynthesis.speak(u);
+  }
+  function handle(text, final) {
+    heard().textContent = (final ? "heard: " : "listening: ") + text;
+    if (!final) return;
+    let cmd = text.trim();
+    if (handsFree) { if (!wake.test(cmd)) return; cmd = cmd.replace(wake, ""); }
+    else cmd = cmd.replace(wake, "");
+    if (cmd) termSend(cmd);
+    else say("Yes?");
+  }
+  function start(continuous) {
+    if (!SR) { termLine("sys", "Voice needs Chrome or Edge (the browser's speech recognition). Firefox and Safari don't support it here."); return; }
+    if (!controlsOn()) { termLine("sys", "Voice commands need the live dashboard with controls on."); return; }
+    if (listening) { rec && rec.stop(); return; }
+    rec = new SR(); rec.lang = navigator.language || "en-US"; rec.interimResults = true; rec.continuous = continuous;
+    rec.onresult = (ev) => { for (let i = ev.resultIndex; i < ev.results.length; i++) handle(ev.results[i][0].transcript, ev.results[i].isFinal); };
+    rec.onerror = (ev) => { heard().textContent = "voice: " + ev.error + (ev.error === "not-allowed" ? " (allow the microphone for this page)" : ""); };
+    rec.onend = () => { listening = false; mark("listening", false); if (handsFree) setTimeout(() => start(true), 300); };
+    try { rec.start(); listening = true; mark("listening", true); if (window.speechSynthesis) speechSynthesis.cancel(); }
+    catch (e) { heard().textContent = "voice: " + e.message; }
+  }
+  for (const b of btns()) b && b.addEventListener("click", () => { handsFree = false; document.getElementById("voice-hands").checked = false; start(false); });
+  document.getElementById("voice-hands").addEventListener("change", (ev) => {
+    handsFree = ev.currentTarget.checked;
+    if (handsFree) { start(true); say("Hands-free on. Say Jarvis, then your command."); }
+    else if (rec) { rec.stop(); }
+  });
+  if (!SR) for (const b of btns()) if (b) b.title = "Voice needs Chrome or Edge";
+  return { say, start };
+})();
+
+// ------------------------------------------------------------------ smart money
+function renderTraders(s) {
+  const st = s.traders || {}, rows = st.traders || [], on = controlsOn();
+  document.getElementById("traders-sub").textContent = st.refreshed_ms ? `${rows.length} traders · ${rows.filter((r) => r.qualified).length} qualified · refreshed ${dt(st.refreshed_ms)}` : "no traders added yet";
+  const rb = document.getElementById("btn-traders-refresh"); rb.disabled = !on; rb.onclick = () => control({ action: "traders_refresh" });
+  const add = document.getElementById("tr-add"); add.disabled = !on;
+  add.onclick = () => control({ action: "trader_add", name: document.getElementById("tr-name").value, kind: document.getElementById("tr-kind").value, value: document.getElementById("tr-value").value });
+  const host = clear(document.getElementById("traders"));
+  if (!rows.length) host.append(el("div", { class: "empty" }, "Add a trader below: their trade-history export, a feed URL, another bot, or a Solana wallet."));
+  else host.append(tableView([
+    { label: "#", num: true, get: (r) => r.rank },
+    { label: "trader", get: (r) => el("strong", {}, r.name) }, { label: "source", get: (r) => r.type },
+    { label: "trades", num: true, get: (r) => r.trades ?? "–" },
+    { label: "win rate", num: true, get: (r) => r.win_rate == null ? "–" : nf(1).format(r.win_rate * 100) + "%" },
+    { label: "95% low", num: true, get: (r) => r.win_rate_lb == null ? "–" : nf(1).format(r.win_rate_lb * 100) + "%" },
+    { label: "avg return", num: true, get: (r) => signed(r.avg_return_pct, 2, "%") },
+    { label: "profit factor", num: true, get: (r) => r.profit_factor == null ? "–" : nf(2).format(r.profit_factor) },
+    { label: "max DD", num: true, get: (r) => r.max_drawdown_pct == null ? "–" : nf(1).format(r.max_drawdown_pct) + "%" },
+    { label: "style", get: (r) => r.style || "–" },
+    { label: "status", get: (r) => r.error ? status("serious", r.error) : r.qualified ? status("good", "qualified") : el("span", { class: "secondary" }, r.why) },
+    { label: "", get: (r) => { const d = el("span", { style: "display:inline-flex;gap:4px" });
+        d.append(controlButton(r.following ? "Unfollow" : "Follow", r.following ? "small" : "small primary", { action: "trader_follow", name: r.name, follow: !r.following }));
+        d.append(controlButton("Remove", "small", { action: "trader_remove", name: r.name }, `Remove trader ${r.name}?`)); return d; } }], rows));
+  const sh = clear(document.getElementById("copy-signals")), sigs = st.copy_signals || [];
+  if (!sigs.length) sh.append(el("div", { class: "empty", style: "padding:10px 0" }, "No open copy signals."));
+  else sh.append(tableView([{ label: "trader", get: (r) => r.trader }, { label: "pair", get: (r) => r.pair },
+    { label: "bought (UTC)", nowrap: true, get: (r) => dt(r.entry_ts) }, { label: "their entry", num: true, get: (r) => px(r.entry_price) }], sigs));
+}
+
 // ------------------------------------------------------------------ terminal
 const TERM = { history: [], pos: 0, queue: Promise.resolve() };
 function termLine(cls, text) {
@@ -1218,6 +1568,7 @@ async function termRun(text) {
     const j = await r.json();
     if (!r.ok) { termLine("sys", "✕ " + (j.message || r.statusText)); return; }
     termLine("bot", j.text);
+    VOICE.say(j.text);
     const out = document.getElementById("term-out");
     if (j.table && j.table.rows && j.table.rows.length) {
       const cols = j.table.cols.map((c, i) => ({ label: c, get: (row) => row[i] }));
@@ -1254,8 +1605,9 @@ async function termRun(text) {
 
 // ------------------------------------------------------------------ data + controls
 async function refresh() {
-  const app = document.getElementById("app"), err = document.getElementById("b-error");
-  app.classList.add("loading");
+  if (state.inflight) return;  // never stack requests: a slow answer is simply skipped
+  state.inflight = true;
+  const err = document.getElementById("b-error");
   try {
     try {
       const fr = await fetch("api/fleet", { cache: "no-store" });
@@ -1265,10 +1617,11 @@ async function refresh() {
     const r = await fetch("api/snapshot" + (state.bot ? "?bot=" + encodeURIComponent(state.bot) : ""), { cache: "no-store" });
     const j = await r.json();
     if (!r.ok || j.error) throw new Error(j.error || r.statusText);
-    state.snap = j; err.textContent = ""; renderAll();
-    refreshConnections();
+    const botChanged = state.snap && state.snap.meta.bot_name !== j.meta.bot_name;
+    state.snap = j; err.textContent = ""; renderAll(botChanged);
+    if (!state.connAt || Date.now() - state.connAt > 10000) { state.connAt = Date.now(); refreshConnections(); }
   } catch (e) { err.textContent = "refresh failed: " + e.message + " (showing last snapshot)"; }
-  finally { app.classList.remove("loading"); }
+  finally { state.inflight = false; }
 }
 
 for (const b of document.querySelectorAll("button[data-table]")) {
@@ -1276,21 +1629,21 @@ for (const b of document.querySelectorAll("button[data-table]")) {
   b.addEventListener("click", () => {
     const k = b.dataset.table; state.tables[k] = !state.tables[k];
     b.setAttribute("aria-pressed", String(state.tables[k])); b.textContent = state.tables[k] ? "Chart" : "Table";
-    renderAll();
+    renderAll(true);
   });
 }
 document.getElementById("theme").addEventListener("click", (ev) => {
-  const order = ["auto", "light", "dark"], next = order[(order.indexOf(state.theme) + 1) % 3];
+  const order = ["jarvis", "auto", "light", "dark"], next = order[(order.indexOf(state.theme) + 1) % order.length];
   state.theme = next;
   if (next === "auto") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", next);
   ev.currentTarget.textContent = "Theme: " + next;
 });
 let resizeTimer = null;
-window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderAll, 150); });
+window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => renderAll(true), 150); });
 
 if (EMBEDDED) { state.snap = EMBEDDED; renderAll(); document.getElementById("conn-card").style.display = "none"; }
-else { refresh(); setInterval(refresh, Math.max(5, REFRESH_S) * 1000); }
+else { refresh(); setInterval(refresh, Math.max(1, REFRESH_S) * 1000); }
 </script>
 </body>
 </html>

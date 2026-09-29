@@ -39,6 +39,8 @@ RULE_IDS = {
     "L_expectancy_guard": "Layer: halve a pair's risk while its last-N-trade expectancy < 0",
     "X_capital": "Execution: not enough free capital / size below minimum",
     "X_operator": "Execution: new entries paused by the operator (exits keep running)",
+    "X_capital_guard": "Execution: capital protection (daily / peak drawdown, losing streak)",
+    "X_data_check": "Execution: a verification agent found this pair's data wrong; no entries",
     "L_signal_layer": "Layer: veto from a validated signal layer (ML/RL/regime/sentiment/flow)",
     "L_learned_rule": "Layer: veto from a learned rule (learning.py), evidence- and backtest-gated",
     "L_brain": "Layer: Chantisimo brain veto (pair not yet proven in paper trading)",

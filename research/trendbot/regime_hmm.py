@@ -1,7 +1,7 @@
 """Regime layer: a pure-Python Gaussian hidden Markov model over a reference series.
 
 Model
-    A K-state Gaussian HMM with DIAGONAL covariance (default K=4), fitted by Baum-Welch EM
+    A K-state Gaussian HMM with DIAGONAL covariance (default K=5), fitted by Baum-Welch EM
     with per-step scaling (emission log-likelihoods are shifted by their per-step maximum
     before exponentiation, so neither the forward nor the backward pass can underflow).
     Initialisation is deterministic: k-means (Lloyd) on z-scored observations, seeded with
@@ -422,12 +422,12 @@ class HmmRegimeLayer(Layer):
     name = "hmm_regime"
     kind = "regime"
     description = (
-        "4-state Gaussian HMM on the reference pair's 4H log return and 12-candle realized "
+        "5-state Gaussian HMM on the reference pair's 4H log return and 12-candle realized "
         "volatility; vetoes entries when the forward-filtered P(crash) + P(bear) >= threshold"
     )
     DEFAULTS: dict[str, Any] = {
         "ref_pair": "BTC/USDT",
-        "n_states": 4,
+        "n_states": 5,  # crash, bear, neutral, bull, euphoria
         "threshold": 0.6,
         "min_candles": 1500,
         "vol_window": 12,

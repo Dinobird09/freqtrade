@@ -154,7 +154,7 @@ def test_brain_filter_logs_every_verdict_and_names_the_rule(tmp_path):
     assert not ok and f.rule_id == "L_learned_rule"
     thoughts = read_thoughts(tmp_path / "b", kind="thought")
     assert [t["verdict"] for t in thoughts] == ["SKIP", "SKIP"]
-    assert thoughts[0]["recall"]["n"] == 12 and "recalls" in thoughts[0]["recall_text"]
+    assert thoughts[0]["recall"]["n"] == 24 and "recalls" in thoughts[0]["recall_text"]
 
 
 def test_reflection_compares_the_recall_with_the_outcome(tmp_path):
@@ -220,3 +220,26 @@ def test_memory_is_causal(tmp_path):
     ok, why = brain.graduation("BTC/USDT", early)
     assert not ok and "6 of 20" in why
     assert brain.graduation("BTC/USDT", trades[-1].exit_ts + 4 * HOUR_MS)[0]
+
+
+def test_recall_reaches_100_neighbours_with_backtest_memory(tmp_path):
+    from research.trendbot.chantisimo import load_backtest_memory, write_backtest_memory
+    from research.trendbot.models import CandidateOutcome
+
+    cands = [
+        CandidateOutcome(
+            "BTC/USDT", t.signal_ts, t.entry_ts, t.exit_ts, t.exit_reason, t.r_multiple, t.features
+        )
+        for t in [_t(i, 1.5 + (i % 50) * 0.03, 2.0 if i % 3 == 0 else -1.0) for i in range(1, 301)]
+    ]
+    assert write_backtest_memory(tmp_path, cands) == 300
+    assert len(load_backtest_memory(tmp_path)) == 300
+    brain = Chantisimo(tmp_path, BrainSettings(), "paper")
+    brain.remember([_t(900, 2.6, 2.0)])
+    assert len(brain.recall_pool()) == 301 and brain.s.recall_k == 100
+    mem = recall("BTC/USDT", _t(0, 2.0, 0).features, brain.recall_pool(), brain.s.recall_k)
+    assert mem["n"] == 100 and set(mem["by_source"]) <= {"own", "backtest"}
+    assert "recalls 100 similar trades" in mem["text"]
+    off = Chantisimo(tmp_path, BrainSettings(use_backtest=False), "paper")
+    off.remember([])
+    assert off.recall_pool() == []

@@ -152,6 +152,43 @@ press **Yes**) to go ahead, or `no` to cancel. `execute trade` never skips the n
 the latest candle failed them, the bot waits for a candle that passes. Times are UTC, and
 `today` starts at 00:00 UTC.
 
+## 4c. Live data: the 1-second dashboard
+
+While the bot runs it reads the market every second (`poll_seconds`, default 1):
+
+- **Live prices:** one request fetches the price of every pair. Stops and targets are
+  checked against the live bid every second.
+- **Forming candle:** the 4H candle that is still open is re-read every 5 seconds and kept
+  up to date with each price in between.
+- **Dashboard:** it shows the forming candle on the price chart, a live price line, and
+  **Open P&L (live)** in the tiles. Open positions show their unrealized P&L at the live bid.
+
+The page refreshes every second (`--refresh`, default 1). The server rebuilds the heavy
+parts (candles, journal, decisions) only when a file changes, so each refresh takes a few
+milliseconds. The page redraws only the sections whose data changed, so tables keep their
+scroll position. New entries are still decided at each 4H close: that is the strategy's
+timeframe.
+
+Tune it in the bot settings: `"live": {"price_seconds": 1, "candle_seconds": 5}`. Set
+`"enabled": false` to turn the feed off.
+
+## 4d. Voice and the Jarvis look
+
+The dashboard opens in a dark HUD theme; **Theme** switches to auto, light or dark. To talk
+to the bot:
+
+- **Push to talk:** click the glowing reactor (top left) or **🎙 Push to talk**, then say a
+  command, e.g. "earnings today", "end day", "execute trade bitcoin", or "why ethereum".
+- **Hands-free:** tick *hands-free* and start each command with "Jarvis" or "Chantisimo",
+  e.g. "Jarvis, status".
+- **Replies:** they are spoken aloud (untick *speak replies* to turn that off).
+- **Confirming:** a command that needs confirmation waits for you to say "yes" or "no".
+
+Voice uses your browser's speech recognition, so use **Chrome or Edge**, and allow the
+microphone the first time. It works on `http://127.0.0.1` or over an SSH tunnel to
+`localhost`. In Chrome and Edge, the browser sends your speech to its own speech service
+(Google or Microsoft) to turn it into text. Only the recognized words reach the bot.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,
@@ -199,8 +236,10 @@ raises risk.
 Chantisimo is the part of the bot that decides whether to take a signal that passed the nine
 rules, and that learns from every trade. Before each entry it:
 
-1. **Recalls** the 12 most similar past trades, by RSI, volume, EMA gap, distance to EMA200,
-   hour and pair, and what happened to them.
+1. **Recalls** the 100 most similar past trades, by RSI, volume, EMA gap, distance to EMA200,
+   hour and pair, and what happened to them. It searches its own trades, the paper bots'
+   and followed traders' trades, and every simulated signal in the cached history (written
+   by the weekly retrain, up to 6,000), so 100 neighbours are available from the first day.
 2. **Checks graduation.** A testnet or live bot trades a pair only after its paper bots have
    at least 20 closed trades on that pair averaging ≥ 0R.
 3. **Applies the learned rules and the validated signal layers.** This includes
@@ -241,6 +280,187 @@ The dashboard's **Chantisimo** card shows:
 
 Chantisimo only ever skips. It never opens a trade, loosens a rule or raises risk. It lowers
 the number of losing trades, but no rule set removes losses entirely.
+
+## 6b. Smart money: learn from and copy other traders
+
+The **Smart money** card ranks other traders and lets you follow them. Add a trader by name
+and source:
+
+| source | what to give it |
+|---|---|
+| trade history file | a CSV or JSON of their fills; a Binance "Trade History" export works as is (Date, Pair, Side, Price, Executed, Fee) |
+| feed URL | an `https://` address serving the same CSV/JSON, re-read every 5 minutes |
+| another trendbot | the other bot's state folder |
+| Solana wallet | a public wallet address; its swaps are read from the chain (public RPC or `SOLANA_RPC_URL`) |
+
+Each trader's fills become round trips (flat to long to flat), and the card shows:
+
+- trades, win rate and its **95% lower bound**, so 3 lucky wins don't count as 100%;
+- average return, profit factor, max drawdown and style (scalper, intraday, swing,
+  position).
+
+A trader is **qualified** with at least 30 trades, a win-rate lower bound of at least 45%,
+a profit factor of at least 1.3, a max drawdown of at most 35%, and a style a 4-hour bot
+can follow (scalpers' entries are gone by the next close). Change the limits in
+`traders.json` under `"rules"`.
+
+**Copying.** When a qualified trader you **follow** opens a position on a pair your bot
+trades (within the last 12 hours), the bot **arms** that pair. It then buys at the next 4H
+close where the signal passes all nine rules, sized by its own stop and the 1% risk limit.
+It never mirrors a trade blindly, and it acts on each copy signal once. Solana wallets are
+watch-only: the bot holds no wallet keys.
+
+**Learning.** Every trader's closed trades (followed or not) join Chantisimo's memory, with
+this bot's own entry features at their entry time and R estimated from their typical loss.
+Their losses show up in the mistake book and in recall ("other people's mistakes").
+
+There is no official API for exchange copy-trading leaderboards, so the bot doesn't scrape
+them. Add a leaderboard trader's shared history or feed instead. Terminal: `traders`,
+`follow <name>`, `unfollow <name>`.
+
+## 6c. Verification agents
+
+Seven independent checkers re-derive what the charts and the bot show. They run every 15
+minutes while the bot runs; press **Verify now** or type `verify` to run them at once.
+
+| agent | checks |
+|---|---|
+| data | cached candles: no gaps or duplicates, sane OHLC, not stale |
+| exchange | re-downloads the latest 60 candles and compares them with the cache |
+| indicator | recomputes EMA9/21/200, RSI(14) and the volume ratio with its own code |
+| chart | the dashboard's price chart equals those independent values, candle by candle |
+| price | the live price against a second exchange: a bad tick shows as a large gap |
+| ledger | dashboard equity, trade count and open positions equal the journal; P&L and R add up |
+| audit | every live trade re-checked against the nine rules on the candles it traded on |
+
+If the data, exchange, indicator or price agent **fails** a pair, the bot takes no new
+entries on it (rule `X_data_check`) until a later check passes. Exits are never blocked.
+
+## 6d. Capital protection
+
+On top of the 1% risk per trade (R7) and the circuit breakers (R9), the bot watches its
+**mark-to-market** equity (realized plus open positions at the live bid) every second:
+
+| condition | what happens |
+|---|---|
+| today's drawdown > 2% (UTC day) | every new entry's risk is halved for the rest of the day |
+| today's drawdown > 3% | every open position is sold and new entries freeze for 24 hours |
+| drawdown from the equity peak > 10% | **kill switch**: sells everything, pauses entries, writes `trading_halted.lock` and stops |
+| 3 losing trades in a row today | no new entries until 00:00 UTC |
+| fee rate above 0.1% | a warning in the log and on the dashboard |
+
+`trading_halted.lock` sits in the bot's state folder and says why and when trading stopped.
+While it exists, neither the dashboard nor the command line will start the bot. Review what
+happened, then **delete the file by hand** to allow a restart.
+
+**Maker orders.** On testnet and live, entries go in as a post-only limit order at the bid.
+That pays the lower maker fee and has no slippage. Whatever hasn't filled after 15 seconds
+is cancelled and bought at market. Stops always exit at market.
+
+Change the limits in the bot settings:
+
+```json
+"capital": {"daily_reduce_pct": 2, "daily_flatten_pct": 3, "freeze_hours": 24,
+            "peak_kill_pct": 10, "max_consecutive_losses": 3, "max_fee_rate": 0.001},
+"execution": {"maker_first": true, "maker_wait_seconds": 15}
+```
+
+## 6e. Market regime and allocation
+
+A 5-state Gaussian HMM (**crash, bear, neutral, bull, euphoria**) reads BTC/USDT's 4H
+returns and volatility. BTC is the market leader, so there is one regime for every pair. It
+uses only **forward-filtered** probabilities (P(state now | data up to now)): no
+`.predict()` over the whole series and no smoothing, so no look-ahead. A new regime counts
+only once it has been the most likely state for **3 bars in a row**.
+
+The regime caps how much of your equity open positions may use:
+
+| regime | exposure cap |
+|---|---|
+| bull, euphoria | 95% |
+| neutral | 50% |
+| bear | 25% |
+| crash | 0% (no new entries) |
+
+The cap only shrinks or skips new entries; each trade's size still comes from its stop and
+the 1% risk limit. The model is fitted on first start and refitted every week, and each new
+candle updates the probabilities. The **Market regime** card shows:
+
+- the regime, the probability of each state, and the last 60 bars;
+- a correlation matrix of the pairs' returns, so assets moving together are visible.
+
+Terminal: `regime`. Settings:
+`"allocation": {"enabled": true, "persistence": 3, "caps": {"neutral": 50}}`.
+
+## 6f. Market scanner (today's movers)
+
+The **Market scanner** card, the `scan` command and the hourly collect job look at every
+USDT ticker on the exchange and keep coins that pass all four filters:
+
+| filter | rule |
+|---|---|
+| price expansion | up at least 10% since today's 00:00 UTC open |
+| relative volume | today's volume at least 5x the average of the previous 50 days |
+| catalyst | a headline, Reddit post or token-unlock mention of the coin in the last 24 hours (from the collected news) |
+| float | fewer than 10 million tokens circulating (CoinGecko's free API; `COINGECKO_API_KEY` in `.env` is optional) |
+
+It is a **watchlist**. To trade a coin, add its pair to a bot: the nine rules, the 1% risk
+limit and every guard still apply. Change the limits with
+`"scanner": {"min_day_change_pct": 10, "min_rvol": 5, "max_float": 10000000}`.
+
+**News for sentiment and catalysts.** Besides the RSS feeds, Reddit and CryptoPanic, you can
+scrape news sites that have no feed: `"sentiment": {"pages": [{"name": "site", "url":
+"https://…", "selector": "h2 a"}]}`. It uses BeautifulSoup if installed
+(`pip install beautifulsoup4`), otherwise it reads the page's headings. Headlines are scored
+by FinBERT if installed, else VADER (`pip install vaderSentiment`), else the built-in
+lexicon. Set `"scorer": "textblob"` for TextBlob. The score is a number in [-1, 1] per coin
+and 4H bucket; the `news_sentiment` layer and the dashboard use it.
+
+New DEX contracts: the DEX scanner follows DEXScreener's newest token profiles and boosts,
+and scores their volume, liquidity and holder concentration (section 8).
+
+## 6g. Strategy lab: new strategies, researched overnight
+
+Besides the main nine-rule strategy, the lab researches three more:
+
+| strategy | timeframe | idea |
+|---|---|---|
+| `nnfx` | 4H | 50 SMA baseline; MACD and a Range Filter must turn up together; a volatility / volume gate against chop; stop 1.5x ATR (never a fixed %); half sold at 2R, then the stop goes to break-even and the rest trails 1.5x ATR below the best close |
+| `sneaky_pivot` | 15m | Range High / Low = yesterday's high / low, Swing High / Low = the next structural pivot beyond them; buys only at the lower boundary: an impulse drop taps the Range / Swing Low, the next candle closes green, a buy-stop sits at its high; stop at the pullback's lowest wick; target the Range High |
+| `fib_fvg` | 4H | after an impulse (swing low to swing high), entries only in the 0.705-0.886 discount zone, on a liquidity grab (a wick below 0.886 or the prior swing low that closes back inside) or a re-test of an unfilled fair value gap; a close below 0.886 cancels the setup. Optional: footprint absorption + a 400% delta expansion, and Elliott's hard rules |
+
+All three keep the 2:1 minimum reward-to-risk.
+
+**Every night at 02:00 UTC** (or **Run research now**) the lab:
+
+1. **Prepares** the cached candles.
+2. **Trains:** runs a *rolling walk-forward*. It picks the best of a dozen parameter variants
+   on 252 days, trades it on the next 6 months, then rolls on 6 months. Only the unseen
+   months count.
+3. **Checks for look-ahead.** Each sampled signal must reappear when the history ends at
+   its own bar, and signals must not change when later data is cut off. A variant earning
+   more than +1,000%/year or a Sharpe above 6 is treated as a leak and discarded.
+4. **Stress-tests** each survivor with 20 random single-day crashes of -5% to -15%.
+5. **Reports:** writes `lab/leaderboard.json` and a plain-English `lab/program.md`.
+
+A variant becomes a **proposal** only if its out-of-sample Sharpe beats 1.5 and the version
+you already approved. Nothing changes by itself: press **Approve for paper**, then run it on
+a paper bot:
+
+```json
+{"engine": "lab", "mode": "paper", "pairs": ["BTC/USDT"], "state_dir": "trendbot_state/nnfx-paper",
+ "lab": {"strategy": "nnfx", "params": {}}}
+```
+
+(Use a pair no other bot on the same account trades.) **Incubation:** a testnet or live lab
+bot refuses to start until that strategy has paper-traded for at least 30 days. The card
+shows the days so far. Lab bots use the same capital protection, kill switch, dashboard and
+terminal as the main bot. Terminal: `lab`.
+
+**Learnings file.** Besides `learnings.md`, the bot writes `learnings.txt`: one plain line
+per stopped-out trade plus the learned rules. It checks them before every entry (through the
+learned rules and Chantisimo's recall), so a mistake that keeps costing money is not
+repeated.
 
 ## 7. Running up to 10 bots (fleet)
 
@@ -321,6 +541,8 @@ also trigger them from the dashboard with **Collect data now** and **Retrain now
 | job | when | what it does |
 |---|---|---|
 | **collect** | hourly | Fear & Greed, news, Reddit, CryptoPanic, exchange trades for order flow, DEX scan |
+| **traders** | every 5 minutes (if `traders.json` exists) | re-reads every trader, re-ranks them, lists copy signals |
+| **verify** | every 15 minutes | runs the verification agents |
 | **retrain** | weekly, Sunday 01:00 UTC | retrains and re-validates every layer on the latest candles and journal (paper trades count), switches layers on or off, writes `layers.json` + `models/`; the bot reloads them |
 
 Any layer can be switched off from the **Signal layers** table.

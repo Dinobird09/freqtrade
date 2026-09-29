@@ -84,6 +84,8 @@ def test_retrain_writes_registry_and_models_and_the_bot_reloads(tmp_path):
     assert status["layers"]["test_edge_hours"]["status"] == "active"
     assert status["layers"]["test_random"]["status"] == "rejected"
     assert status["layers"]["nope"]["status"] == "unavailable"
+    assert status["backtest_memory"] > 100  # Chantisimo's recall memory of simulated signals
+    assert (tmp_path / "brain_backtest.json").exists()
     reg = json.loads((tmp_path / "layers.json").read_text())
     assert reg["layers"]["test_edge_hours"]["gain_r"] > 0
     assert (tmp_path / "models" / "test_edge_hours.json").exists()
@@ -130,12 +132,23 @@ def test_market_view_is_causal():
 
 
 def test_schedule_collect_hourly_and_retrain_weekly():
+    only = {"verify_every_minutes": 0, "lab_hour_utc": -1, "traders_every_minutes": 0}
     sun = _ms("2026-09-27T01:30:00")  # a Sunday
-    assert due({}, {}, sun) == ["collect", "retrain"]
+    assert due(only, {}, sun) == ["collect", "retrain"]
     done = {"collect": sun - 10 * 60_000, "retrain": sun - 20 * 60_000}
-    assert due({}, done, sun) == []
-    assert due({}, done, sun + 60 * 60_000) == ["collect"]
+    assert due(only, done, sun) == []
+    assert due(only, done, sun + 60 * 60_000) == ["collect"]
     next_week = _ms("2026-10-04T01:00:00")
-    assert "retrain" not in due({}, done, next_week - 60_000)
-    assert "retrain" in due({}, done, next_week)
-    assert due({"collect_every_minutes": 0}, {}, sun) == ["retrain"]
+    assert "retrain" not in due(only, done, next_week - 60_000)
+    assert "retrain" in due(only, done, next_week)
+    assert due({**only, "collect_every_minutes": 0}, {}, sun) == ["retrain"]
+
+
+def test_schedule_verify_every_15_minutes_and_the_lab_nightly():
+    t = _ms("2026-09-29T02:10:00")
+    jobs = due({}, {"collect": t, "retrain": t}, t)
+    assert "verify" in jobs and "lab" in jobs  # the lab runs at 02:00 UTC
+    last = {"collect": t, "retrain": t, "verify": t - 5 * 60_000, "lab": t - 60_000}
+    assert due({}, last, t) == []
+    assert "lab" not in due({}, last, _ms("2026-09-30T01:59:00"))
+    assert "lab" in due({}, last, _ms("2026-09-30T02:00:00"))

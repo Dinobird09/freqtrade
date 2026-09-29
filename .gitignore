@@ -129,4 +129,7 @@ trendbot_state/
 /fleet.json
 /fleet_approvals.jsonl
 /connections.json
+/traders.json
+/traders_status.json
+/traders/
 /bots/

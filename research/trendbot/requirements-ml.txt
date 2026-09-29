@@ -3,3 +3,8 @@
 xgboost>=2.0          # "gbm" layer uses XGBoost instead of the built-in boosted trees
 torch>=2.2            # "lstm" layer (CPU is enough)
 transformers>=4.40    # FinBERT news scoring (ProsusAI/finbert); lexicon scorer otherwise
+
+# market scanner / sentiment (optional)
+vaderSentiment
+textblob
+beautifulsoup4

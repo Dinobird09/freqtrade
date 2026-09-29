@@ -63,6 +63,16 @@ def load_env_file(path: str | os.PathLike[str] | None = None) -> list[str]:
     return loaded
 
 
+def combine_fills(a: Fill, b: Fill) -> Fill:
+    """One fill from two partial fills of the same order intent."""
+    qty = a.qty + b.qty
+    if qty <= 0:
+        return b
+    price = (a.qty * a.price + b.qty * b.price) / qty
+    fee = None if a.fee_quote is None or b.fee_quote is None else a.fee_quote + b.fee_quote
+    return Fill(qty, price, fee, max(a.ts, b.ts), f"{a.order_id}+{b.order_id}".strip("+"))
+
+
 class OrderError(RuntimeError):
     """An order could not be placed or its outcome could not be established."""
 
@@ -199,6 +209,34 @@ class CcxtGateway:
     def _ticker(self, pair: str) -> dict[str, Any]:
         return self._call(lambda: self.ex.fetch_ticker(pair), f"fetch_ticker {pair}")
 
+    def tickers(self, pairs: list[str]) -> dict[str, dict[str, Any]]:
+        """Latest ticker of every pair: one request when the exchange supports it."""
+        if (getattr(self.ex, "has", None) or {}).get("fetchTickers"):
+            got = self._call(lambda: self.ex.fetch_tickers(list(pairs)), "fetch_tickers")
+            return {p: got[p] for p in pairs if p in got}
+        return {p: self._ticker(p) for p in pairs}
+
+    def forming_candle(self, pair: str) -> Candle | None:
+        """The 4H candle that is still open, aggregated from the exchange's own candles."""
+        now = self.now_ms()
+        start = now // self.tf_ms * self.tf_ms
+        n = self.tf_ms // self.request_ms + 1
+        rows = self._call(
+            lambda: self.ex.fetch_ohlcv(pair, self.request_tf, since=start, limit=n),
+            f"fetch_ohlcv {pair} (forming)",
+        )
+        rows = [r for r in rows or [] if int(r[0]) >= start]
+        if not rows:
+            return None
+        return Candle(
+            start,
+            float(rows[0][1]),
+            max(float(r[2]) for r in rows),
+            min(float(r[3]) for r in rows),
+            float(rows[-1][4]),
+            sum(float(r[5] or 0) for r in rows),
+        )
+
     def bid(self, pair: str) -> float:
         t = self._ticker(pair)
         return float(t.get("bid") or t.get("last"))
@@ -249,6 +287,49 @@ class CcxtGateway:
     def buy(self, pair: str, qty: float) -> Fill:
         return self._market_order(pair, "buy", qty)
 
+    def buy_maker_first(self, pair: str, qty: float, *, wait_s: float = 15.0) -> Fill:
+        """Post-only limit buy at the bid (maker fee, no slippage); whatever has not filled
+        after ``wait_s`` seconds is cancelled and bought at market."""
+        has = getattr(self.ex, "has", None) or {}
+        if not (has.get("createPostOnlyOrder") or has.get("createLimitOrder")):
+            return self.buy(pair, qty)
+        try:
+            import ccxt
+
+            invalid: tuple[type[BaseException], ...] = (ccxt.InvalidOrder,)
+        except ImportError:
+            invalid = ()
+        price = self.bid(pair)
+        if hasattr(self.ex, "price_to_precision"):
+            price = float(self.ex.price_to_precision(pair, price))
+        try:
+            order = self.ex.create_order(pair, "limit", "buy", qty, price, {"postOnly": True})
+        except invalid:  # it would have taken liquidity (or was refused): plain market order
+            return self.buy(pair, qty)
+        except self._transient as exc:
+            # Never blindly re-send an order: the first one may have been accepted.
+            raise OrderError(f"limit buy {pair} {qty}: network error, outcome unknown: {exc}")
+        oid = order.get("id")
+        done = ("closed", "canceled", "expired", "rejected")
+        for _ in range(max(1, int(wait_s))):
+            if order.get("status") in done:
+                break
+            self.sleep(1.0)
+            order = self._call(lambda: self.ex.fetch_order(oid, pair), f"fetch_order {oid}")
+        if order.get("status") not in done:
+            try:
+                self._call(lambda: self.ex.cancel_order(oid, pair), f"cancel_order {oid}")
+            except Exception as exc:  # it may have filled meanwhile: the fetch below tells
+                log.warning("cancel of %s failed: %s", oid, exc)
+            order = self._call(lambda: self.ex.fetch_order(oid, pair), f"fetch_order {oid}")
+        maker = fill_from_order(order, pair, "buy", self.now_ms())
+        rest = self.round_qty(pair, qty - float(order.get("filled") or 0.0))
+        min_amount, min_cost = self.min_order(pair)
+        if rest <= 0 or rest < min_amount or rest * price < min_cost:
+            return maker
+        taker = self.buy(pair, rest)
+        return combine_fills(maker, taker)
+
     def sell(self, pair: str, qty: float) -> Fill:
         return self._market_order(pair, "sell", qty)
 
@@ -295,6 +376,12 @@ class PaperBroker:
 
     def bid(self, pair: str) -> float:
         return self.market.bid(pair)
+
+    def tickers(self, pairs: list[str]) -> dict[str, dict[str, Any]]:
+        return self.market.tickers(pairs)
+
+    def forming_candle(self, pair: str) -> Candle | None:
+        return self.market.forming_candle(pair)
 
     def ask(self, pair: str) -> float:
         return self.market.ask(pair)

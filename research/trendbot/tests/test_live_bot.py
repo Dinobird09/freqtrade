@@ -424,3 +424,17 @@ def test_operator_pause_close_stop_and_learning_files(tmp_path, world):
     assert bot.stop_requested
     beat = json.loads((bot.dir / "heartbeat.json").read_text())
     assert beat["status"] == "stopped" and beat["mode"] == "testnet"
+
+
+def test_bot_writes_live_prices_every_step_and_exits_on_them(tmp_path, world):
+    data, _ = world
+    ex = FakeExchange(data, _start_ts(data))
+    bot = _bot(_settings(tmp_path), ex)
+    bot.start()
+    bot.step()
+    live = json.loads((bot.dir / "live.json").read_text())
+    assert set(live["prices"]) == set(PAIRS)
+    assert live["prices"]["BTC/USDT"]["bid"] == pytest.approx(bot.gw.bid("BTC/USDT"))
+    assert bot._bid("BTC/USDT") == live["prices"]["BTC/USDT"]["bid"]
+    ex.advance(3600)  # an hour later the cached price is stale: a fresh request is made
+    assert bot._bid("BTC/USDT") == pytest.approx(bot.gw.bid("BTC/USDT"))

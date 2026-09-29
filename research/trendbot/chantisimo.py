@@ -45,6 +45,7 @@ on its own, never loosens a rule and never raises risk.
 
 from __future__ import annotations
 
+import heapq
 import json
 import math
 import statistics
@@ -81,7 +82,9 @@ QUICK_STOP = "stopped out within 2 candles (entered into a reversal)"
 class BrainSettings:
     enabled: bool = True
     learn_from: list[str] = field(default_factory=list)  # teacher state dirs (paper bots)
-    recall_k: int = 12
+    recall_k: int = 100
+    use_backtest: bool = True  # recall also draws on the simulated history (retrain writes it)
+    learn_from_traders: bool = True  # other traders' trades join recall and the mistake book
     min_paper_trades: int = 20  # graduation: teacher trades a pair needs (testnet/live only)
     min_paper_avg_r: float = 0.0
     graduation: bool = True
@@ -164,6 +167,40 @@ def distance(a: Mapping[str, float], b: Mapping[str, float], scales: Mapping[str
     return math.sqrt(d)
 
 
+def _label(m: Memory) -> str:
+    return "own" if m.source == "self" else m.mode
+
+
+BACKTEST_FILE = "brain_backtest.json"
+BACKTEST_KEEP = 6000
+
+
+def write_backtest_memory(state_dir: Path, candidates: Sequence[Any]) -> int:
+    """Store the simulated outcome of every rule-passing signal in history (retrain job)."""
+    rows = [
+        {"pair": c.pair, "signal_ts": c.signal_ts, "entry_ts": c.entry_ts, "exit_ts": c.exit_ts,
+         "exit_reason": c.exit_reason, "r": c.r_multiple, "features": dict(c.features)}
+        for c in list(candidates)[-BACKTEST_KEEP:]
+    ]  # fmt: skip
+    _atomic(Path(state_dir) / BACKTEST_FILE, json.dumps(rows))
+    return len(rows)
+
+
+def load_backtest_memory(state_dir: Path) -> list[Memory]:
+    p = Path(state_dir) / BACKTEST_FILE
+    if not p.exists():
+        return []
+    out = []
+    for i, r in enumerate(json.loads(p.read_text(encoding="utf-8"))):
+        t = Trade(
+            -(i + 1), r["pair"], "backtest", r["signal_ts"], r["entry_ts"], 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, "", r["exit_ts"], None, r["exit_reason"], 0.0, None, float(r["r"]),
+            dict(r["features"]),
+        )  # fmt: skip
+        out.append(Memory("backtest", "backtest", t))
+    return out
+
+
 def recall(
     pair: str, feats: Mapping[str, float], memory: Sequence[Memory], k: int = 12
 ) -> dict[str, Any]:
@@ -171,17 +208,20 @@ def recall(
     if not memory or not feats:
         return {"n": 0, "text": f"{NAME} has no memory of similar trades yet", "similar": []}
     scales = _scales([m.trade.features for m in memory])
-    scored = sorted(
+    scored = heapq.nsmallest(
+        k,
         (
-            distance(feats, m.trade.features, scales) + (0.0 if m.trade.pair == pair else 0.5),
-            i,
-            m,
-        )
-        for i, m in enumerate(memory)
-    )[:k]
+            (
+                distance(feats, m.trade.features, scales) + (0.0 if m.trade.pair == pair else 0.5),
+                i,
+                m,
+            )
+            for i, m in enumerate(memory)
+        ),
+    )
     rs = [m.trade.r_multiple or 0.0 for _, _, m in scored]
     wins = sum(r > 0 for r in rs)
-    by_source = Counter("own" if m.source == "self" else m.mode for _, _, m in scored)
+    by_source = Counter(_label(m) for _, _, m in scored)
     avg = statistics.fmean(rs)
     src = ", ".join(f"{n} {s}" for s, n in sorted(by_source.items()))
     return {
@@ -266,6 +306,10 @@ class Chantisimo:
         self.mode = mode
         self.memory: list[Memory] = []
         self.teachers: list[Memory] = []
+        self.backtest: list[Memory] = []
+        self.traders: list[Memory] = []  # other traders' round trips (traders.py)
+        self._traders_sig: tuple[Any, ...] = ()
+        self._backtest_mtime: float | None = None
         self.pending: dict[str, dict[str, Any]] = {}  # pair -> recall at the last signal
 
     @property
@@ -273,10 +317,35 @@ class Chantisimo:
         return self.dir / "chantisimo_thoughts.jsonl"
 
     # -------------------------------------------------------------- memory
-    def remember(self, own_trades: Sequence[Trade]) -> list[Memory]:
+    def remember(
+        self, own_trades: Sequence[Trade], candles: Mapping[str, Any] | None = None, cfg: Any = None
+    ) -> list[Memory]:
         self.teachers = load_teachers(self.s.learn_from, self.dir)
+        if self.s.learn_from_traders and candles and cfg is not None:
+            self._load_traders(candles, cfg)
         self.memory = pooled([t for t in own_trades if t.is_closed], self.teachers, self.mode)
+        p = self.dir / BACKTEST_FILE
+        mtime = p.stat().st_mtime if p.exists() else None
+        if self.s.use_backtest and mtime != self._backtest_mtime:
+            self.backtest = load_backtest_memory(self.dir)
+            self._backtest_mtime = mtime
         return self.memory
+
+    def _load_traders(self, candles: Mapping[str, Any], cfg: Any) -> None:
+        from .traders import trader_memory, traders_dir
+
+        d = traders_dir() / "traders"
+        sig = tuple(
+            (f.name, f.stat().st_mtime_ns) for f in sorted(d.glob("*.trips.json"))
+        ) if d.exists() else ()  # fmt: skip
+        sig += tuple((p, len(c), c[-1].ts if c else 0) for p, c in sorted(candles.items()))
+        if sig != self._traders_sig:
+            self.traders = trader_memory(candles, cfg)
+            self._traders_sig = sig
+
+    def recall_pool(self) -> list[Memory]:
+        """Real trades first (own, paper bots, other traders); then the simulated history."""
+        return self.memory + self.traders + (self.backtest if self.s.use_backtest else [])
 
     def teacher_trades(self, own_trades: Sequence[Trade]) -> list[Trade]:
         """Teachers' closed trades on signals this bot did not trade itself."""
@@ -388,10 +457,10 @@ class Chantisimo:
             tmp.replace(p)
 
     def write(self, pairs: Sequence[str], rules: Sequence[Any] = ()) -> dict[str, Any]:
-        mem = self.memory
+        mem = self.memory + self.traders  # real trades: own, paper bots, other traders
         by_source = Counter("own" if m.source == "self" else f"{m.mode}:{m.source}" for m in mem)
         rs = [m.trade.r_multiple or 0.0 for m in mem]
-        book = mistake_book(mem, self.s.mistake_z)
+        book = mistake_book(mem, self.s.mistake_z)  # includes other people's mistakes
         active = [r for r in rules if getattr(r, "status", "") == "active"]
         for row in book:
             row["status"] = "watching"
@@ -408,6 +477,8 @@ class Chantisimo:
                 "wins": sum(r > 0 for r in rs),
                 "avg_r": round(statistics.fmean(rs), 4) if rs else None,
                 "teachers": sorted({m.source for m in self.teachers}),
+                "traders": sorted({m.source.split(":", 1)[1] for m in self.traders}),
+                "backtest": len(self.backtest) if self.s.use_backtest else 0,
             },
             "graduation": self.graduation_table(pairs),
             "mistakes": book,
@@ -415,6 +486,7 @@ class Chantisimo:
                 {"id": r.id, "text": r.text, "n": r.n, "avg_r": r.avg_r} for r in active
             ],
         }
+        self.dir.mkdir(parents=True, exist_ok=True)
         _atomic(self.dir / "chantisimo.json", json.dumps(state, indent=1, default=str))
         _atomic(self.dir / "chantisimo.md", render_md(state))
         self.trim()
@@ -442,15 +514,23 @@ class BrainFilter:
     ) -> tuple[bool, float | None, str]:
         feats = row.ml_features() or {}
         now = row.close_ts  # only trades that had closed by the decision time
-        mem = recall(pair, feats, known_by(self.brain.memory, now), self.brain.s.recall_k)
+        mem = recall(pair, feats, known_by(self.brain.recall_pool(), now), self.brain.s.recall_k)
         self.brain.pending[pair] = mem
         ok, why = self.brain.graduation(pair, now)
+        guard_rule = RULE_ID
+        if ok:  # the verification agents' guard: never trade on data they found wrong
+            from .verify import RULE_ID as DATA_RULE
+            from .verify import blocked_pairs
+
+            bad = blocked_pairs(self.brain.dir, now_ms=now).get(pair)
+            if bad:
+                ok, why, guard_rule = False, f"data check failed: {bad}", DATA_RULE
         prob: float | None = None
         if ok and self.inner is not None:
             ok, prob, why = self.inner(pair, row, check)
             self.rule_id = getattr(self.inner, "rule_id", RULE_ID)
         else:
-            self.rule_id = RULE_ID
+            self.rule_id = guard_rule
         self.brain.think(
             {
                 "kind": "thought",
@@ -538,7 +618,7 @@ class RecallLayer(Layer):
     )
 
     def __init__(self, **params: Any) -> None:
-        super().__init__(**{"k": 15, "max_avg_r": -0.2, "min_examples": 60, **params})
+        super().__init__(**{"k": 100, "max_avg_r": -0.2, "min_examples": 150, **params})
         self.rows: list[tuple[str, dict[str, float], float]] = []
         self.scales: dict[str, float] = {}
 

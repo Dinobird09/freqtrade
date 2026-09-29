@@ -182,7 +182,10 @@ def test_finbert_unavailable_path(monkeypatch):
     with pytest.raises(RuntimeError):
         sm.make_scorer("finbert")
     with pytest.raises(ValueError):
-        sm.make_scorer("vader")
+        sm.make_scorer("nonsense")
+    if not sm.VaderScorer().available()[0]:
+        with pytest.raises(RuntimeError, match="vaderSentiment"):
+            sm.make_scorer("vader")  # supported, but not installed here
 
 
 def test_finbert_score_is_p_positive_minus_p_negative_with_injected_pipeline():

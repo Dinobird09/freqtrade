@@ -434,6 +434,16 @@ class LearningBook:
         _atomic(
             self.dir / "learnings.md", render_learnings(self.rules, closed, self.lessons, self.s)
         )
+        stopped = [t for t in closed if t.exit_reason == EXIT_SL]  # one plain line per stop-out
+        _atomic(
+            self.dir / "learnings.txt",
+            "".join(
+                f"{ms_to_iso(t.exit_ts)} {t.pair} #{t.trade_id}: "
+                f"{self.lessons.get(str(t.trade_id), '')}\n"
+                for t in stopped
+            )
+            + "".join(f"RULE {r.id} ({r.status}): {r.text}\n" for r in self.rules),
+        )
 
 
 def ledger_row(t: Trade, ctx: Mapping[str, Any], lessons: Mapping[str, str]) -> dict[str, Any]:

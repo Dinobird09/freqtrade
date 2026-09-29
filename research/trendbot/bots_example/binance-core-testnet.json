@@ -9,7 +9,7 @@
   "state_dir": "trendbot_state/binance-core-testnet",
   "events": "trendbot_state/binance-core-testnet/events.csv",
   "starting_equity": null,
-  "poll_seconds": 10,
+  "poll_seconds": 1,
   "close_delay_seconds": 5,
   "history_candles": 1500,
   "entry_buffer_pct": 0.3,
@@ -61,9 +61,41 @@
     "learn_from": [
       "trendbot_state/binance-core-paper"
     ],
-    "recall_k": 12,
+    "recall_k": 100,
     "graduation": true,
     "min_paper_trades": 20,
     "min_paper_avg_r": 0.0
+  },
+  "live": {
+    "enabled": true,
+    "price_seconds": 1,
+    "candle_seconds": 5
+  },
+  "capital": {
+    "enabled": true,
+    "daily_reduce_pct": 2,
+    "daily_flatten_pct": 3,
+    "freeze_hours": 24,
+    "peak_kill_pct": 10,
+    "max_consecutive_losses": 3,
+    "max_fee_rate": 0.001
+  },
+  "execution": {
+    "maker_first": true,
+    "maker_wait_seconds": 15
+  },
+  "copy": {
+    "enabled": true
+  },
+  "allocation": {
+    "enabled": true,
+    "persistence": 3,
+    "caps": {
+      "euphoria": 95,
+      "bull": 95,
+      "neutral": 50,
+      "bear": 25,
+      "crash": 0
+    }
   }
 }

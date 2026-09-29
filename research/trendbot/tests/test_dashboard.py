@@ -251,3 +251,34 @@ def test_controls_need_the_token_and_write_request_files(state_dir):
 def test_export_never_contains_a_control_token(state_dir):
     html = render_html(build_snapshot(state_dir, StrategyConfig(), now_ms=T0), 15)
     assert "const CONTROL_TOKEN = null" in html
+
+
+def test_live_snapshot_caches_files_and_overlays_live_prices(state_dir):
+    import time as _time
+
+    from research.trendbot import dashboard as dash
+
+    cfg = StrategyConfig()
+    now = int(_time.time() * 1000)
+    a = dash.live_snapshot(state_dir, cfg, now_ms=now)
+    assert a["live"]["fresh"] is False and a["open_positions"][0].get("live") is None
+    (state_dir / "live.json").write_text(
+        json.dumps(
+            {
+                "wall_ts": now,
+                "prices": {"ETH/USDT": {"bid": 52.0, "ask": 52.1, "last": 52.05}},
+                "forming": {"ETH/USDT": {"ts": T0 + 260 * 4 * HOUR_MS, "close": 52.05}},
+            }
+        )
+    )
+    b = dash.live_snapshot(state_dir, cfg, now_ms=now + 500)
+    pos = b["open_positions"][0]
+    assert b["live"]["fresh"] and pos["live"] and pos["last"] == 52.0
+    fee = cfg.fee_rate * 50 * (50 + 52)
+    assert pos["unrealized"] == pytest.approx(50 * 2 - fee, abs=0.01)
+    assert b["pairs"] is a["pairs"]  # the heavy part came from the cache
+    stale = dash.live_snapshot(state_dir, cfg, now_ms=now + 60_000)
+    assert stale["live"]["fresh"] is False  # an old live.json is never shown as live
+    write_journal([], state_dir / "journal.csv")  # a file changed: rebuilt
+    c = dash.live_snapshot(state_dir, cfg, now_ms=now + 700)
+    assert c["pairs"] is not a["pairs"] and c["open_positions"] == []

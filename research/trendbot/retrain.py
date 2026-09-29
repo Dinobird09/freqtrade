@@ -44,7 +44,14 @@ from .news import load_events
 log = logging.getLogger("trendbot.retrain")
 
 SOURCE_MODULES = ("sentiment", "orderflow")
-DEFAULT_SCHEDULE = {"retrain_weekday": 6, "retrain_hour_utc": 1, "collect_every_minutes": 60}
+DEFAULT_SCHEDULE = {
+    "retrain_weekday": 6,
+    "retrain_hour_utc": 1,
+    "collect_every_minutes": 60,
+    "traders_every_minutes": 5,  # smart money: re-read followed traders, list copy signals
+    "verify_every_minutes": 15,  # verification agents (verify.py)
+    "lab_hour_utc": 2,  # the strategy lab's nightly research (lab.py); -1 = off
+}
 
 
 def _now_ms() -> int:
@@ -96,6 +103,9 @@ def run_collect(settings: Any, *, fetch: Any = None, exchange: Any = None) -> di
     ]
     if settings.dex.get("enabled"):
         jobs.append(("dex_scan", dict(settings.dex)))
+    scan_cfg = dict(getattr(settings, "scanner", None) or {})
+    if scan_cfg.get("enabled", True):
+        jobs.append(("scanner", scan_cfg))
     from .connections import load_connections
 
     if any(e.get("sources") for e in load_connections()["mcp"].values()):
@@ -104,7 +114,7 @@ def run_collect(settings: Any, *, fetch: Any = None, exchange: Any = None) -> di
         try:
             mod = importlib.import_module(f"{__package__}.{name}")
             kwargs: dict[str, Any] = {"fetch": fetch} if fetch is not None else {}
-            if name == "orderflow":
+            if name in ("orderflow", "scanner"):
                 kwargs["exchange"] = exchange or _public_exchange(settings.exchange)
             report["sources"][name] = {
                 "ok": True,
@@ -145,6 +155,24 @@ def run_retrain(settings: Any, cfg: Any, *, now_ms: int | None = None) -> dict[s
     vs = ValidationSettings(**lay.get("validation", {}))
     t0 = time.time()
     results = book.retrain(data, now_ms=now, events=events, trades=trades, sources=sources, vs=vs)
+    alloc = None
+    try:  # the regime allocator's 5-state HMM is refitted every week (allocation.py)
+        from .allocation import AllocationSettings, RegimeAllocator
+
+        ra = RegimeAllocator(AllocationSettings(**(getattr(settings, "allocation", None) or {})))
+        if ra.s.enabled and ra.fit(data, cfg.timeframe_ms, now):
+            ra.save(state_dir / "models")
+            alloc = "fitted"
+    except Exception as exc:
+        log.warning("regime allocator not fitted: %s", exc)
+        alloc = f"error: {exc}"
+    backtest_n = 0
+    if data:  # Chantisimo's recall draws on every simulated signal in history too
+        from .chantisimo import write_backtest_memory
+        from .layers import build_context
+
+        ctx = build_context(data, cfg, now, events, trades, sources, state_dir)
+        backtest_n = write_backtest_memory(state_dir, ctx.candidates)
     status = {
         "finished_utc": ms_to_iso(_now_ms()),
         "trained_until_utc": ms_to_iso(now),
@@ -152,6 +180,8 @@ def run_retrain(settings: Any, cfg: Any, *, now_ms: int | None = None) -> dict[s
         "candles": {p: len(c) for p, c in data.items()},
         "journal_trades": len(trades),
         "teacher_dirs": list(teachers),
+        "backtest_memory": backtest_n,
+        "regime_allocator": alloc,
         "layers": {
             n: {"status": r.get("status"), "reason": r.get("reason")} for n, r in results.items()
         },
@@ -167,6 +197,21 @@ def due(schedule: Mapping[str, Any], last: Mapping[str, Any], now_ms: int) -> li
     minutes = float(sch["collect_every_minutes"])
     if minutes > 0 and now_ms - int(last.get("collect", 0)) >= minutes * 60_000:
         jobs.append("collect")
+    lab_h = int(sch["lab_hour_utc"])
+    if lab_h >= 0:
+        today = now_ms // 86_400_000 * 86_400_000 + lab_h * 3_600_000
+        slot = today if today <= now_ms else today - 86_400_000
+        if int(last.get("lab", 0)) < slot <= now_ms:
+            jobs.append("lab")
+    vmin = float(sch["verify_every_minutes"])
+    if vmin > 0 and now_ms - int(last.get("verify", 0)) >= vmin * 60_000:
+        jobs.append("verify")
+    tmin = float(sch["traders_every_minutes"])
+    if tmin > 0 and now_ms - int(last.get("traders", 0)) >= tmin * 60_000:
+        from .traders import registry_path
+
+        if registry_path().exists():
+            jobs.append("traders")
     now = datetime.fromtimestamp(now_ms / 1000, UTC)
     week_start = now.replace(minute=0, second=0, microsecond=0)
     slot = (
@@ -189,7 +234,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="python3 -m research.trendbot.retrain",
         description="collect data sources and retrain signal layers",
     )
-    p.add_argument("job", choices=("collect", "retrain", "all"))
+    p.add_argument("job", choices=("collect", "retrain", "traders", "verify", "lab", "all"))
     p.add_argument("--settings", required=True)
     return p
 
@@ -220,6 +265,18 @@ def main(argv: list[str] | None = None) -> int:
             run_collect(settings)
         if args.job in ("retrain", "all"):
             run_retrain(settings, settings.strategy_config())
+        if args.job in ("lab", "all"):
+            from .lab import run as run_lab
+
+            run_lab(settings.state_dir)
+        if args.job in ("verify", "all"):
+            from .verify import run_for_settings
+
+            run_for_settings(settings)
+        if args.job in ("traders", "all"):
+            from .traders import refresh
+
+            refresh()
     finally:
         lock.unlink(missing_ok=True)
     return 0

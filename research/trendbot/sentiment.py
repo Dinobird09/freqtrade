@@ -289,6 +289,49 @@ def parse_feed(body: bytes, source: str, fetched_ts: int) -> list[NewsItem]:
     return items
 
 
+_HEAD_RE = re.compile(r"<h([1-4])[^>]*>(.*?)</h\1>", re.IGNORECASE | re.DOTALL)
+_HREF_RE = re.compile(r'<a[^>]+href="([^"]+)"', re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def parse_page(
+    body: bytes, source: str, fetched_ts: int, selector: str | None = None, base_url: str = ""
+) -> list[NewsItem]:
+    """Headlines scraped from an HTML page (a news site without an RSS feed).
+
+    With BeautifulSoup installed (``pip install beautifulsoup4``) ``selector`` is a CSS
+    selector (default: headings and their links); without it, h1-h4 headings are read with
+    a regular expression."""
+    text = body.decode("utf-8", "replace")
+    found: list[tuple[str, str]] = []
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(text, "html.parser")
+        for el in soup.select(selector or "h1, h2, h3, h4"):
+            a = el if el.name == "a" else el.find("a")
+            found.append((_clean(el.get_text(" ")), (a.get("href") if a else "") or ""))
+    except ImportError:
+        for m in _HEAD_RE.finditer(text):
+            inner = m.group(2)
+            href = _HREF_RE.search(inner)
+            found.append((_clean(_TAG_RE.sub(" ", inner)), href.group(1) if href else ""))
+    out, seen = [], set()
+    for title, href in found:
+        if len(title) < 12 or title in seen:
+            continue  # menus and labels, not headlines
+        seen.add(title)
+        url = (
+            href
+            if href.startswith("http")
+            else (base_url.rstrip("/") + "/" + href.lstrip("/"))
+            if href
+            else base_url
+        )
+        out.append(NewsItem(source, title[:120], url, title, None, fetched_ts))
+    return out
+
+
 def parse_reddit(body: bytes, subreddit: str, fetched_ts: int) -> list[NewsItem]:
     """Reddit listing JSON (``/top.json``) -> items (stickied posts skipped)."""
     doc = json.loads(body.decode("utf-8"))
@@ -469,19 +512,68 @@ class FinBertScorer:
         return self.score_many([text])[0]
 
 
-def make_scorer(kind: str = "auto") -> LexiconScorer | FinBertScorer:
-    """``"lexicon"``, ``"finbert"`` (RuntimeError if not installed) or ``"auto"``."""
+class VaderScorer:
+    """VADER (``pip install vaderSentiment``): the compound score, in [-1, 1]."""
+
+    name = "vader"
+
+    def __init__(self, analyzer: Any = None) -> None:
+        self._an = analyzer
+
+    def available(self) -> tuple[bool, str]:
+        if self._an is not None:
+            return True, "injected analyzer"
+        ok = importlib.util.find_spec("vaderSentiment") is not None
+        return ok, "vaderSentiment installed" if ok else "pip install vaderSentiment"
+
+    def _analyzer(self) -> Any:
+        if self._an is None:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+            self._an = SentimentIntensityAnalyzer()
+        return self._an
+
+    def score(self, text: str) -> float:
+        return float(self._analyzer().polarity_scores(text)["compound"])
+
+    def score_many(self, texts: Sequence[str]) -> list[float]:
+        return [self.score(t) for t in texts]
+
+
+class TextBlobScorer:
+    """TextBlob (``pip install textblob``): the polarity, in [-1, 1]."""
+
+    name = "textblob"
+
+    def available(self) -> tuple[bool, str]:
+        ok = importlib.util.find_spec("textblob") is not None
+        return ok, "textblob installed" if ok else "pip install textblob"
+
+    def score(self, text: str) -> float:
+        from textblob import TextBlob
+
+        return float(TextBlob(text).sentiment.polarity)
+
+    def score_many(self, texts: Sequence[str]) -> list[float]:
+        return [self.score(t) for t in texts]
+
+
+def make_scorer(kind: str = "auto") -> Any:
+    """``lexicon``, ``finbert``, ``vader``, ``textblob`` (RuntimeError if not installed) or
+    ``auto``: FinBERT if installed, else VADER, else the built-in lexicon."""
     k = (kind or "auto").strip().lower()
     if k == "lexicon":
         return LexiconScorer()
-    if k not in ("finbert", "auto"):
-        raise ValueError(f"unknown scorer {kind!r}; use auto, finbert or lexicon")
-    fb = FinBertScorer()
-    ok, why = fb.available()
-    if ok:
-        return fb
-    if k == "finbert":
-        raise RuntimeError(f"FinBERT scorer requested but {why}")
+    named = {"finbert": FinBertScorer, "vader": VaderScorer, "textblob": TextBlobScorer}
+    if k != "auto" and k not in named:
+        raise ValueError(f"unknown scorer {kind!r}; use auto, finbert, vader, textblob or lexicon")
+    for name in [k] if k != "auto" else ["finbert", "vader"]:
+        sc = named[name]()
+        ok, why = sc.available()
+        if ok:
+            return sc
+        if k != "auto":
+            raise RuntimeError(f"{name} scorer requested but {why}")
     return LexiconScorer()
 
 
@@ -810,6 +902,17 @@ def _jobs(
             jobs.append(
                 (f"reddit:{sub}", lambda s=sub, u=url: parse_reddit(_get(fetch, u), s, now), None)
             )
+    for page in settings.get("pages") or []:  # news sites scraped as HTML
+        name = str(page.get("name") or re.sub(r"\W+", "_", page["url"].split("//")[-1])[:30])
+        jobs.append(
+            (
+                f"page:{name}",
+                lambda n=name, pg=page: parse_page(
+                    _get(fetch, pg["url"]), f"page:{n}", now, pg.get("selector"), pg["url"]
+                ),
+                None,
+            )
+        )
     token = settings.get("cryptopanic_token") or os.environ.get(CRYPTOPANIC_ENV)
     if "cryptopanic" in enabled and token:
         url = str(settings.get("cryptopanic_url", CRYPTOPANIC_URL)).format(token=token)

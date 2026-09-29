@@ -46,6 +46,8 @@ from typing import Any
 
 from .adoption_evidence import read_decisions_log, write_decisions_log
 from .adoption_record import config_from_overrides
+from .allocation import AllocationSettings, RegimeAllocator, exposure_room
+from .capital import CapitalGuard, CapitalSettings, fee_warning, read_lock, write_lock
 from .chantisimo import BrainSettings, Chantisimo
 from .config import StrategyConfig
 from .data import load_candles_csv, save_candles_csv, timeframe_to_ms
@@ -74,7 +76,7 @@ class BotSettings:
     state_dir: str = "trendbot_state"
     events: str | None = None  # news calendar CSV (reloaded every candle close)
     starting_equity: float | None = None  # paper: default 10000; testnet/live: quote balance
-    poll_seconds: float = 10.0  # stop / target check interval
+    poll_seconds: float = 1.0  # loop interval: stop / target checks and live prices
     close_delay_seconds: float = 5.0  # wait after a 4H close before fetching the candle
     history_candles: int = 1500  # deep history fetched once (EMA200 converges; then cached)
     entry_buffer_pct: float = 0.3  # pre-size for a fill this much worse than the ask
@@ -88,7 +90,17 @@ class BotSettings:
     sentiment: dict[str, Any] = field(default_factory=dict)  # sentiment.collect settings
     orderflow: dict[str, Any] = field(default_factory=dict)  # orderflow.collect settings
     dex: dict[str, Any] = field(default_factory=dict)  # {"enabled": false, ...} dex_scan settings
+    engine: str = "trendbot"  # "trendbot" (the nine rules) or "lab" (a strategy-lab strategy)
+    lab: dict[str, Any] = field(default_factory=dict)  # {"strategy": "nnfx", "params": {...}}
     brain: dict[str, Any] = field(default_factory=dict)  # chantisimo.BrainSettings fields
+    # live feed for the dashboard: {"enabled": true, "price_seconds": 1, "candle_seconds": 5}
+    live: dict[str, Any] = field(default_factory=dict)
+    copy: dict[str, Any] = field(default_factory=dict)  # {"enabled": true}: follow traders.json
+    capital: dict[str, Any] = field(default_factory=dict)  # capital.CapitalSettings fields
+    # {"maker_first": true, "maker_wait_seconds": 15}: post-only limit entries (testnet/live)
+    execution: dict[str, Any] = field(default_factory=dict)
+    allocation: dict[str, Any] = field(default_factory=dict)  # allocation.AllocationSettings
+    scanner: dict[str, Any] = field(default_factory=dict)  # scanner.ScannerSettings (watchlist)
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -153,6 +165,18 @@ class TrendBot:
         )
         self.brain = Chantisimo(self.dir, BrainSettings(**settings.brain), settings.mode)
         self._teacher_sig: tuple[Any, ...] = ()
+        self._prices: dict[str, dict[str, Any]] = {}
+        self._prices_wall = 0  # exchange ms of the last price fetch
+        self._forming: dict[str, Any] = {}
+        self._forming_wall = 0.0  # wall-clock seconds of the last forming-candle fetch
+        self._copy_mtime: float | None = None
+        self.capital_settings = CapitalSettings(**settings.capital)
+        self.capital: CapitalGuard | None = None
+        self._capital_block: str | None = None
+        self._capital_sig: tuple[Any, ...] = ()
+        self._live_ready = False
+        self.allocator = RegimeAllocator(AllocationSettings(**settings.allocation))
+        self._alloc_mtime: float | None = None
         self.settings_path: Path | None = None  # set by main(); needed to spawn jobs
         self._jobs: dict[str, Any] = {}
 
@@ -172,6 +196,12 @@ class TrendBot:
     # ------------------------------------------------------------------ start / persist
     def start(self) -> None:
         """Restore state (or initialise it) and rebuild the session from the journal."""
+        lock = read_lock(self.dir)
+        if lock is not None:
+            raise SystemExit(
+                f"trading is halted ({lock.get('reason')}, {lock.get('halted_utc')}). Review what "
+                f"happened, then delete {self.dir / 'trading_halted.lock'} by hand to restart."
+            )
         if self.state_path.exists():
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
             if (
@@ -203,6 +233,11 @@ class TrendBot:
             self._cache[pair] = load_candles_csv(path) if path.exists() else []
         self._reconcile()
         self.state.setdefault("trade_context", {})
+        self.capital = CapitalGuard(self.capital_settings, self.state.setdefault("capital", {}))
+        warn = fee_warning(self.cfg.fee_rate, self.capital_settings)
+        self.state["capital"]["fee_warning"] = warn
+        if warn:
+            log.warning("FEES: %s", warn)
         self._relearn()
         self._save()
         log.info(
@@ -301,6 +336,10 @@ class TrendBot:
             self._compose_filter()
         self.schedule_jobs()
         self.handle_requests()
+        self.update_live()
+        self.apply_capital()
+        self._write_live()
+        self.copy_trades()
         self.manage_exits()
         if not self.stop_requested:
             self.process_closed_candles()
@@ -354,7 +393,7 @@ class TrendBot:
         sess = self._sess()
         own = sess.journal_trades()
         self._teacher_sig = self._teacher_signature()
-        self.brain.remember(own)
+        self.brain.remember(own, candles=self._cache, cfg=self.cfg)
         extra = self.brain.teacher_trades(own)
         self.book.relearn(own, self._cache, extra=extra)
         self._compose_filter()
@@ -389,9 +428,191 @@ class TrendBot:
             log.info("scheduled job %s started (pid %d)", job, self._jobs[job].pid)
 
     # ------------------------------------------------------------------ exits
+    # ------------------------------------------------------------------ copy trading
+    def copy_trades(self) -> None:
+        """Arm a pair when a followed, qualified trader opened a position on it (traders.py)."""
+        if not self.s.copy.get("enabled", True):
+            return
+        from .traders import copy_signals_for, status_path
+
+        p = status_path()
+        mtime = p.stat().st_mtime if p.exists() else None
+        if mtime is None or mtime == self._copy_mtime:
+            return
+        self._copy_mtime = mtime
+        done = self.state.setdefault("copied", [])
+        held = set(self._sess().open_positions)
+        for sig in copy_signals_for(list(self.s.pairs), set(done)):
+            done.append(sig["id"])
+            if sig["pair"] in held:
+                continue
+            arm_pair(self.dir, sig["pair"], self.gw.now_ms() + 24 * 3_600_000)
+            log.info(
+                "COPY %s bought %s: armed for its next rule-passing signal",
+                sig["trader"],
+                sig["pair"],
+            )
+            self.brain.think(
+                {
+                    "kind": "copy",
+                    "pair": sig["pair"],
+                    "trader": sig["trader"],
+                    "signal_utc": ms_to_iso(sig["entry_ts"]),
+                    "reason": f"followed trader {sig['trader']} bought {sig['pair']}: armed",
+                }
+            )
+        del done[:-500]
+        self._save()
+
+    # ------------------------------------------------------------------ live feed
+    def _live_cfg(self) -> dict[str, Any]:
+        return {"enabled": True, "price_seconds": 1.0, "candle_seconds": 5.0, **self.s.live}
+
+    def update_live(self) -> None:
+        """Live prices (one request) and the forming 4H candle, written to live.json."""
+        cfg = self._live_cfg()
+        tickers = getattr(self.gw, "tickers", None)
+        if not cfg["enabled"] or tickers is None:
+            return
+        now = self.gw.now_ms()  # the exchange clock (also right in replays)
+        if now - self._prices_wall >= 900 * float(cfg["price_seconds"]):
+            try:
+                got = tickers(list(self.s.pairs))
+            except Exception as exc:  # the feed is for display; trading falls back to bid()
+                log.warning("live prices unavailable: %s", exc)
+                return
+            self._prices = {
+                p: {
+                    "bid": _num_or_none(t.get("bid") or t.get("last")),
+                    "ask": _num_or_none(t.get("ask") or t.get("last")),
+                    "last": _num_or_none(t.get("last") or t.get("close")),
+                    "ts": now,
+                }
+                for p, t in got.items()
+            }
+            self._prices_wall = now
+        forming = getattr(self.gw, "forming_candle", None)
+        wall = time.time()  # the forming candle is paced by real time (cheap in replays)
+        if forming is not None and wall - self._forming_wall >= float(cfg["candle_seconds"]):
+            self._forming_wall = wall
+            for p in self.s.pairs:
+                try:
+                    c = forming(p)
+                except Exception as exc:
+                    log.debug("forming candle %s unavailable: %s", p, exc)
+                    continue
+                if c is not None:
+                    self._forming[p] = {
+                        "ts": c.ts,
+                        "open": c.open,
+                        "high": c.high,
+                        "low": c.low,
+                        "close": c.close,
+                        "volume": c.volume,
+                    }
+        for p, f in self._forming.items():  # keep the forming candle in step with the price
+            last = (self._prices.get(p) or {}).get("last")
+            if last and f["ts"] == now // self.tf_ms * self.tf_ms:
+                f.update(close=last, high=max(f["high"], last), low=min(f["low"], last))
+        self._live_ready = True
+
+    def _write_live(self) -> None:
+        if not self._live_ready:
+            return
+        cap = self.state.get("capital") or {}
+        beat = {
+            "wall_ts": int(time.time() * 1000),
+            "ts": self.gw.now_ms(),
+            "prices": self._prices,
+            "forming": self._forming,
+            "capital": {k: cap.get(k) for k in ("equity_mtm", "daily_dd_pct", "peak_dd_pct")},
+        }
+        tmp = self.dir / "live.json.tmp"
+        tmp.write_text(json.dumps(beat), encoding="utf-8")
+        tmp.replace(self.dir / "live.json")
+
+    # ------------------------------------------------------------------ regime allocation
+    def update_regime(self) -> None:
+        """Forward-filtered 5-state HMM regime with persistence (allocation.py)."""
+        a = self.allocator
+        if not a.s.enabled:
+            return
+        models = self.dir / "models"
+        p = models / "regime_alloc.json"
+        mtime = p.stat().st_mtime if p.exists() else None
+        if mtime != self._alloc_mtime:
+            self._alloc_mtime = mtime
+            a.load(models)
+        if a.layer is None and len(self._cache.get(a.s.ref_pair) or []) >= a.s.min_candles:
+            if a.fit(self._cache, self.tf_ms, self.gw.now_ms()):  # first run: fit now
+                a.save(models)
+                self._alloc_mtime = p.stat().st_mtime
+        try:
+            r = a.regime(self._cache, self.tf_ms)
+        except Exception as exc:  # the allocation overlay must never stop trading
+            log.warning("regime unavailable: %s", exc)
+            r = None
+        if r is not None:
+            prev = (self.state.get("regime") or {}).get("confirmed")
+            if prev and prev != r["confirmed"]:
+                log.info("REGIME %s -> %s: exposure cap %g%%", prev, r["confirmed"], r["cap_pct"])
+            self.state["regime"] = r
+
+    # ------------------------------------------------------------------ capital protection
+    def mark_to_market(self) -> float:
+        sess = self._sess()
+        eq = sess.equity
+        for p, t in sess.open_positions.items():
+            bid = (self._prices.get(p) or {}).get("bid")
+            if not bid:
+                continue  # no live price this step: counted at cost
+            eq += t.qty * (bid - t.entry_price) - self.cfg.fee_rate * t.qty * (bid + t.entry_price)
+        return eq
+
+    def apply_capital(self) -> None:
+        """Daily / peak drawdown limits and the losing-streak stop (capital.py)."""
+        if self.capital is None:
+            return
+        sess = self._sess()
+        now = self.gw.now_ms()
+        eq = self.mark_to_market()
+        v = self.capital.evaluate(now, eq, list(sess.closed))
+        sess.gatekeeper.risk_scale = v.risk_scale
+        self._capital_block = v.block
+        if v.kill:
+            log.critical("KILL SWITCH: %s; selling everything and stopping", v.kill)
+            self.flatten()
+            write_control(self.dir, entries_paused=True)
+            peak = float(self.state["capital"].get("peak_equity") or eq)
+            path = write_lock(self.dir, v.kill, now, self.mark_to_market(), peak)
+            log.critical("wrote %s: delete it by hand to allow a restart", path)
+            self.stop_requested = True
+        elif v.flatten:
+            log.warning("CAPITAL: %s; selling every open position, entries frozen", v.flatten)
+            self.flatten()
+        st = self.state["capital"]
+        sig = (
+            st.get("day"),
+            st.get("frozen_until"),
+            st.get("day_reduced"),
+            st.get("day_stopped"),
+            round(float(st.get("peak_equity") or 0), 0),
+        )
+        if sig != self._capital_sig:  # persist the limits' state when it changes
+            self._capital_sig = sig
+            self._save()
+
+    def _bid(self, pair: str) -> float:
+        """The live bid fetched this second, else a fresh ticker request."""
+        q = self._prices.get(pair) or {}
+        age = self.gw.now_ms() - int(q.get("ts") or 0)
+        if q.get("bid") and 0 <= age <= 2000 * float(self._live_cfg()["price_seconds"]):
+            return float(q["bid"])
+        return self.gw.bid(pair)
+
     def manage_exits(self) -> None:
         for pair, t in sorted(self._sess().open_positions.items()):
-            bid = self.gw.bid(pair)
+            bid = self._bid(pair)
             if bid <= t.stop:
                 self.exit_position(t, EXIT_SL, bid)
             elif bid >= t.target:
@@ -460,6 +681,7 @@ class TrendBot:
         for pair in todo:
             self.refresh_candles(pair)
         self._compose_filter()  # layers see the freshly topped-up history
+        self.update_regime()
         for pair in todo:
             candles = self._cache.get(pair, [])
             if not candles or candles[-1].ts != signal_ts:
@@ -469,7 +691,10 @@ class TrendBot:
             last[pair] = signal_ts
             log.info("SIGNAL %s %s: %s", pair, dec.rule, dec.reason)
             armed = armed_pairs(self.dir, self.gw.now_ms())
-            if dec.allowed and self.entries_paused and pair not in armed:
+            if dec.allowed and self._capital_block:
+                reason = f"{pair}: {self._capital_block}"
+                sess.on_fill_skipped(pair, dec, reason, rule="X_capital_guard")
+            elif dec.allowed and self.entries_paused and pair not in armed:
                 sess.on_fill_skipped(
                     pair, dec, f"{pair}: new entries paused by the operator", rule="X_operator"
                 )
@@ -516,6 +741,19 @@ class TrendBot:
         slip = self.cfg.slippage_pct / 100.0
         pessimistic = ask * (1 + slip) * (1 + self.s.entry_buffer_pct / 100.0)
         cash = min(sess.free_cash(), self.gw.free(self.s.quote))
+        regime = self.state.get("regime") if self.allocator.s.enabled else None
+        if regime:  # the regime's exposure cap can only shrink or skip the entry
+            used = sum(t.qty * t.entry_price for t in sess.open_positions.values())
+            room = exposure_room(float(regime["cap_pct"]), sess.equity, used)
+            if room < max(self.gw.min_order(pair)[1], 5.0):
+                reason = (
+                    f"{pair}: {regime['confirmed']} regime caps exposure at "
+                    f"{regime['cap_pct']:g}% of equity and {used:,.2f} is already in use"
+                )
+                sess.on_fill_skipped(pair, dec, reason, rule="X_capital_guard")
+                log.info("SKIP %s", reason)
+                return None
+            cash = min(cash, room)
         plan = sess.gatekeeper.plan_fill(pair, dec, ask, pessimistic, sess.equity, cash)
         if not plan.ok or plan.sizing is None:
             sess.on_fill_skipped(pair, dec, plan.reason, rule=plan.rule)
@@ -529,7 +767,12 @@ class TrendBot:
             log.info("SKIP %s", reason)
             return None
         try:
-            fill = self.gw.buy(pair, qty)
+            ex = {"maker_first": True, "maker_wait_seconds": 15, **self.s.execution}
+            maker = getattr(self.gw, "buy_maker_first", None)
+            if ex["maker_first"] and self.s.mode != "paper" and maker is not None:
+                fill = maker(pair, qty, wait_s=float(ex["maker_wait_seconds"]))
+            else:
+                fill = self.gw.buy(pair, qty)
         except OrderError as exc:
             sess.on_fill_skipped(pair, dec, f"{pair}: buy failed: {exc}")
             raise
@@ -642,6 +885,13 @@ def write_control(state_dir: Path, **flags: Any) -> dict[str, Any]:
     tmp.write_text(json.dumps(current, indent=1), encoding="utf-8")
     tmp.replace(Path(state_dir) / "control.json")
     return current
+
+
+def _num_or_none(x: Any) -> float | None:
+    try:
+        return float(x) if x is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def arm_pair(state_dir: Path, pair: str, until_ms: int) -> dict[str, Any]:
@@ -780,6 +1030,20 @@ def main(argv: list[str] | None = None, gateway: Any = None) -> int:
     _setup_logging(settings.state_dir, args.verbose)
     cfg = settings.strategy_config()
     gw = gateway if gateway is not None else build_gateway(settings, cfg)
+    if settings.engine == "lab":
+        from .lab_bot import LabBot
+
+        lab = LabBot(settings, gw)
+        lab.settings_path = Path(args.settings).resolve()
+        lab.start()
+        if args.command == "flatten":
+            lab._exit_all(gw.bid(lab.pair), EXIT_END, "flatten")
+            return 0
+        if args.command == "run":
+            signal.signal(signal.SIGINT, lambda *_: setattr(lab, "stop_requested", True))
+            signal.signal(signal.SIGTERM, lambda *_: setattr(lab, "stop_requested", True))
+            lab.run(max_steps=args.steps)
+        return 0
     bot = TrendBot(settings, gw, cfg=cfg)
     bot.settings_path = Path(args.settings).resolve()
     bot.start()
