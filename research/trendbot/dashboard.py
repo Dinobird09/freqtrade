@@ -22,7 +22,6 @@ import math
 import os
 import secrets
 import subprocess
-import sys
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -289,8 +288,12 @@ def _lab_view(d: Path) -> dict[str, Any]:
 
     board = _read_json(d / "lab" / "leaderboard.json")
     rows = [
-        {k: r.get(k) for k in ("strategy", "pair", "timeframe", "status", "why", "windows")}
+        {
+            k: r.get(k)
+            for k in ("strategy", "pair", "timeframe", "status", "why", "windows", "explain")
+        }
         | {"oos": r.get("oos") or {}, "stress": (r.get("stress") or {}).get("worst_max_dd_pct")}
+        | {"stories": {k: (r.get("analysis") or {}).get(k, []) for k in ("best", "worst")}}
         for r in board.get("leaderboard", [])
     ]
     try:
@@ -302,6 +305,7 @@ def _lab_view(d: Path) -> dict[str, Any]:
         "seconds": board.get("seconds"),
         "rows": rows,
         "proposals": board.get("proposals", []),
+        "why_best": board.get("why_best", []),
         "approved": approved,
     }
 
@@ -536,9 +540,19 @@ def _ledger_view(d: Path, tail: int) -> list[dict[str, Any]]:
     return list(reversed(rows[-tail:]))
 
 
+def _html_template() -> str:
+    """The page, read as package data so it also works inside the single-file build."""
+    try:
+        from importlib.resources import files
+
+        return files(__package__).joinpath("dashboard.html").read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, TypeError):
+        return HTML_PATH.read_text(encoding="utf-8")
+
+
 def render_html(snapshot: dict[str, Any] | None, refresh_s: int, token: str | None = None) -> str:
     """The page; with a snapshot embedded it is self-contained (``--export``)."""
-    html = HTML_PATH.read_text(encoding="utf-8")
+    html = _html_template()
     embedded = "null" if snapshot is None else json.dumps(snapshot).replace("</", "<\\/")
     html = html.replace(SNAPSHOT_TOKEN, embedded).replace("__REFRESH_S__", str(int(refresh_s)))
     return html.replace('"__CONTROL_TOKEN__"', json.dumps(token))
@@ -706,17 +720,9 @@ class Controller:
                 f"({lock.get('reason', 'see the lock file')}). "
                 f"Review it, then delete {self.dir / 'trading_halted.lock'} by hand to restart"
             )
-        repo_root = Path(__file__).resolve().parents[2]
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH")]))
-        cmd = [
-            sys.executable,
-            "-m",
-            "research.trendbot.live_bot",
-            "run",
-            "--settings",
-            str(self.settings_path),
-        ]
+        from .launch import command
+
+        cmd, env = command("live_bot", "run", "--settings", str(self.settings_path))
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

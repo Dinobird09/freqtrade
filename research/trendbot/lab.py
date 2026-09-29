@@ -97,7 +97,11 @@ def rolling_walk_forward(
         curve += r.equity
         equity = r.equity[-1][1] if r.equity else equity
         t += oos_days * DAY_MS
-    return {"windows": windows, "oos": performance(oos_trades, curve, 10_000.0)}
+    return {
+        "windows": windows,
+        "oos": performance(oos_trades, curve, 10_000.0),
+        "trades": oos_trades,
+    }
 
 
 # ---------------------------------------------------------------------- look-ahead
@@ -271,6 +275,10 @@ def train(
                 row["why"] = why
                 board.append(row)
                 continue
+            from .postmortem import analyse, explain
+
+            row["analysis"] = analyse(wf["trades"], cs)  # why it won / why its losses lost
+            row["explain"] = explain(row["analysis"])
             row["stress"] = stress_test(cs, cls(**row["last_params"]), runs=stress_runs)
             current = (approved or {}).get(f"{name}:{pair}", {})
             beat = oos.get("sharpe", 0) > max(min_sharpe, float(current.get("sharpe") or 0))
@@ -294,7 +302,9 @@ def train(
                 )
             board.append(row)
     board.sort(key=lambda r: -((r.get("oos") or {}).get("sharpe") or -99))
-    return {"leaderboard": board, "proposals": proposals}
+    from .postmortem import why_best
+
+    return {"leaderboard": board, "proposals": proposals, "why_best": why_best(board)}
 
 
 def render_program(res: Mapping[str, Any], when: int) -> str:
@@ -315,6 +325,30 @@ def render_program(res: Mapping[str, Any], when: int) -> str:
             f"{o.get('return_pct', '-')}% | {o.get('max_dd_pct', '-')}% | "
             f"{o.get('trades', '-')} | {r['status']} |"
         )
+    lines += ["", "## Why the best one is the best", ""] + [
+        f"- {x}" for x in res.get("why_best", [])
+    ]
+    for r in res["leaderboard"]:
+        ex = r.get("explain")
+        if not ex:
+            continue
+        lines += ["", f"## {r['strategy']} on {r['pair']}", ""]
+        lines += ["**Why it worked**", ""] + [
+            f"- {x}" for x in ex["worked"] or ["Nothing: it did not make money here."]
+        ]
+        lines += ["", "**Why the losses happened**", ""] + [
+            f"- {x}" for x in ex["failed"] or ["No clear pattern in the losing trades."]
+        ]
+        if ex["help"]:
+            lines += ["", "**What would help**", ""] + [f"- {x}" for x in ex["help"]]
+        a = r.get("analysis") or {}
+        if a.get("best"):
+            lines += [
+                "",
+                "Best trades: " + "; ".join(a["best"]),
+                "",
+                "Worst trades: " + "; ".join(a["worst"]),
+            ]
     lines += ["", "## Proposals", ""]
     lines += [
         f"- **{p['id']}** {p['params']}: out-of-sample Sharpe {p['sharpe']}"
@@ -400,3 +434,29 @@ def incubation(
             "live wait until the incubation is complete"
         )
     return True, f"{key} incubated {age:.0f} days"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``lab --settings bot.json`` (or ``--state-dir DIR``): run tonight's research now."""
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="trendbot lab", description="run the strategy lab's research now"
+    )
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--settings")
+    src.add_argument("--state-dir")
+    args = p.parse_args(argv)
+    if args.settings:
+        from .live_bot import BotSettings
+
+        state_dir = BotSettings.load(args.settings).state_dir
+    else:
+        state_dir = args.state_dir
+    res = run(state_dir)
+    print(render_program(res, res["run_ms"]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

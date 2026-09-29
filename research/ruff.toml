@@ -12,3 +12,7 @@ extend = "../pyproject.toml"
   "S310",  # urllib against the local test server
   "S311",
 ]
+"trendbot/postmortem.py" = [
+  "S311",
+  "E501",  # the explanations are whole sentences; breaking them hurts readability
+]

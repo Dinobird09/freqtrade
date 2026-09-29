@@ -315,6 +315,7 @@ class LabBot:
         o = self.state.get("open")
         if not o:
             return
+        o["peak"] = max(float(o.get("peak") or o["entry"]), bid)  # for the trade's story
         if bid <= o["stop"]:
             self._exit_all(bid, EXIT_SL, "stop" if not o["trailing"] else "trailing stop")
             return
@@ -344,6 +345,21 @@ class LabBot:
         if o["trailing"] and o["trail_atr"]:
             o["best"] = max(o["best"], bid)
             o["stop"] = max(o["stop"], o["best"] - o["trail_atr"])
+
+    def _story(self, o: dict[str, Any], pnl: float, reason: str) -> str:
+        """The same one-line post-mortem the lab writes for backtest trades."""
+        r = pnl / o["risk"] if o.get("risk") else 0.0
+        bars = int((self.gw.now_ms() - o["entry_ts"]) // self.tf_ms)
+        mfe = (float(o.get("peak") or o["entry"]) - o["entry"]) / max(o["entry"] - o["stop"], 1e-12)
+        if r > 0:
+            return f"won {r:+.2f}R: " + (
+                "half at 2R, the rest trailed the trend" if o["trailing"] else "reached the target"
+            )
+        if bars <= 2:
+            return f"lost {r:+.2f}R: stopped within {bars} bars, the entry came into a reversal"
+        if mfe >= 1:
+            return f"lost {r:+.2f}R: was +{mfe:.1f}R in profit first, then fell back to the stop"
+        return f"lost {r:+.2f}R: never got going (best +{mfe:.1f}R), stopped after {bars} bars"
 
     def _exit_all(self, bid: float, reason: str, why: str) -> None:
         o = self.state.get("open")
@@ -387,7 +403,7 @@ class LabBot:
             pnl / o["risk"] if o["risk"] else None,
             {},
             None,
-            f"{o['reason']} | exit: {why}",
+            f"{o['reason']} | exit: {why} | {self._story(o, pnl, reason)}",
         )
         self.trades.append(t)
         self.state["open"] = None

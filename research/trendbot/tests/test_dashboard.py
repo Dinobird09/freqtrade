@@ -259,7 +259,7 @@ def test_live_snapshot_caches_files_and_overlays_live_prices(state_dir):
     from research.trendbot import dashboard as dash
 
     cfg = StrategyConfig()
-    now = int(_time.time() * 1000)
+    now = int(_time.time() * 1000) // 60_000 * 60_000 + 1_000  # every call below in one minute
     a = dash.live_snapshot(state_dir, cfg, now_ms=now)
     assert a["live"]["fresh"] is False and a["open_positions"][0].get("live") is None
     (state_dir / "live.json").write_text(

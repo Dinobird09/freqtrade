@@ -443,6 +443,21 @@ All three keep the 2:1 minimum reward-to-risk.
 4. **Stress-tests** each survivor with 20 random single-day crashes of -5% to -15%.
 5. **Reports:** writes `lab/leaderboard.json` and a plain-English `lab/program.md`.
 
+**Why it won, why it lost.** Every strategy gets a post-mortem of its out-of-sample trades
+(in the card, in `program.md`, and in the terminal: `why did nnfx lose?`,
+`which strategy is the best?`). It shows:
+
+- **why it worked:** its win rate against the break-even win rate its payoffs need, what
+  the trailing stop added, and whether it did best with the trend and in calm or volatile
+  markets;
+- **why the losses happened:** stop-outs within 2 bars (the entries came into reversals),
+  trades that were +1R in profit and then fell back to the stop, near-misses of the target,
+  losses against the trend, and fee drag;
+- **what would help:** a concrete change for each cause;
+- **why the best one is the best:** where the runners-up fall behind;
+- **one line per trade** for the best and worst trades. Lab bots write the same line into
+  each closed trade's notes.
+
 A variant becomes a **proposal** only if its out-of-sample Sharpe beats 1.5 and the version
 you already approved. Nothing changes by itself: press **Approve for paper**, then run it on
 a paper bot:
@@ -571,6 +586,31 @@ Some layers only start working once their data exists:
 (section 4a). The bot then calls its tools itself; it does not need Claude. Separately,
 `claude mcp add --transport http mcp-tradingview https://mcp.tradingview.com/mcp` connects
 it to **Claude Code**, if you also want Claude to read TradingView while you work.
+
+## 8a. One file instead of a folder
+
+The bot is 57 small modules (about 31,000 lines) because each one has a single job and its
+own tests. That keeps it maintainable, and Python loads them for you. You never run more
+than one command, and you don't need to merge them.
+
+If you want to carry **one file**, build it:
+
+```bash
+python research/trendbot/scripts/build_pyz.py      # writes dist/trendbot.pyz (about 0.5 MB)
+```
+
+`trendbot.pyz` holds every module and the dashboard. Copy it to any computer with Python
+3.11+, `pip install ccxt` once, and run:
+
+```bash
+python trendbot.pyz bot run --settings bot.json
+python trendbot.pyz dashboard --settings bot.json      # or --fleet fleet.json
+python trendbot.pyz jobs retrain --settings bot.json    # collect / retrain / traders / verify / lab
+python trendbot.pyz lab --settings bot.json             # the strategy research, now
+```
+
+The dashboard's Start button and the background jobs re-launch the same file. Rebuild it
+after updating the code.
 
 ## 9. Tests (optional)
 

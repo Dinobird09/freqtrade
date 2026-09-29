@@ -291,6 +291,25 @@ class Terminal:
             "options",
         ):
             return "help", {}
+        strat = next(
+            (
+                k
+                for w, k in (
+                    ("nnfx", "nnfx"),
+                    ("sneaky", "sneaky_pivot"),
+                    ("fib", "fib_fvg"),
+                    ("fvg", "fib_fvg"),
+                )
+                if re.search(rf"\b{w}", t)
+            ),
+            None,
+        )
+        if strat and has(
+            "why", "explain", "how", "worked", "work", "lost", "losses", "lose", "fail\\w*"
+        ):
+            return "lab", {"strategy": strat}
+        if has("best strategy", "winning strategy", "which strategy", "why .*(best|win)"):
+            return "lab", {"strategy": "_best"}
         m = re.match(r"^(?:use|switch to|talk to|select) (?:bot )?(.+)$", t)
         if m and self.find_bot(m.group(1)):
             return "use_bot", {"name": self.find_bot(m.group(1))}
@@ -871,6 +890,19 @@ class Terminal:
     def tool_lab(self, args: dict[str, Any], bot: str) -> Reply:
         L = self._snap(bot).get("lab") or {}
         rows = L.get("rows") or []
+        name = args.get("strategy")
+        if name and rows:  # "why nnfx": the post-mortem of one strategy
+            if name == "_best":
+                return Reply(" ".join(L.get("why_best") or ["No research yet."]))
+            r = next((x for x in rows if x["strategy"] == name and x.get("explain")), None)
+            if r is None:
+                return Reply(f"No research on {name} yet.")
+            ex = r["explain"]
+            parts = [f"{name} on {r['pair']} (out-of-sample Sharpe {r['oos'].get('sharpe')})."]
+            parts += ["Why it worked: " + " ".join(ex["worked"])] if ex["worked"] else []
+            parts += ["Why the losses happened: " + " ".join(ex["failed"])] if ex["failed"] else []
+            parts += ["What would help: " + " ".join(ex["help"])] if ex["help"] else []
+            return Reply("\n".join(parts))
         if not rows:
             return Reply(
                 "The strategy lab hasn't run yet: it runs nightly at 02:00 UTC "

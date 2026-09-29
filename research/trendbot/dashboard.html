@@ -404,6 +404,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
         <span class="spacer"></span><button type="button" id="btn-lab">Run research now</button></div>
       <div class="muted" style="font-size:12px">Nightly research on NNFX, Sneaky Pivot (15m) and Fib / FVG / liquidity-grab strategies: rolling walk-forward (252 days in-sample, 6 months out-of-sample), look-ahead detector, crash stress test. A proposal needs an out-of-sample Sharpe above 1.5 and your approval, then 30 days of paper trading before real money.</div>
       <div class="scroll" id="lab"></div>
+      <div id="lab-why"></div>
       <div class="subhead">Proposals and approved strategies</div>
       <div class="scroll" id="lab-props"></div>
     </div>
@@ -1389,6 +1390,20 @@ function renderLab(s) {
     { label: "trades", num: true, get: (r) => r.oos.trades ?? "–" },
     { label: "crash test DD", num: true, get: (r) => r.stress == null ? "–" : nf(1).format(r.stress) + "%" },
     { label: "status", get: (r) => r.status === "proposal" ? status("good", "proposal") : el("span", { class: "secondary" }, r.why || r.status) }], rows));
+  const why = clear(document.getElementById("lab-why"));
+  if ((L.why_best || []).length) {
+    why.append(el("div", { class: "subhead" }, "Why the best one is the best"));
+    for (const x of L.why_best) why.append(el("div", { class: "secondary", style: "font-size:13px" }, "• " + x));
+  }
+  for (const r of rows.filter((r) => r.explain)) {
+    const d = el("details", { style: "margin-top:6px" });
+    const ok = (r.oos.avg_r || 0) > 0 || (r.oos.return_pct || 0) > 0;
+    d.append(el("summary", { style: "cursor:pointer;font-weight:600" }, `${r.strategy} on ${r.pair}: ${ok ? "why it worked, and why its losses happened" : "why it didn't work"}`));
+    const block = (title, items) => { if (!items || !items.length) return; d.append(el("div", { class: "subhead" }, title)); for (const x of items) d.append(el("div", { class: "secondary", style: "font-size:13px" }, "• " + x)); };
+    block("Why it worked", r.explain.worked); block("Why the losses happened", r.explain.failed); block("What would help", r.explain.help);
+    block("Best trades", (r.stories || {}).best); block("Worst trades", (r.stories || {}).worst);
+    why.append(d);
+  }
   const ph = clear(document.getElementById("lab-props")), appr = L.approved || {};
   const props = (L.proposals || []).concat(Object.values(appr).filter((a) => !(L.proposals || []).some((p) => p.id === a.id)));
   if (!props.length) { ph.append(el("div", { class: "empty", style: "padding:10px 0" }, "No proposal has beaten the bar on unseen data yet.")); return; }

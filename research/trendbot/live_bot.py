@@ -860,10 +860,9 @@ def spawn_job(job: str, settings_path: Path, state_dir: Path) -> Any:
     """Start ``retrain.py <job>`` as a separate process (output in retrain.log)."""
     import subprocess
 
-    repo_root = Path(__file__).resolve().parents[2]
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH")]))
-    cmd = [sys.executable, "-m", "research.trendbot.retrain", job, "--settings", str(settings_path)]
+    from .launch import command
+
+    cmd, env = command("retrain", job, "--settings", str(settings_path))
     err = (Path(state_dir) / "jobs.stderr.log").open("ab")
     return subprocess.Popen(cmd, cwd=Path.cwd(), env=env, stdout=subprocess.DEVNULL, stderr=err)
 
