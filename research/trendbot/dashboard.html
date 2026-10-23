@@ -286,6 +286,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     <div class="chips" id="term-chips"></div>
     <div class="voice-bar" style="margin-top:8px">
       <button type="button" class="small" id="voice-btn2">🎙 Push to talk</button>
+      <button type="button" class="small" id="voice-check">Voice check</button>
       <label><input type="checkbox" id="voice-hands"> hands-free (say "Jarvis" or "Chantisimo" first)</label>
       <label><input type="checkbox" id="voice-speak" checked> speak replies</label>
       <span class="muted" id="voice-heard"></span>
@@ -1825,8 +1826,14 @@ const VOICE = (() => {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   const heard = () => document.getElementById("voice-heard");
   const btns = () => [document.getElementById("voice-btn"), document.getElementById("voice-btn2")];
-  const wake = /^\s*(hey\s+)?(jarvis|chantisimo|chanti\w*)[,.!\s]*/i;
+  // speech services spell the wake word many ways ("Santisimo", "chanty seemo", "Jarvis,")
+  const wake = /^\s*(hey|ok|okay)?[\s,]*(jarvis|jarvi|travis|chanti\w*|santi\w*|shanti\w*|chante\w*|chanty\s*\w*)[,.!?\s]*/i;
   let rec = null, listening = false, handsFree = false, voice = null;
+  const HINT = {
+    "network": "the browser could not reach its speech service (Chrome uses Google's, Edge uses Microsoft's). Brave, VPNs and some office networks block it: try Edge or Chrome on another network.",
+    "no-speech": "I heard nothing. Check that Windows uses the right microphone (Settings, System, Sound, Input) and speak right after the click.",
+    "language-not-supported": "the speech service does not support this language; English (US) is used.",
+  };
   const FATAL = {
     "not-allowed": "the microphone is blocked for this page. Allow it in the browser's site settings (the icon left of the address), then tick hands-free again.",
     "service-not-allowed": "the browser does not allow speech recognition here (it needs Chrome or Edge, online).",
@@ -1848,7 +1855,8 @@ const VOICE = (() => {
     if (voice) u.voice = voice;
     u.rate = 1.03; u.pitch = 0.9;
     u.onstart = () => mark("speaking", true); u.onend = () => mark("speaking", false);
-    speechSynthesis.speak(u);
+    say.last = u;  // Chrome drops an utterance that is garbage-collected mid-sentence
+    setTimeout(() => speechSynthesis.speak(u), 60);  // speak() right after cancel() is sometimes lost
   }
   function handle(text, final) {
     heard().textContent = (final ? "heard: " : "listening: ") + text;
@@ -1863,11 +1871,18 @@ const VOICE = (() => {
     if (!SR) { termLine("sys", "Voice needs Chrome or Edge (the browser's speech recognition). Firefox and Safari don't support it here."); return; }
     if (!controlsOn()) { termLine("sys", "Voice commands need the live dashboard with controls on."); return; }
     if (listening) { rec && rec.stop(); return; }
-    rec = new SR(); rec.lang = navigator.language || "en-US"; rec.interimResults = true; rec.continuous = continuous;
+    // commands are English: a Windows language such as Filipino would mis-hear them
+    const lang = navigator.language || "";
+    rec = new SR(); rec.lang = /^en(-|$)/i.test(lang) ? lang : "en-US"; rec.interimResults = true; rec.continuous = continuous;
+    rec.onstart = () => { heard().textContent = continuous ? "listening for \"Jarvis …\"" : "listening… speak now"; };
     rec.onresult = (ev) => { for (let i = ev.resultIndex; i < ev.results.length; i++) handle(ev.results[i][0].transcript, ev.results[i].isFinal); };
     rec.onerror = (ev) => {
       const why = FATAL[ev.error];
-      if (!why) { heard().textContent = "voice: " + ev.error; return; }
+      if (!why) {
+        heard().textContent = "voice: " + ev.error;
+        if (HINT[ev.error]) termLine("sys", "Voice: " + HINT[ev.error]);
+        return;
+      }
       handsFree = false; document.getElementById("voice-hands").checked = false;  // retrying cannot help
       heard().textContent = "voice off: " + why;
       termLine("sys", "Voice is off: " + why);
@@ -1883,7 +1898,37 @@ const VOICE = (() => {
     else if (rec) { rec.stop(); }
   });
   if (!SR) for (const b of btns()) if (b) b.title = "Voice needs Chrome or Edge";
-  return { say, start };
+  async function check() {  // step by step: browser, microphone, speech out
+    const out = (t) => termLine("sys", t);
+    out(`Voice check: speech recognition ${SR ? "available" : "NOT available (use Chrome or Edge)"}; spoken replies ${window.speechSynthesis ? "available" : "not available"}; page ${window.isSecureContext ? "secure (OK)" : "NOT secure: open it as http://127.0.0.1:8050"}.`);
+    try {
+      const st = navigator.permissions ? (await navigator.permissions.query({ name: "microphone" })).state : "unknown";
+      out(`Microphone permission: ${st}${st === "denied" ? ": allow it in the site settings (icon left of the address)" : ""}.`);
+    } catch (e) { out("Microphone permission: unknown in this browser."); }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const track = stream.getAudioTracks()[0];
+      const ac = new (window.AudioContext || window.webkitAudioContext)(), an = ac.createAnalyser();
+      ac.createMediaStreamSource(stream).connect(an);
+      const buf = new Uint8Array(an.fftSize);
+      let peak = 0;
+      out(`Microphone: "${track ? track.label || "default" : "none"}". Say something for 2 seconds…`);
+      const t0 = Date.now();
+      while (Date.now() - t0 < 2000) { an.getByteTimeDomainData(buf); for (const v of buf) peak = Math.max(peak, Math.abs(v - 128)); await new Promise((r) => setTimeout(r, 50)); }
+      stream.getTracks().forEach((t) => t.stop()); ac.close();
+      out(peak > 6 ? `✓ The microphone hears you (level ${peak}).` : "✕ The microphone is silent: pick the right input in Windows sound settings, or unmute it.");
+    } catch (e) { out(`✕ The microphone could not be opened: ${e.name === "NotAllowedError" ? "permission refused" : e.message}.`); }
+    if (window.speechSynthesis) {
+      const was = document.getElementById("voice-speak").checked;
+      document.getElementById("voice-speak").checked = true;
+      say("Voice check. If you can hear me, spoken replies work.");
+      document.getElementById("voice-speak").checked = was;
+      out("You should hear a sentence now. If not, check the speaker volume and the browser tab is not muted.");
+    }
+    if (SR) out("Last step: press 🎙 Push to talk and say \"status\".");
+  }
+  document.getElementById("voice-check").addEventListener("click", check);
+  return { say, start, check };
 })();
 
 // ------------------------------------------------------------------ smart money
