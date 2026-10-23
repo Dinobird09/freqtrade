@@ -284,6 +284,25 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     </div>
   </section>
 
+  <section class="card" id="wallet-card" style="margin-bottom:12px" aria-label="Wallet">
+    <div class="card-head"><h2>Wallet</h2><span class="muted" id="wallet-sub">MetaMask or Phantom: you approve every trade in the wallet</span><span class="spacer"></span>
+      <button type="button" class="small" id="wallet-mm">🦊 Connect MetaMask</button>
+      <button type="button" class="small" id="wallet-ph">👻 Connect Phantom</button>
+      <button type="button" class="small" id="wallet-off">Disconnect</button></div>
+    <div id="wallet-body"></div>
+  </section>
+
+  <dialog class="modal" id="wallet-dialog" aria-labelledby="wallet-title">
+    <h3 id="wallet-title">Chantisimo wants to trade</h3>
+    <div id="wallet-ticket"></div>
+    <div class="muted" id="wallet-step" role="status" aria-live="polite" style="margin-top:8px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button type="button" id="wallet-close">Later</button>
+      <button type="button" class="danger" id="wallet-reject">Reject</button>
+      <button type="button" class="primary" id="wallet-approve">Approve in wallet</button>
+    </div>
+  </dialog>
+
   <section class="card" id="conn-card" style="margin-bottom:12px" aria-label="Connections">
     <details id="conn-details">
       <summary class="card-head" style="cursor:pointer"><h2 style="display:inline">Connections</h2>
@@ -1000,6 +1019,7 @@ function renderAll(force) {
     [renderControls, [s.bot && { ...s.bot, heartbeat_age_s: Math.round((s.bot.heartbeat_age_s || 0) / 5) }, s.control, s.meta.mode, s.open_positions.length]],
     [renderRules, [s.learning]], [renderLedger, [s.ledger]], [renderLayers, [s.layers, s.bot && s.bot.jobs_running]],
     [renderMarket, [s.market, s.layers && s.layers.collect_status]], [renderDex, [s.market]],
+    [renderWallet, [s.wallet]],
     [renderBrain, [s.brain]], [renderLab, [s.lab]], [renderScanner, [s.scanner]], [renderRegime, [s.regime, s.correlations]], [renderTraders, [s.traders]], [renderMcpData, [s.market && s.market.mcp]], [renderVerify, [s.verify]],
   ];
   state.drawn = state.drawn || new Map();
@@ -1476,6 +1496,186 @@ function renderVerify(s) {
         return d; } }], v.agents));
 }
 
+
+// ------------------------------------------------------------------ wallet (MetaMask / Phantom)
+const WALLET = { shown: null, busy: false, ticket: null };
+function metamask() {
+  const e = window.ethereum;
+  if (!e) return null;
+  return (e.providers || []).find((p) => p.isMetaMask) || (e.isMetaMask ? e : null);
+}
+function phantom() {
+  const p = (window.phantom && window.phantom.solana) || window.solana;
+  return p && p.isPhantom ? p : null;
+}
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function b58encode(bytes) {
+  const digits = [0];
+  for (const b of bytes) {
+    let carry = b;
+    for (let i = 0; i < digits.length; i++) { carry += digits[i] << 8; digits[i] = carry % 58; carry = (carry / 58) | 0; }
+    while (carry) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  let out = "";
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) out += "1";
+  for (let i = digits.length - 1; i >= 0; i--) out += B58[digits[i]];
+  return out;
+}
+function b64decode(s) { return Uint8Array.from(atob(s), (c) => c.charCodeAt(0)); }
+function shortAddr(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "–"; }
+function walletStep(text) { document.getElementById("wallet-step").textContent = text; }
+async function walletConnect(kind) {
+  if (!controlsOn()) { toast("Controls are off (static export or --read-only)."); return; }
+  try {
+    if (kind === "metamask") {
+      const p = metamask();
+      if (!p) { toast("✕ MetaMask is not installed in this browser: add the extension from metamask.io, then reload this page."); return; }
+      const accounts = await p.request({ method: "eth_requestAccounts" });
+      const chainId = await p.request({ method: "eth_chainId" });
+      await control({ action: "wallet_connect", provider: "metamask", address: accounts[0], chain_id: chainId });
+    } else {
+      const p = phantom();
+      if (!p) { toast("✕ Phantom is not installed in this browser: add the extension from phantom.com, then reload this page."); return; }
+      const r = await p.connect();
+      await control({ action: "wallet_connect", provider: "phantom", address: (r.publicKey || p.publicKey).toString() });
+    }
+  } catch (e) { toast("✕ " + ((e && e.message) || e)); }
+}
+async function waitReceipt(p, hash) {
+  for (let i = 0; i < 90; i++) {
+    const r = await p.request({ method: "eth_getTransactionReceipt", params: [hash] });
+    if (r && r.status) { if (parseInt(r.status, 16) !== 1) throw new Error("the approval failed on chain"); return; }
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  throw new Error("the approval did not confirm in 3 minutes");
+}
+async function walletApprove() {
+  const t = WALLET.ticket;
+  if (!t || WALLET.busy) return;
+  WALLET.busy = true; document.getElementById("wallet-approve").disabled = true;
+  try {
+    walletStep("Getting the best route…");
+    const j = await control({ action: "wallet_prepare", id: t.id });
+    if (!j || !j.ok) { walletStep("✕ " + ((j && j.message) || "could not prepare the swap")); return; }
+    const tx = j.tx;
+    let sig;
+    try {
+      if (tx.kind === "solana") {
+        const p = phantom();
+        if (!p) throw new Error("Phantom is not available in this browser");
+        if (!p.isConnected) await p.connect();
+        walletStep("Confirm the swap in Phantom…");
+        const res = await p.request({ method: "signAndSendTransaction", params: { message: b58encode(b64decode(tx.tx)) } });
+        sig = (res && res.signature) || res;
+      } else {
+        const p = metamask();
+        if (!p) throw new Error("MetaMask is not available in this browser");
+        const cur = await p.request({ method: "eth_chainId" });
+        if (parseInt(cur, 16) !== parseInt(tx.chain_id, 16)) {
+          walletStep(`Switch MetaMask to ${t.chain_name}…`);
+          await p.request({ method: "wallet_switchEthereumChain", params: [{ chainId: tx.chain_id }] });
+        }
+        if (tx.approve) {
+          walletStep(`Step 1 of 2: allow the swap to spend ${nf(6).format(t.amount_in)} ${t.token_in.symbol} (MetaMask)…`);
+          const h = await p.request({ method: "eth_sendTransaction", params: [tx.approve] });
+          walletStep("Waiting for that approval to confirm…");
+          await waitReceipt(p, h);
+        }
+        walletStep((tx.approve ? "Step 2 of 2: " : "") + "Confirm the swap in MetaMask…");
+        sig = await p.request({ method: "eth_sendTransaction", params: [tx.swap] });
+      }
+    } catch (e) {
+      const why = String((e && e.message) || e).slice(0, 180);
+      await control({ action: "wallet_reject", id: t.id, reason: why });
+      walletStep("✕ Not sent: " + why);
+      return;
+    }
+    await control({ action: "wallet_sent", id: t.id, tx: String(sig) });
+    walletStep("✓ Sent. The bot is confirming it on chain.");
+    const d = document.getElementById("wallet-ticket");
+    d.append(el("a", { href: tx.explorer + sig, target: "_blank", rel: "noopener" }, "view the transaction ↗"));
+  } finally { WALLET.busy = false; document.getElementById("wallet-approve").disabled = false; }
+}
+function openTicket(t) {
+  WALLET.ticket = t;
+  const d = clear(document.getElementById("wallet-ticket"));
+  const verb = t.side === "buy" ? "BUY" : "SELL";
+  d.append(el("p", {}, `${verb} ${t.pair} on ${t.chain_name} with ${t.provider === "phantom" ? "Phantom" : "MetaMask"}:`));
+  d.append(el("p", {}, el("strong", {}, `${nf(6).format(t.amount_in)} ${t.token_in.symbol} → about ${nf(6).format(t.est_out)} ${t.token_out.symbol}`)));
+  d.append(el("p", { class: "muted" }, `slippage limit ${t.slippage_bps / 100}% · ${t.token_out.symbol} token ${shortAddr(t.token_out.address)} · from ${shortAddr(t.address)}`));
+  d.append(el("p", { class: "muted", id: "wallet-left" }, `waits ${t.seconds_left}s for you, then the bot ${t.side === "sell" ? "asks again" : "skips this entry"}`));
+  walletStep(t.status === "pending" ? "" : t.status === "approved" ? "Approved: finish it in your wallet." : "Sent: confirming on chain…");
+  const dlg = document.getElementById("wallet-dialog");
+  if (!dlg.open) dlg.showModal();
+}
+function renderWallet(s) {
+  const w = s.wallet, host = clear(document.getElementById("wallet-body"));
+  const card = document.getElementById("wallet-card");
+  card.style.display = w ? "" : "none";
+  if (!w) return;
+  const on = controlsOn();
+  for (const [id, fn] of [["wallet-mm", () => walletConnect("metamask")], ["wallet-ph", () => walletConnect("phantom")],
+    ["wallet-off", () => control({ action: "wallet_disconnect" }, "Disconnect the wallet from this bot?")]]) {
+    const b = document.getElementById(id); b.disabled = !on; b.onclick = fn;
+  }
+  const c = w.connected;
+  document.getElementById("wallet-sub").textContent = c
+    ? `${c.provider === "phantom" ? "Phantom" : "MetaMask"} ${shortAddr(c.address)} connected` + (w.mode === "wallet" ? ` · trading on ${w.chain_name}, at most $${money(w.max_trade_usd)} a swap` : "")
+    : "MetaMask or Phantom: you approve every trade in the wallet";
+  if (w.mode !== "wallet") {
+    host.append(el("div", { class: "empty" }, 'To trade with a wallet, set "mode": "wallet" and "wallet": {"provider": "phantom", "chain": "solana"} (or "metamask" with "base", "ethereum", "arbitrum", "bsc", "polygon") in bot.json, connect the wallet here, then start the bot.'));
+  } else if (!c) {
+    host.append(el("div", { class: "empty" }, `Connect ${w.provider === "phantom" ? "Phantom" : "MetaMask"} to let the bot ask you for trades on ${w.chain_name}.`));
+  }
+  const bal = w.status && w.status.balances;
+  if (bal && c && w.status.address === c.address) {
+    const rows = Object.entries(bal).filter(([, v]) => v > 0).sort();
+    host.append(el("div", { class: "subhead" }, `Balances on ${w.chain_name || w.status.chain} · ${dt(w.status.ts)}`));
+    host.append(rows.length ? wrapScroll(tableView([{ label: "token", get: (r) => r[0] }, { label: "amount", num: true, get: (r) => nf(6).format(r[1]) }], rows))
+      : el("div", { class: "empty" }, "No balances yet: fund the wallet with the stable coin (and a little of the network coin for fees)."));
+  }
+  const tickets = w.tickets || [];
+  if (tickets.length) {
+    host.append(el("div", { class: "subhead" }, "Waiting for you"));
+    for (const t of tickets) {
+      const row = el("div", { class: "chips" });
+      row.append(status(t.status === "pending" ? "serious" : "warning", `${t.side.toUpperCase()} ${t.pair}: ${nf(6).format(t.amount_in)} ${t.token_in.symbol} · ${t.status} · ${t.seconds_left}s`));
+      const b = el("button", { type: "button", class: "small primary" }, "Review");
+      b.disabled = !on; b.onclick = () => openTicket(t);
+      row.append(b); host.append(row);
+    }
+  }
+  const top = tickets.find((t) => t.status === "pending");
+  if (top && on && WALLET.shown !== top.id) {  // a new trade: pop it up once and say it
+    WALLET.shown = top.id; openTicket(top);
+    VOICE.say(`Chantisimo wants to ${top.side} ${top.pair.split("/")[0]}. Approve it in your wallet.`);
+  }
+  const dlg = document.getElementById("wallet-dialog");
+  if (dlg.open && WALLET.ticket) {
+    const live = tickets.find((t) => t.id === WALLET.ticket.id);
+    const left = document.getElementById("wallet-left");
+    if (live && left) left.textContent = `waits ${live.seconds_left}s for you`;
+    if (!live && !WALLET.busy) { const r = (w.recent || []).find((t) => t.id === WALLET.ticket.id); walletStep(r ? `This ticket is ${r.status}${r.error ? ": " + r.error : ""}.` : "This ticket is closed."); }
+  }
+  const recent = (w.recent || []).filter((t) => !["pending", "approved", "sent"].includes(t.status));
+  if (recent.length) {
+    host.append(el("div", { class: "subhead" }, "Recent wallet trades"));
+    host.append(wrapScroll(tableView([
+      { label: "when", nowrap: true, get: (t) => dt(t.created_ms) },
+      { label: "trade", get: (t) => `${t.side.toUpperCase()} ${t.pair}` },
+      { label: "result", get: (t) => status(t.status === "filled" ? "good" : "warning", t.status) },
+      { label: "detail", get: (t) => t.fill ? `${nf(6).format(t.fill.qty)} at ${px(t.fill.price)}` : (t.error || "–") },
+      { label: "tx", get: (t) => t.tx && w.explorer ? el("a", { href: w.explorer + t.tx, target: "_blank", rel: "noopener" }, shortAddr(t.tx)) : "–" },
+    ], recent)));
+  }
+}
+document.getElementById("wallet-approve").onclick = walletApprove;
+document.getElementById("wallet-close").onclick = () => document.getElementById("wallet-dialog").close();
+document.getElementById("wallet-reject").onclick = async () => {
+  const t = WALLET.ticket; if (!t) return;
+  await control({ action: "wallet_reject", id: t.id, reason: "rejected on the dashboard" });
+  document.getElementById("wallet-dialog").close();
+};
 
 // ------------------------------------------------------------------ voice (Web Speech API)
 const VOICE = (() => {

@@ -780,7 +780,9 @@ class Terminal:
         return str(self._snap(bot)["meta"].get("mode"))
 
     def tool_start_day(self, args: dict[str, Any], bot: str) -> Reply:
-        if self._mode(bot) == "live" and not (self._snap(bot).get("bot") or {}).get("running"):
+        if self._mode(bot) in ("live", "wallet") and not (self._snap(bot).get("bot") or {}).get(
+            "running"
+        ):
             return self._prepare(
                 "start_day", args, bot, f"Start the day on {bot} in LIVE mode with real funds?"
             )
@@ -849,7 +851,7 @@ class Terminal:
         return Reply(text, data={"day": e})
 
     def tool_start_bot(self, args: dict[str, Any], bot: str) -> Reply:
-        if self._mode(bot) == "live":
+        if self._mode(bot) in ("live", "wallet"):
             return self._prepare(
                 "start_bot", args, bot, f"Start {bot} in LIVE mode with real funds?"
             )

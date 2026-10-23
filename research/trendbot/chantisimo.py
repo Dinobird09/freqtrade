@@ -355,7 +355,8 @@ class Chantisimo:
     # -------------------------------------------------------------- graduation
     def graduation(self, pair: str, now_ts: int | None = None) -> tuple[bool, str]:
         """Is ``pair`` proven in paper trading (teacher trades known by ``now_ts``)?"""
-        if not (self.s.graduation and self.s.learn_from and self.mode in ("testnet", "live")):
+        real_money = self.mode in ("testnet", "live", "wallet")
+        if not (self.s.graduation and self.s.learn_from and real_money):
             return True, "no graduation needed"
         rs = [
             m.trade.r_multiple or 0.0

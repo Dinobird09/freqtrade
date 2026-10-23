@@ -64,7 +64,7 @@ from .retrain import due
 
 log = logging.getLogger("trendbot.bot")
 
-MODES = ("paper", "testnet", "live")
+MODES = ("paper", "testnet", "live", "wallet")  # wallet: MetaMask / Phantom (wallets.py)
 STATE_VERSION = 1
 
 
@@ -101,6 +101,8 @@ class BotSettings:
     execution: dict[str, Any] = field(default_factory=dict)
     allocation: dict[str, Any] = field(default_factory=dict)  # allocation.AllocationSettings
     scanner: dict[str, Any] = field(default_factory=dict)  # scanner.ScannerSettings (watchlist)
+    # mode "wallet": {"provider": "phantom"|"metamask", "chain": "solana"|"base"|..., ...}
+    wallet: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -111,6 +113,10 @@ class BotSettings:
         quotes = {quote_of(p) for p in self.pairs}
         if len(quotes) != 1:
             raise ValueError(f"all pairs must share one quote currency (got {sorted(quotes)})")
+        if self.mode == "wallet":
+            from .wallets import WalletSettings
+
+            WalletSettings(**self.wallet).check_pairs(self.pairs)
         if self.poll_seconds <= 0 or self.history_candles < 1200:
             raise ValueError(
                 "poll_seconds must be > 0 and history_candles >= 1200 (EMA200 needs ~1000 "
@@ -179,6 +185,8 @@ class TrendBot:
         self._alloc_mtime: float | None = None
         self.settings_path: Path | None = None  # set by main(); needed to spawn jobs
         self._jobs: dict[str, Any] = {}
+        if hasattr(gateway, "on_wait"):  # a wallet ticket waits for you: stay "running"
+            gateway.on_wait = lambda: self._heartbeat("running")
 
     # ------------------------------------------------------------------ paths
     @property
@@ -984,6 +992,11 @@ def build_gateway(settings: BotSettings, cfg: StrategyConfig) -> Any:
         return PaperBroker.connect(
             settings.exchange, fee_rate=cfg.fee_rate, slippage_pct=cfg.slippage_pct
         )
+    if settings.mode == "wallet":
+        from .wallets import WalletBroker, WalletSettings
+
+        ws = WalletSettings(**settings.wallet)
+        return WalletBroker.connect(settings.exchange, ws, Path(settings.state_dir))
     return CcxtGateway.connect(settings.exchange, settings.mode)
 
 

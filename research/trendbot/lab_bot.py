@@ -62,6 +62,8 @@ class LabBot:
         self.stop_requested = False
         self.capital: CapitalGuard | None = None
         self.settings_path: Path | None = None
+        if hasattr(gateway, "on_wait"):  # a wallet ticket waits for you: stay "running"
+            gateway.on_wait = lambda: self._heartbeat("running")
 
     # -------------------------------------------------------------- files
     @property

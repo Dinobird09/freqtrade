@@ -583,10 +583,20 @@ class Controller:
         self._err_from = 0
         self.jobs: dict[str, subprocess.Popen[bytes]] = {}
         self.poll_s = 10.0
+        self._settings: tuple[float, Any] | None = None
         if settings_path is not None:
-            from .live_bot import BotSettings
+            self.poll_s = self.settings().poll_seconds
 
-            self.poll_s = BotSettings.load(settings_path).poll_seconds
+    def settings(self) -> Any:
+        """bot.json as BotSettings, re-read when the file changes (None without --settings)."""
+        if self.settings_path is None:
+            return None
+        from .live_bot import BotSettings
+
+        mtime = self.settings_path.stat().st_mtime
+        if self._settings is None or self._settings[0] != mtime:
+            self._settings = (mtime, BotSettings.load(self.settings_path))
+        return self._settings[1]
 
     def bot_status(self) -> dict[str, Any]:
         beat = _read_json(self.dir / "heartbeat.json")
@@ -784,12 +794,78 @@ class FleetRuntime:
         state_dir, cfg, ctrl = self.entries[name]
         snap = live_snapshot(state_dir, cfg)
         snap["bot"] = ctrl.bot_status() if ctrl else None
+        snap["wallet"] = self._wallet_view(name)
         snap["meta"]["bot_name"] = name
         bot = self.fleet.bots.get(name) if self.fleet is not None else None
         if bot is not None and snap["meta"].get("mode") in (None, "unknown"):
             snap["meta"]["mode"] = bot.settings.mode  # never started: show the configured mode
             snap["meta"]["exchange"] = bot.settings.exchange
         return snap
+
+    def _bot_settings(self, name: str) -> Any:
+        ctrl = self._ctrl(name)
+        try:
+            return ctrl.settings() if ctrl is not None else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _wallet_view(self, name: str) -> dict[str, Any]:
+        from .wallets import wallet_view
+
+        s = self._bot_settings(name)
+        raw = {"mode": s.mode, "wallet": s.wallet} if s is not None else None
+        return wallet_view(self.entries[name][0], raw)
+
+    def wallet_action(self, req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:  # noqa: C901
+        """Wallet card: connect MetaMask / Phantom, approve or reject the bot's trade tickets."""
+        from . import wallets as w
+
+        name = str(req.get("bot") or self.names[0])
+        if name not in self.entries:
+            return 400, {"ok": False, "message": f"no bot named {name!r}"}
+        state_dir = self.entries[name][0]
+        s = self._bot_settings(name)
+        a = str(req.get("action"))
+        try:
+            ws = w.WalletSettings(**s.wallet) if s is not None and s.wallet else None
+            if a == "wallet_connect":
+                provider = str(req.get("provider"))
+                conn = w.connect(state_dir, provider, str(req.get("address")), req.get("chain_id"))
+                msg = f"{provider.title()} connected: {conn['address'][:6]}…{conn['address'][-4:]}"
+                if s is None or s.mode != "wallet":
+                    msg += ' (to trade with it, set "mode": "wallet" in bot.json and restart)'
+                elif ws is not None and ws.provider != provider:
+                    msg += f" (bot.json trades with {ws.provider.title()}, not {provider.title()})"
+                elif ws is not None:
+                    try:
+                        bal = w.refresh_status(state_dir, ws)
+                        msg += (
+                            "; balances "
+                            + ", ".join(f"{v:.6g} {k}" for k, v in sorted(bal.items()) if v)
+                            if any(bal.values())
+                            else "; the wallet is empty on " + ws.spec["name"]
+                        )
+                    except w.WalletError as exc:
+                        msg += f"; balances not read yet ({exc})"
+                return 200, {"ok": True, "message": msg}
+            if a == "wallet_disconnect":
+                w.disconnect(state_dir)
+                return 200, {"ok": True, "message": "wallet disconnected"}
+            tid = str(req.get("id", ""))
+            if a == "wallet_prepare":
+                if s is None or s.mode != "wallet" or ws is None:
+                    return 400, {"ok": False, "message": 'bot.json is not in "wallet" mode'}
+                tx = w.prepare(state_dir, tid, ws)
+                return 200, {"ok": True, "message": "approve it in your wallet", "tx": tx}
+            if a == "wallet_sent":
+                w.mark_sent(state_dir, tid, str(req.get("tx", "")))
+                return 200, {"ok": True, "message": "sent: the bot is confirming it on chain"}
+            if a == "wallet_reject":
+                w.reject(state_dir, tid, str(req.get("reason", "")))
+                return 200, {"ok": True, "message": "trade declined"}
+        except w.WalletError as exc:
+            return 400, {"ok": False, "message": str(exc)}
+        return 400, {"ok": False, "message": f"unknown action {a!r}"}
 
     def summary(self) -> dict[str, Any]:
         from .fleet import summary_row
@@ -815,6 +891,8 @@ class FleetRuntime:
         action = req.get("action")
         if str(action).startswith(("keys_", "mcp_", "trader")):
             return connection_action(req)
+        if str(action).startswith("wallet_"):
+            return self.wallet_action(req)
         try:
             if action == "approve":
                 a = self.fleet.take_approval(
