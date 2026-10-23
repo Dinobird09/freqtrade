@@ -566,6 +566,14 @@ MEME_HEADERS = {
         "frame-ancestors 'none'"
     ),
 }
+MEMORY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+    ),
+}
+TOKEN_PAGES = {"/memes": ("memes.html", MEME_HEADERS), "/memory": ("memory.html", MEMORY_HEADERS)}
 MARKET_PAGES: dict[str, tuple[str, dict[str, str]]] = {
     "/market": (
         "market.html",
@@ -986,6 +994,30 @@ class FleetRuntime:
                 meta["exchange"] = s.exchange
         return snap
 
+    def memory_note(self, req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Your note, tags or star on a trade in the Memory bank."""
+        from .memory_bank import annotate
+
+        tags = req.get("tags")
+        row = annotate(
+            self.entries[self.names[0]][0],
+            str(req.get("id", "")),
+            note=req.get("note"),
+            tags=[str(x) for x in tags] if isinstance(tags, list) else None,
+            star=req.get("star"),
+        )
+        return 200, {"ok": True, "message": "saved", "annotation": row}
+
+    def memory_bank(self) -> dict[str, Any]:
+        """Every trade of every bot (and the meme desk), for the Memory bank tab."""
+        from .memory_bank import bank
+
+        bots = {}
+        for name, (state_dir, _, _) in self.entries.items():
+            s = self._bot_settings(name)
+            bots[name] = (state_dir, {"mode": s.mode, "exchange": s.exchange} if s else None)
+        return bank(bots, self.entries[self.names[0]][0])
+
     def _bot_settings(self, name: str) -> Any:
         fn = getattr(self._ctrl(name), "settings", None)  # test doubles may have none
         try:
@@ -1090,12 +1122,15 @@ class FleetRuntime:
         from .fleet import FleetError
 
         action = req.get("action")
-        if str(action).startswith(("keys_", "mcp_", "trader")):
-            return connection_action(req)
-        if str(action).startswith("meme_"):
-            return self.memes.act(req)
-        if str(action).startswith("wallet_"):
-            return self.wallet_action(req)
+        routes = (
+            (("keys_", "mcp_", "trader"), connection_action),
+            (("meme_",), lambda r: self.memes.act(r)),
+            (("memory_",), self.memory_note),
+            (("wallet_",), self.wallet_action),
+        )
+        for prefixes, handler in routes:  # the cards that keep their own buttons
+            if str(action).startswith(prefixes):
+                return handler(req)
         try:
             if action == "approve":
                 if self.fleet is None:
@@ -1351,13 +1386,14 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 if path in ("/", "/index.html"):
                     page = render_html(None, refresh_s, token if controls else None)
                     self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8")
-                elif path.rstrip("/") == "/memes":
-                    page = _html_template("memes.html").replace(
+                elif path.rstrip("/") in TOKEN_PAGES:  # pages with buttons get the token
+                    name, headers = TOKEN_PAGES[path.rstrip("/")]
+                    page = _html_template(name).replace(
                         '"__CONTROL_TOKEN__"', json.dumps(token if controls else "")
                     )
-                    self._send(
-                        HTTPStatus.OK, page.encode(), "text/html; charset=utf-8", MEME_HEADERS
-                    )
+                    self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8", headers)
+                elif path in ("/api/memory", "/api/memory/export.csv"):
+                    self._memory(path.endswith(".csv"))
                 elif path in ("/api/memes/feed", "/api/memes/check", "/api/memes/positions"):
                     desk, q = runtime.memes, self._query()
                     kind = path.rsplit("/", 1)[1]
@@ -1415,6 +1451,17 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 log.exception("dashboard action failed")
                 code, body = 500, {"ok": False, "message": _plain(exc)}
             self._json(code, body)
+
+        def _memory(self, as_csv: bool) -> None:
+            data = runtime.memory_bank()
+            if not as_csv:
+                self._json(HTTPStatus.OK, data)
+                return
+            from .memory_bank import to_csv
+
+            body = to_csv(data["records"]).encode("utf-8-sig")  # the BOM lets Excel read UTF-8
+            extra = {"Content-Disposition": 'attachment; filename="trades-memory-bank.csv"'}
+            self._send(HTTPStatus.OK, body, "text/csv; charset=utf-8", extra)
 
         def _voice(self) -> None:
             """A recorded clip (16 kHz mono PCM16) -> its words, with the offline engine."""

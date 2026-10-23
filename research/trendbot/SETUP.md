@@ -389,6 +389,45 @@ a browser notification when a level is hit, and also when the pool's liquidity f
 or more after you bought, the usual sign of a rug pull. Every sell is still a swap you
 confirm in the wallet.
 
+## 4h. Memory bank: every trade and its story
+
+Open **🧠 Memory bank** in the dashboard header, or go to http://127.0.0.1:8050/memory. It
+holds every trade every bot has made:
+
+- all modes: paper, testnet, live and wallet;
+- every bot in a fleet;
+- strategy-lab bots;
+- meme desk positions.
+
+It updates itself every 15 seconds.
+
+- **Totals:**
+  - number of trades, win rate, total profit or loss and average R;
+  - the longest winning and losing streaks;
+  - the best and worst trade (click to open it);
+  - a profit-and-loss curve (click a point to open that trade);
+  - a chart of trades by R;
+  - **Mistakes it keeps seeing:** the mistakes Chantisimo flagged most often. Click one to
+    list those trades.
+- **Find trades:**
+  - search across pairs, lessons, reasons, notes and tags;
+  - filter by bot, mode, result (win, loss or open), strategy, tag or ★ starred;
+  - sort by clicking a column.
+- **Each trade's story:**
+  - entry, exit, stop, target, size, risk, fees, P&L, R and how long it was held;
+  - **why it took the trade** (every rule that passed);
+  - **what it expected** from similar past trades;
+  - **what happened**;
+  - **Chantisimo's reflection** (won or lost, the mistakes it saw, what its recall had
+    predicted);
+  - the lesson it learned;
+  - the MetaMask or Phantom transactions behind the trade, with explorer links;
+  - the market readings at entry.
+- **Your notes:** write a note, add tags (e.g. `fomo`, `news`) and star trades. They are saved
+  in `memory_bank.json` next to the bot's state and kept across restarts.
+- **Export CSV:** downloads every trade, with lessons, mistakes, notes and tags, as a
+  spreadsheet that opens in Excel.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,
