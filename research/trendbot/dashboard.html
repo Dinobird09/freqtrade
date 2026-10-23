@@ -169,6 +169,12 @@ td.nowrap, th.nowrap { white-space: nowrap; }
 .status .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
 .status.good .dot { background: var(--good); } .status.warning .dot { background: var(--warning); }
 .status.serious .dot { background: var(--serious); } .status.critical .dot { background: var(--critical); }
+.status.neutral .dot { background: var(--text-muted); } .status.neutral { color: var(--text-secondary); }
+.local-status { font-size: 12.5px; color: var(--text-secondary); margin: 4px 0 6px; min-height: 0; }
+.local-status:empty { display: none; }
+a.navlink { color: var(--text-primary); text-decoration: none; border: 1px solid var(--border); border-radius: 6px;
+  padding: 3px 10px; background: var(--surface-1); font-weight: 600; white-space: nowrap; }
+a.navlink:hover { border-color: var(--series-1); }
 .meter { height: 6px; background: var(--grid); border-radius: 3px; margin-top: 8px; overflow: hidden; }
 .meter > div { height: 100%; border-radius: 3px; background: var(--series-1); }
 .meter.critical > div { background: var(--critical); }
@@ -220,8 +226,9 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
   border: 1px solid var(--baseline); border-radius: 6px; background: var(--page); color: var(--text-primary); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .subhead { font-size: 13px; font-weight: 650; margin: 12px 0 4px; }
-.brain-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-@media (max-width: 960px) { .brain-grid { grid-template-columns: 1fr; } }
+.brain-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+.brain-grid > * { min-width: 0; }
+@media (max-width: 960px) { .brain-grid { grid-template-columns: minmax(0, 1fr); } }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -236,6 +243,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     <span class="badge" id="b-updated"></span>
     <span class="spacer"></span>
     <span class="muted" id="b-error"></span>
+    <a class="navlink" id="market-link" href="market" title="Live charts from the exchanges' public feeds (no keys)">📈 Market terminal</a>
     <button type="button" id="theme" title="Theme">Theme: jarvis</button>
   </header>
 
@@ -307,6 +315,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     <details id="conn-details">
       <summary class="card-head" style="cursor:pointer"><h2 style="display:inline">Connections</h2>
         <span class="muted" id="conn-sub">exchange API keys and MCP servers (TradingView, …)</span></summary>
+      <div class="local-status" id="conn-status" role="status" aria-live="polite"></div>
       <div class="subhead">Exchange accounts</div>
       <div class="muted" style="font-size:12px">Keys are saved only to your local .env file, never shown again, and never leave this computer except to the exchange. Use trade-only keys without withdrawal permission. Restart a bot after changing its keys.</div>
       <div class="scroll" id="conn-exchanges"></div>
@@ -349,6 +358,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
         <button type="button" class="primary" id="tools-collect">Collect hourly</button>
         <button type="button" id="tools-uncollect">Stop collecting</button>
       </div>
+      <div class="local-status" id="tools-status" role="status" aria-live="polite"></div>
       <pre id="tools-out"></pre>
     </div>
     <div style="display:flex;justify-content:flex-end"><button type="button" id="tools-close">Close</button></div>
@@ -377,7 +387,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
 
     <div class="card span-12">
       <div class="card-head"><h2>Open positions</h2><span class="muted" id="open-sub"></span></div>
-      <div id="open"></div>
+      <div class="scroll" id="open"></div>
     </div>
 
     <div class="card span-7">
@@ -395,7 +405,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
 
     <div class="card span-12">
       <div class="card-head"><h2>Learned rules</h2><span class="muted" id="learn-sub"></span></div>
-      <div id="rules"></div>
+      <div class="scroll" id="rules"></div>
     </div>
 
     <div class="card span-12" id="brain-card">
@@ -462,7 +472,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
         <span class="spacer"></span>
         <button type="button" id="btn-collect">Collect data now</button>
         <button type="button" id="btn-retrain">Retrain now</button></div>
-      <div id="layers"></div>
+      <div class="scroll" id="layers"></div>
     </div>
 
     <div class="card span-6">
@@ -472,7 +482,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     </div>
     <div class="card span-6">
       <div class="card-head"><h2>Order flow (latest 4H candle)</h2></div>
-      <div id="flow"></div>
+      <div class="scroll" id="flow"></div>
     </div>
 
     <div class="card span-12">
@@ -543,6 +553,15 @@ function dt(ms) {
   const d = new Date(ms);
   return d.toISOString().slice(0, 16).replace("T", " ") + "Z";
 }
+function ago(sec) {  // a heartbeat age as people say it: "35 s ago", "35 min ago", "24 days ago"
+  if (sec === null || sec === undefined) return "–";
+  const s = Math.max(0, Math.round(sec));
+  if (s < 90) return `${s} s ago`;
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 129600) return `${Math.round(s / 3600)} h ago`;
+  const d = Math.round(s / 86400);
+  return `${d} day${d === 1 ? "" : "s"} ago`;
+}
 function day(ms, span) {
   const iso = new Date(ms).toISOString();
   return span > 120 * 864e5 ? iso.slice(0, 7) : iso.slice(5, 10);
@@ -594,7 +613,7 @@ function tableView(cols, rows) {
   for (const r of rows) {
     const row = el("tr");
     for (const c of cols) {
-      const v = c.get(r), td = el("td", { class: c.num ? "num" : c.nowrap ? "nowrap" : null });
+      const v = c.get(r), td = el("td", { class: c.num ? "num" : c.nowrap ? "nowrap" : null, "data-k": c.key || null });
       if (v instanceof Node) td.append(v); else td.textContent = v === null || v === undefined ? "–" : String(v);
       row.append(td);
     }
@@ -626,10 +645,15 @@ function lineChart(host, opts) {
     ax.append(sv("line", { class: "gridline", x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v) }));
     const t = sv("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end" }); t.textContent = opts.yfmt(v); ax.append(t);
   }
-  const nt = Math.min(6, n - 1);
+  // x labels by time (not by point index: trades are uneven in time), never closer than 60px
+  const span = x1 - x0, unit = (host.clientWidth || W) / W, gap = 60 / unit;
+  const nt = Math.max(1, Math.min(6, Math.floor((W - m.l - m.r) / gap)));
+  let lastX = -Infinity, lastLab = null;
   for (let k = 0; k <= nt; k++) {
-    const i = Math.round(k * (n - 1) / nt), t = sv("text", { x: X(xs[i]), y: H - 8, "text-anchor": "middle" });
-    t.textContent = day(xs[i], x1 - x0); ax.append(t);
+    const tk = x0 + k * span / nt, x = X(tk), lab = day(tk, span);
+    if (x - lastX < gap || lab === lastLab) continue;
+    lastX = x; lastLab = lab;
+    const t = sv("text", { x, y: H - 8, "text-anchor": "middle" }); t.textContent = lab; ax.append(t);
   }
   ax.append(sv("line", { class: "baseline", x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b }));
   svg.append(ax);
@@ -646,15 +670,20 @@ function lineChart(host, opts) {
       "stroke-width": 1.5, "stroke-dasharray": "5 4" }));
     refLabels.push({ y: Y(r.value), label: r.label });
   }
-  const ends = refLabels;
-  for (const s of opts.series) {
+  const ends = refLabels, paths = [];
+  const pathOf = (s) => {
     let d = "", lastI = -1;
     s.values.forEach((v, i) => {
       if (v === null || v === undefined) { return; }
       d += (lastI === i - 1 && d ? "L" : "M") + X(xs[i]).toFixed(1) + "," + Y(v).toFixed(1); lastI = i;
     });
-    svg.append(sv("path", { d, fill: "none", stroke: s.color, "stroke-width": s.width || 2,
-      "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    return [d, lastI];
+  };
+  for (const s of opts.series) {
+    const [d, lastI] = pathOf(s);
+    const path = sv("path", { d, fill: "none", stroke: s.color, "stroke-width": s.width || 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round" });
+    paths.push(path); svg.append(path);
     if (lastI >= 0 && opts.directLabels) ends.push({ y: Y(s.values[lastI]), label: s.label });
   }
   ends.sort((a, b) => a.y - b.y);
@@ -706,6 +735,15 @@ function lineChart(host, opts) {
     if (ev.key === "ArrowLeft") { showAt(focusI - 1); ev.preventDefault(); }
     if (ev.key === "ArrowRight") { showAt(focusI + 1); ev.preventDefault(); }
   });
+  // live price: move the last point in place (the tooltip and hover stay); false = redraw
+  function setLast(k, v) {
+    if (v === null || v === undefined || !(v >= lo && v <= hi)) return false;
+    opts.series[k].values[n - 1] = v;
+    paths[k].setAttribute("d", pathOf(opts.series[k])[0]);
+    if (cross.getAttribute("visibility") === "visible" && focusI === n - 1) showAt(n - 1);
+    return true;
+  }
+  return { setLast, lastTs: x1 };
 }
 
 // ------------------------------------------------------------------ bar charts
@@ -892,14 +930,14 @@ function renderPairTabs(s) {
 function renderPrice(s) {
   const host = document.getElementById("chart-price"), leg = clear(document.getElementById("price-legend"));
   const data = s.pairs[state.pair];
-  if (!data) { clear(host).append(el("div", { class: "empty" }, "No candles cached yet: the bot writes them at each 4H close.")); return; }
-  const live = s.live || {}, f = (live.forming || {})[state.pair], q = (live.prices || {})[state.pair];
+  if (!data) { state.priceChart = null; clear(host).append(el("div", { class: "empty" }, "No candles cached yet: the bot writes them at each 4H close.")); return; }
+  const live = s.live || {}, f = (live.forming || {})[state.pair];
   let cs = data.candles;
   const lastTs = cs.length ? cs[cs.length - 1].ts : 0;
   if (f && f.ts > lastTs) cs = cs.concat([{ ts: f.ts, close: f.close, ema21: null, ema200: null, forming: true }]);
   const pos = s.open_positions.find((p) => p.pair === state.pair);
-  document.getElementById("price-sub").textContent = `${state.pair} · last ${data.candles.length} candles` +
-    (q && q.last ? ` · live ${px(q.last)} (bid ${px(q.bid)} / ask ${px(q.ask)}, ${Math.round((live.age_ms || 0) / 1000)}s ago)` : " · no live price");
+  state.priceChart = null;
+  document.getElementById("price-sub").textContent = priceSub(s);
   const series = [
     { label: "Close", color: "var(--series-1)", values: cs.map((c) => c.close) },
     { label: "EMA21", color: "var(--series-2)", values: cs.map((c) => c.ema21), width: 1.5 },
@@ -923,18 +961,49 @@ function renderPrice(s) {
     cs.slice().reverse())));
     return;
   }
-  lineChart(host, { x: cs.map((c) => c.ts), series, refs, marks: data.marks, yfmt: (v) => px(v), directLabels: true,
+  state.priceChart = lineChart(host, { x: cs.map((c) => c.ts), series, refs, marks: data.marks, yfmt: (v) => px(v), directLabels: true,
     height: 300, rightPad: 110, aria: `${state.pair} 4H close with EMA21 and EMA200` });
 }
+function priceSub(s) {
+  const data = s.pairs[state.pair], live = s.live || {}, q = (live.prices || {})[state.pair];
+  if (!data) return "";
+  return `${state.pair} · last ${data.candles.length} candles` +
+    (q && q.last ? ` · live ${px(q.last)} (bid ${px(q.bid)} / ask ${px(q.ask)}, ${Math.round((live.age_ms || 0) / 1000)}s ago)` : " · no live price");
+}
+function livePrice(s) {  // every second: the subtitle and the forming candle, without a redraw
+  document.getElementById("price-sub").textContent = priceSub(s);
+  const c = state.priceChart, f = ((s.live || {}).forming || {})[state.pair];
+  if (!c || !f || f.ts !== c.lastTs || c.setLast(0, f.close)) return;
+  if (!busy("chart-price")) renderPrice(s);  // the price left the chart's range: redraw
+}
 
+const OPEN_LIVE = { last: (r) => px(r.last), unrealized: (r) => signed(r.unrealized, 2), r_now: (r) => signed(r.r_now, 2, "R") };
+function openSub(rows) {
+  if (!rows.length) return "";
+  return rows.some((r) => r.live) ? "marked at the live bid, updated every second" : "marked at the last cached 4H close";
+}
+function progressLeft(r) { return `calc(${Math.max(0, Math.min(1, r.progress)) * 100}% - 1px)`; }
+function liveOpen(s) {  // every second: update the changing cells in place (the Close buttons stay)
+  document.getElementById("open-sub").textContent = openSub(s.open_positions);
+  const trs = document.querySelectorAll("#open tbody tr");
+  s.open_positions.forEach((r, i) => {
+    const tr = trs[i]; if (!tr) return;
+    for (const [k, fn] of Object.entries(OPEN_LIVE)) {
+      const td = tr.querySelector(`td[data-k="${k}"]`), v = fn(r);
+      if (td && td.textContent !== v) td.textContent = v;
+    }
+    const mark = tr.querySelector('td[data-k="progress"] i');
+    if (mark && r.progress !== null && r.progress !== undefined) mark.style.left = progressLeft(r);
+  });
+}
 function renderOpen(s) {
   const host = clear(document.getElementById("open")), rows = s.open_positions;
-  document.getElementById("open-sub").textContent = rows.length ? "marked at the last cached 4H close" : "";
+  document.getElementById("open-sub").textContent = openSub(rows);
   if (!rows.length) { host.append(el("div", { class: "empty" }, "Flat: no open positions.")); return; }
   const prog = (r) => {
     if (r.progress === null || r.progress === undefined) return "–";
     const d = el("div", { class: "progress", title: "stop → target" });
-    d.append(el("i", { style: `left:calc(${Math.max(0, Math.min(1, r.progress)) * 100}% - 1px)` }));
+    d.append(el("i", { style: "left:" + progressLeft(r) }));
     return d;
   };
   host.append(tableView([
@@ -942,11 +1011,11 @@ function renderOpen(s) {
     { label: "entry (UTC)", nowrap: true, get: (r) => dt(r.entry_ts) },
     { label: "qty", num: true, get: (r) => px(r.qty) }, { label: "entry", num: true, get: (r) => px(r.entry) },
     { label: "stop", num: true, get: (r) => px(r.stop) }, { label: "target", num: true, get: (r) => px(r.target) },
-    { label: "last", num: true, get: (r) => px(r.last) },
-    { label: "unrealized", num: true, get: (r) => signed(r.unrealized, 2) },
-    { label: "R now", num: true, get: (r) => signed(r.r_now, 2, "R") },
+    { label: "last", num: true, key: "last", get: OPEN_LIVE.last },
+    { label: "unrealized", num: true, key: "unrealized", get: OPEN_LIVE.unrealized },
+    { label: "R now", num: true, key: "r_now", get: OPEN_LIVE.r_now },
     { label: "risk", num: true, get: (r) => nf(2).format(r.risk_pct) + "%" },
-    { label: "stop → target", get: prog },
+    { label: "stop → target", key: "progress", get: prog },
     { label: "", get: (r) => controlButton("Close", "small danger", { action: "close", pair: r.pair },
       `Market-sell ${r.pair} (trade #${r.id}) now?`) }], rows));
 }
@@ -1010,13 +1079,14 @@ function renderAll(force) {
     [renderBreakers, [s.breakers, s.capital]],
     [renderEquity, [s.equity_curve, T]],
     [renderPairTabs, [Object.keys(s.pairs), P]],
-    [renderPrice, [s.pairs[P], (live.forming || {})[P], (live.prices || {})[P], s.open_positions, P, T]],
-    [renderOpen, [s.open_positions]],
+    // live prices are NOT in these keys: livePrice / liveOpen update them in place below
+    [renderPrice, [s.pairs[P], ((live.forming || {})[P] || {}).ts, openShape(s.open_positions.filter((p) => p.pair === P)), P, T]],
+    [renderOpen, [openShape(s.open_positions), controlsOn()]],
     [renderR, [s.trades, T]],
     [renderDecisionCounts, [s.decision_counts, T]],
     [renderTrades, [s.trades]],
     [renderDecisions, [s.decisions]],
-    [renderControls, [s.bot && { ...s.bot, heartbeat_age_s: Math.round((s.bot.heartbeat_age_s || 0) / 5) }, s.control, s.meta.mode, s.open_positions.length]],
+    [renderControls, [s.bot && { ...s.bot, heartbeat_age_s: Math.round((s.bot.heartbeat_age_s || 0) / 5) }, s.control, s.meta.mode, s.meta.configured_mode, s.open_positions.length]],
     [renderRules, [s.learning]], [renderLedger, [s.ledger]], [renderLayers, [s.layers, s.bot && s.bot.jobs_running]],
     [renderMarket, [s.market, s.layers && s.layers.collect_status]], [renderDex, [s.market]],
     [renderWallet, [s.wallet]],
@@ -1026,31 +1096,75 @@ function renderAll(force) {
   for (const [fn, inputs] of sections) {
     const key = JSON.stringify(inputs);
     if (!force && state.drawn.get(fn) === key) continue;
+    if (!force && SECTION_HOST.has(fn) && busy(SECTION_HOST.get(fn))) continue;  // redrawn once free
     state.drawn.set(fn, key);
     fn(s);
   }
+  liveOpen(s);
+  livePrice(s);
   const logText = s.log.length ? s.log.join("\n") : "bot.log is empty or missing.";
   const logEl = document.getElementById("log");
   if (logEl.textContent !== logText) logEl.textContent = logText;
 }
 
+// a section is not rebuilt under the pointer (chart tooltips) or while one of its buttons is
+// focused or hovered: the click would land on a node that is being replaced
+const SECTION_HOST = new Map([[renderEquity, "chart-equity"], [renderPrice, "chart-price"], [renderR, "chart-r"],
+  [renderDecisionCounts, "chart-dc"], [renderOpen, "open"], [renderRules, "rules"], [renderLayers, "layers"],
+  [renderTraders, "traders"], [renderLab, "lab-props"]]);
+function busy(id) {
+  const h = document.getElementById(id); if (!h) return false;
+  const a = document.activeElement;  // focus counts for a few seconds after a click / key press
+  if (a && a !== document.body && h.contains(a) && Date.now() - (state.inputAt || 0) < 4000) return true;
+  return h.classList.contains("chart") ? h.matches(":hover") : !!h.querySelector("button:hover");
+}
+function openShape(rows) {  // what changes the open table's rows (not its live prices)
+  return rows.map((p) => [p.id, p.pair, p.entry_ts, p.qty, p.entry, p.stop, p.target, p.risk_pct, p.progress == null]);
+}
+
 // ------------------------------------------------------------------ operator controls
 function controlsOn() { return !EMBEDDED && typeof CONTROL_TOKEN === "string" && CONTROL_TOKEN.length > 0; }
 function toast(msg) { document.getElementById("toast").textContent = msg; }
-async function control(body, confirmText) {
-  if (!controlsOn()) { toast("Controls are off (static export or --read-only)."); return; }
+document.addEventListener("pointerdown", (ev) => { state.clicked = { node: ev.target, at: Date.now() }; state.inputAt = Date.now(); }, true);
+document.addEventListener("keydown", () => { state.inputAt = Date.now(); }, true);
+function localStatusFor(origin) {  // the status line of the card / dialog the user clicked in
+  if (!origin || !origin.closest) return null;
+  const box = origin.closest("dialog, .card");
+  if (!box) return null;
+  let st = box.querySelector(".local-status");
+  if (!st) {
+    const head = box.querySelector(".card-head"); if (!head) return null;
+    st = el("div", { class: "local-status", role: "status", "aria-live": "polite" }); head.after(st);
+  }
+  return st;
+}
+function report(where, msg) {
+  toast(msg);
+  if (!where) return;
+  where.textContent = msg;
+  clearTimeout(where._t); where._t = setTimeout(() => { if (where.textContent === msg) where.textContent = ""; }, 30000);
+}
+async function control(body, confirmText, statusEl) {
+  const recent = state.clicked && Date.now() - state.clicked.at < 3000 ? state.clicked.node : null;
+  const where = statusEl || localStatusFor(recent || document.activeElement);
+  if (!controlsOn()) { report(where, "Controls are off (static export or --read-only)."); return; }
   if (confirmText && !window.confirm(confirmText)) return;
   try {
     if (state.bot && body.bot === undefined && !String(body.action).endsWith("_all") && body.action !== "approve") body = { ...body, bot: state.bot };
+    if (where) where.textContent = "working…";
     const r = await fetch("api/control", { method: "POST", cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Trendbot-Token": CONTROL_TOKEN },
       body: JSON.stringify(body) });
-    const j = await r.json();
-    if (r.status === 409 && j.needs_approval) { openApproval(j); toast("Approval required: see the pop-up."); return j; }
-    toast((j.ok ? "✓ " : "✕ ") + j.message);
+    let j;
+    try { j = await r.json(); } catch (e) { j = { ok: false, message: `the dashboard answered HTTP ${r.status} without a message` }; }
+    if (r.status === 409 && j.needs_approval) { openApproval(j); report(where, "Approval required: see the pop-up."); return j; }
+    report(where, (j.ok ? "✓ " : "✕ ") + j.message);
     setTimeout(refresh, 800);
     return j;
-  } catch (e) { toast("✕ " + e.message); setTimeout(refresh, 800); return { ok: false, message: e.message }; }
+  } catch (e) {
+    const msg = "✕ The dashboard did not answer (" + e.message + "): is it still running?";
+    report(where, msg); setTimeout(refresh, 800); return { ok: false, message: msg };
+  }
 }
 function openApproval(j) {
   const dlg = document.getElementById("approval"), body = clear(document.getElementById("approval-body"));
@@ -1058,7 +1172,7 @@ function openApproval(j) {
   const ul = el("ul");
   for (const b of j.bots) ul.append(el("li", {}, `${b.name}: ${b.mode.toUpperCase()} on ${b.exchange} (${b.pairs.join(", ")})`));
   body.append(el("p", {}, "These bots will start:"), ul);
-  if (j.bots.some((b) => b.mode === "live")) body.append(el("p", { style: "color:var(--critical);font-weight:600" }, "At least one of them trades LIVE with real funds."));
+  if (j.bots.some((b) => b.mode === "live" || b.mode === "wallet")) body.append(el("p", { style: "color:var(--critical);font-weight:600" }, "At least one of them trades LIVE with real funds."));
   body.append(el("p", { class: "muted" }, `This approval expires in ${j.expires_in_s}s and is logged to fleet_approvals.jsonl.`));
   const input = document.getElementById("approval-input");
   input.value = "";
@@ -1071,6 +1185,9 @@ function renderFleet() {
   const f = state.fleet, card = document.getElementById("fleet-card");
   if (!f || !f.fleet) { card.style.display = "none"; return; }
   card.style.display = "";
+  const key = JSON.stringify([f, state.bot, controlsOn()]);  // keep the row buttons between refreshes
+  if (state.fleetKey === key || busy("fleet")) return;
+  state.fleetKey = key;
   document.getElementById("fleet-sub").textContent = `${f.running} of ${f.bots.length} running · max ${f.max_bots} · approval pop-up above ${f.approval_threshold} running`;
   const on = controlsOn();
   const sa = document.getElementById("btn-start-all"), pa = document.getElementById("btn-pause-all"), so = document.getElementById("btn-stop-all");
@@ -1090,7 +1207,7 @@ function renderFleet() {
     { label: "open", num: true, get: (r) => r.open_positions ?? 0 },
     { label: "", get: (r) => { const d = el("span", { style: "display:inline-flex;gap:4px" });
         d.append(controlButton(r.running ? "Stop" : "Start", r.running ? "small" : "small primary", { action: r.running ? "stop" : "start", bot: r.name },
-          r.running ? `Stop ${r.name}?` : (r.mode === "live" ? `Start ${r.name} in LIVE mode?` : null)));
+          r.running ? `Stop ${r.name}?` : realMoneyPrompt(r.configured_mode || r.mode, r.name)));
         const v = el("button", { type: "button", class: "small" }, state.bot === r.name ? "Viewing" : "View");
         v.addEventListener("click", () => { state.bot = r.name; history.replaceState(null, "", "?bot=" + encodeURIComponent(r.name)); refresh(); });
         d.append(v); return d; } }], f.bots);
@@ -1104,13 +1221,19 @@ function controlButton(label, cls, body, confirmText) {
   b.addEventListener("click", () => control(body, confirmText));
   return b;
 }
+function realMoneyPrompt(mode, name) {  // Start in a real-money mode always asks first
+  const who = name ? name : "the bot";
+  if (mode === "live") return `Start ${who} in LIVE mode with real funds?`;
+  if (mode === "wallet") return `Start ${who} in WALLET mode with real funds? You approve every trade in MetaMask / Phantom.`;
+  return null;
+}
 function renderControls(s) {
-  const bot = s.bot, on = controlsOn(), live = s.meta.mode === "live";
+  const bot = s.bot, on = controlsOn(), mode = s.meta.configured_mode || s.meta.mode;
   const st = clear(document.getElementById("bot-status"));
   if (!bot) st.append(status("warning", EMBEDDED ? "Static snapshot: no live status" : "Read-only dashboard"));
-  else if (bot.running) st.append(status("good", `Bot running (pid ${bot.pid ?? "?"}, heartbeat ${bot.heartbeat_age_s ?? "–"}s ago)`));
+  else if (bot.running) st.append(status("good", `Bot running (pid ${bot.pid ?? "?"}, heartbeat ${ago(bot.heartbeat_age_s)})`));
   else if (bot.last_error) st.append(status("critical", `Bot stopped: ${bot.last_error}`));
-  else st.append(status("critical", "Bot stopped" + (bot.heartbeat_age_s ? ` (last heartbeat ${Math.round(bot.heartbeat_age_s)}s ago)` : "")));
+  else st.append(status("critical", "Bot stopped" + (bot.heartbeat_age_s ? ` (last heartbeat ${ago(bot.heartbeat_age_s)})` : "")));
   const paused = !!(s.control && s.control.entries_paused);
   const start = document.getElementById("btn-start"), stop = document.getElementById("btn-stop");
   const pause = document.getElementById("btn-pause"), closeAll = document.getElementById("btn-close-all");
@@ -1119,8 +1242,9 @@ function renderControls(s) {
   stop.disabled = !on || !bot || !bot.running;
   pause.disabled = !on;
   pause.textContent = paused ? "▶ Resume new entries" : "❚❚ Pause new entries";
-  closeAll.disabled = !on || !s.open_positions.length;
-  start.onclick = () => control({ action: "start" }, live ? "Start the bot in LIVE mode with real funds?" : null);
+  closeAll.disabled = !on || !s.open_positions.length || !bot || !bot.running;
+  closeAll.title = bot && !bot.running && s.open_positions.length ? "Only a running bot can sell: start it first (or sell on the exchange)" : "";
+  start.onclick = () => control({ action: "start" }, realMoneyPrompt(mode));
   stop.onclick = () => control({ action: "stop" }, "Stop the bot? Open positions stay open and are managed again on the next start.");
   pause.onclick = () => control({ action: paused ? "resume" : "pause" });
   closeAll.onclick = () => control({ action: "close", pair: "ALL" }, "Market-sell ALL open positions now?");
@@ -1130,19 +1254,19 @@ function renderRules(s) {
   const host = clear(document.getElementById("rules")), L = s.learning || { rules: [] };
   document.getElementById("learn-sub").textContent = L.mode ? `mode ${L.mode} · rules veto entries that already passed R1–R9` : "";
   if (!L.rules.length) { host.append(el("div", { class: "empty" }, "No learned rules yet: a rule needs enough losing trades behind it.")); return; }
-  const kind = { active: "critical", candidate: "warning", rejected: "good", disabled: "good" };
+  const kind = { active: "good", candidate: "warning", rejected: "neutral", disabled: "neutral" };
   host.append(tableView([
     { label: "status", get: (r) => status(kind[r.status] || "warning", r.status) },
     { label: "rule", get: (r) => el("span", {}, r.text) },
     { label: "trades", num: true, get: (r) => r.n },
     { label: "avg R", num: true, get: (r) => signed(r.avg_r, 2, "R") },
-    { label: "why this status", get: (r) => el("span", { class: "secondary" }, r.why + (r.validation ? " · " + r.validation : "")) },
+    { label: "why this status", get: (r) => el("span", { class: "secondary" }, (r.why || "") + (r.validation && r.validation !== r.why ? " · " + r.validation : "")) },
     { label: "", get: (r) => r.status === "active"
       ? controlButton("Disable", "small", { action: "rule", rule_id: r.id, status: "disabled" })
       : r.override ? controlButton("Automatic", "small", { action: "rule", rule_id: r.id, status: null })
       : controlButton("Force on", "small", { action: "rule", rule_id: r.id, status: "active" }) }], L.rules));
 }
-const STATUS_KIND = { active: "critical", rejected: "good", collecting: "warning", unavailable: "warning", disabled: "good", error: "serious" };
+const STATUS_KIND = { active: "good", rejected: "neutral", collecting: "warning", unavailable: "warning", disabled: "neutral", error: "serious" };
 function renderLayers(s) {
   const host = clear(document.getElementById("layers")), L = s.layers || { rows: [] };
   const bot = s.bot || {}, running = bot.jobs_running || [];
@@ -1243,11 +1367,11 @@ function renderBrain(s) {
   const grad = clear(document.getElementById("brain-grad"));
   if ((b.graduation || []).some((g) => g.why !== "no graduation needed")) {
     grad.append(el("div", { class: "subhead" }, "Graduation from paper trading (testnet / live bots trade a pair only after it is proven in paper)"));
-    grad.append(tableView([{ label: "pair", get: (r) => r.pair },
+    grad.append(wrapScroll(tableView([{ label: "pair", get: (r) => r.pair },
       { label: "graduated", get: (r) => el("span", { class: "pill " + (r.graduated ? "ok" : "no") }, r.graduated ? "yes" : "not yet") },
       { label: "paper trades", num: true, get: (r) => r.paper_trades },
       { label: "paper avg R", num: true, get: (r) => signed(r.paper_avg_r, 2, "R") },
-      { label: "why", get: (r) => el("span", { class: "secondary" }, r.why) }], b.graduation));
+      { label: "why", get: (r) => el("span", { class: "secondary" }, r.why) }], b.graduation)));
   }
   const mk = clear(document.getElementById("brain-mistakes"));
   if (!(b.mistakes || []).length) mk.append(el("div", { class: "empty" }, "No mistakes recorded yet."));
@@ -1312,7 +1436,9 @@ function renderConnections() {
     { label: "name", get: (r) => el("strong", {}, r.name) },
     { label: "URL", get: (r) => el("span", { class: "secondary" }, r.url) },
     { label: "token", get: (r) => r.token ? "saved" : "none" },
-    { label: "status", get: (r) => r.tested ? status("good", `${r.tools.length} tools · tested ${r.tested.replace("T", " ").slice(0, 16)}`) : status("warning", "not tested") },
+    { label: "status", get: (r) => !r.tested ? status("warning", "not tested")
+      : r.test_ok === false ? status("critical", `test failed ${r.tested.replace("T", " ").slice(0, 16)}: ${r.test_error || "no reply"}`)
+      : status("good", `${r.tools.length} tools · tested ${r.tested.replace("T", " ").slice(0, 16)}`) },
     { label: "collected hourly", get: (r) => (r.sources || []).map((x) => x.tool).join(", ") || "–" },
     { label: "", get: (r) => { const d = el("span", { style: "display:inline-flex;gap:4px" });
         const t = el("button", { type: "button", class: "small primary" }, "Test");
@@ -1340,7 +1466,7 @@ function openKeys(r) {
       password: document.getElementById("keys-password").value };
     for (const id of ["keys-key", "keys-secret", "keys-password"]) document.getElementById(id).value = "";
     dlg.close();
-    await control(body);
+    await control(body, null, document.getElementById("conn-status"));
     refreshConnections();
   };
   dlg.showModal(); document.getElementById("keys-key").focus();
@@ -1349,6 +1475,7 @@ function openTools(name, tools) {
   const dlg = document.getElementById("tools-dialog");
   document.getElementById("tools-title").textContent = `${name}: ${tools.length} tools`;
   const tryBox = document.getElementById("tools-try"); tryBox.style.display = "none";
+  const tst = document.getElementById("tools-status"); tst.textContent = "";
   const list = clear(document.getElementById("tools-list"));
   const pairs = Object.keys((state.snap || {}).pairs || {});
   const sel = clear(document.getElementById("tools-pair"));
@@ -1358,19 +1485,26 @@ function openTools(name, tools) {
     document.getElementById("tools-try-title").textContent = t.name;
     document.getElementById("tools-args").value = '{"symbol": "{symbol}"}';
     document.getElementById("tools-out").textContent = t.description || "";
-    const args = () => { try { return JSON.parse(document.getElementById("tools-args").value || "{}"); } catch (e) { toast("✕ arguments are not valid JSON"); return null; } };
+    tst.textContent = "";
+    const args = () => {
+      let a;
+      try { a = JSON.parse(document.getElementById("tools-args").value || "{}"); }
+      catch (e) { report(tst, "✕ The arguments are not valid JSON (" + e.message + "). Example: {\"symbol\": \"{symbol}\"}"); return null; }
+      if (a === null || typeof a !== "object" || Array.isArray(a)) { report(tst, "✕ The arguments must be a JSON object, like {\"symbol\": \"{symbol}\"}"); return null; }
+      return a;
+    };
     document.getElementById("tools-run").onclick = async () => {
       const a = args(); if (a === null) return;
       document.getElementById("tools-out").textContent = "calling…";
-      const j = await control({ action: "mcp_call", name, tool: t.name, args: a, pair: sel.value, exchange_id: (state.snap || {meta: {}}).meta.exchange || "binance" });
+      const j = await control({ action: "mcp_call", name, tool: t.name, args: a, pair: sel.value, exchange_id: (state.snap || {meta: {}}).meta.exchange || "binance" }, null, tst);
       document.getElementById("tools-out").textContent = j && j.ok ? (j.text || "(empty reply)") : "✕ " + (j ? j.message : "failed");
     };
     document.getElementById("tools-collect").onclick = async () => {
       const a = args(); if (a === null) return;
-      await control({ action: "mcp_source", name, tool: t.name, args: a, per_pair: document.getElementById("tools-perpair").checked, enabled: true });
+      await control({ action: "mcp_source", name, tool: t.name, args: a, per_pair: document.getElementById("tools-perpair").checked, enabled: true }, null, tst);
       refreshConnections();
     };
-    document.getElementById("tools-uncollect").onclick = async () => { await control({ action: "mcp_source", name, tool: t.name, args: {}, enabled: false }); refreshConnections(); };
+    document.getElementById("tools-uncollect").onclick = async () => { await control({ action: "mcp_source", name, tool: t.name, args: {}, enabled: false }, null, tst); refreshConnections(); };
   };
   list.append(tableView([{ label: "tool", get: (t) => el("strong", {}, t.name) },
     { label: "what it does", get: (t) => el("span", { class: "secondary" }, t.description || "") },
@@ -1384,15 +1518,17 @@ document.getElementById("mcp-preset").addEventListener("change", (ev) => {
   document.getElementById("mcp-url").value = v && presets[v] ? presets[v].url : "";
 });
 document.getElementById("mcp-add").addEventListener("click", async () => {
-  const tok = document.getElementById("mcp-token");
-  const j = await control({ action: "mcp_save", name: document.getElementById("mcp-name").value,
-    url: document.getElementById("mcp-url").value, token: tok.value });
+  const tok = document.getElementById("mcp-token"), st = document.getElementById("conn-status");
+  const name = document.getElementById("mcp-name").value.trim().toLowerCase();
+  const j = await control({ action: "mcp_save", name, url: document.getElementById("mcp-url").value, token: tok.value }, null, st);
   tok.value = "";
   await refreshConnections();
   if (j && j.ok) {
-    const t = await control({ action: "mcp_test", name: document.getElementById("mcp-name").value.trim().toLowerCase() });
+    report(st, `Testing ${name}…`);
+    const t = await control({ action: "mcp_test", name }, null, st);
     await refreshConnections();
-    if (t && t.ok) openTools(document.getElementById("mcp-name").value.trim().toLowerCase(), t.tools);
+    if (t && t.ok) openTools(name, t.tools);
+    else report(st, `✕ ${name} is saved, but the connection test failed: ${t ? t.message : "no answer"}. Check the URL and the token, then press Test.`);
   }
 });
 
@@ -1480,12 +1616,19 @@ function renderRegime(s) {
 }
 
 // ------------------------------------------------------------------ verification agents
-const AGENT_KIND = { pass: "good", warn: "warning", fail: "critical", skip: "warning" };
+const AGENT_KIND = { pass: "good", warn: "warning", fail: "critical", skip: "neutral" };
+function verifyHasData(v) {  // dashboard.verify_has_data: "pass" with nothing checked is not a pass
+  return (v.agents || []).some((a) => a.status !== "skip" &&
+    !(a.agent === "ledger" && Object.values(a.pairs || {}).every((r) => String(r.detail || "").includes(" 0 closed"))));
+}
 function renderVerify(s) {
   const v = s.verify || {}, host = clear(document.getElementById("verify"));
-  document.getElementById("verify-sub").textContent = v.checked_ms ? `overall ${v.overall} · checked ${dt(v.checked_ms)} in ${v.seconds}s` + ((v.blocked_pairs || []).length ? ` · entries blocked: ${v.blocked_pairs.join(", ")}` : "") : "not run yet";
+  const checked = verifyHasData(v);
+  document.getElementById("verify-sub").textContent = !v.checked_ms ? "not run yet"
+    : !checked ? `not run yet: nothing to check (no candles or trades) · tried ${dt(v.checked_ms)}`
+    : `overall ${v.overall} · checked ${dt(v.checked_ms)} in ${v.seconds}s` + ((v.blocked_pairs || []).length ? ` · entries blocked: ${v.blocked_pairs.join(", ")}` : "");
   const b = document.getElementById("btn-verify"); b.disabled = !controlsOn(); b.onclick = () => control({ action: "verify" });
-  if (!(v.agents || []).length) { host.append(el("div", { class: "empty" }, "The agents run every 15 minutes while the bot runs, or press Verify now.")); return; }
+  if (!(v.agents || []).length || !checked) { host.append(el("div", { class: "empty" }, "Nothing checked yet: the agents need cached candles and trades. They run every 15 minutes while the bot runs, or press Verify now.")); return; }
   host.append(tableView([
     { label: "agent", get: (a) => el("strong", {}, a.agent) },
     { label: "result", get: (a) => status(AGENT_KIND[a.status] || "warning", a.status) },
@@ -1499,12 +1642,12 @@ function renderVerify(s) {
 
 // ------------------------------------------------------------------ wallet (MetaMask / Phantom)
 const WALLET = { shown: null, busy: false, ticket: null };
-function metamask() {
+function metamaskProvider() {
   const e = window.ethereum;
   if (!e) return null;
   return (e.providers || []).find((p) => p.isMetaMask) || (e.isMetaMask ? e : null);
 }
-function phantom() {
+function phantomProvider() {
   const p = (window.phantom && window.phantom.solana) || window.solana;
   return p && p.isPhantom ? p : null;
 }
@@ -1528,13 +1671,13 @@ async function walletConnect(kind) {
   if (!controlsOn()) { toast("Controls are off (static export or --read-only)."); return; }
   try {
     if (kind === "metamask") {
-      const p = metamask();
+      const p = metamaskProvider();
       if (!p) { toast("✕ MetaMask is not installed in this browser: add the extension from metamask.io, then reload this page."); return; }
       const accounts = await p.request({ method: "eth_requestAccounts" });
       const chainId = await p.request({ method: "eth_chainId" });
       await control({ action: "wallet_connect", provider: "metamask", address: accounts[0], chain_id: chainId });
     } else {
-      const p = phantom();
+      const p = phantomProvider();
       if (!p) { toast("✕ Phantom is not installed in this browser: add the extension from phantom.com, then reload this page."); return; }
       const r = await p.connect();
       await control({ action: "wallet_connect", provider: "phantom", address: (r.publicKey || p.publicKey).toString() });
@@ -1561,14 +1704,14 @@ async function walletApprove() {
     let sig;
     try {
       if (tx.kind === "solana") {
-        const p = phantom();
+        const p = phantomProvider();
         if (!p) throw new Error("Phantom is not available in this browser");
         if (!p.isConnected) await p.connect();
         walletStep("Confirm the swap in Phantom…");
         const res = await p.request({ method: "signAndSendTransaction", params: { message: b58encode(b64decode(tx.tx)) } });
         sig = (res && res.signature) || res;
       } else {
-        const p = metamask();
+        const p = metamaskProvider();
         if (!p) throw new Error("MetaMask is not available in this browser");
         const cur = await p.request({ method: "eth_chainId" });
         if (parseInt(cur, 16) !== parseInt(tx.chain_id, 16)) {
@@ -1601,8 +1744,8 @@ function openTicket(t) {
   const d = clear(document.getElementById("wallet-ticket"));
   const verb = t.side === "buy" ? "BUY" : "SELL";
   d.append(el("p", {}, `${verb} ${t.pair} on ${t.chain_name} with ${t.provider === "phantom" ? "Phantom" : "MetaMask"}:`));
-  d.append(el("p", {}, el("strong", {}, `${nf(6).format(t.amount_in)} ${t.token_in.symbol} → about ${nf(6).format(t.est_out)} ${t.token_out.symbol}`)));
-  d.append(el("p", { class: "muted" }, `slippage limit ${t.slippage_bps / 100}% · ${t.token_out.symbol} token ${shortAddr(t.token_out.address)} · from ${shortAddr(t.address)}`));
+  const what = el("p"); what.append(el("strong", {}, `${nf(6).format(t.amount_in)} ${t.token_in.symbol} → about ${nf(6).format(t.est_out)} ${t.token_out.symbol}`)); d.append(what);
+  d.append(el("p", { class: "muted" }, `slippage limit ${t.slippage_bps / 100}% · ${t.token_out.symbol} ${t.token_out.native ? "(the network coin)" : "token " + shortAddr(t.token_out.address)} · from ${shortAddr(t.address)}`));
   d.append(el("p", { class: "muted", id: "wallet-left" }, `waits ${t.seconds_left}s for you, then the bot ${t.side === "sell" ? "asks again" : "skips this entry"}`));
   walletStep(t.status === "pending" ? "" : t.status === "approved" ? "Approved: finish it in your wallet." : "Sent: confirming on chain…");
   const dlg = document.getElementById("wallet-dialog");
@@ -1684,6 +1827,11 @@ const VOICE = (() => {
   const btns = () => [document.getElementById("voice-btn"), document.getElementById("voice-btn2")];
   const wake = /^\s*(hey\s+)?(jarvis|chantisimo|chanti\w*)[,.!\s]*/i;
   let rec = null, listening = false, handsFree = false, voice = null;
+  const FATAL = {
+    "not-allowed": "the microphone is blocked for this page. Allow it in the browser's site settings (the icon left of the address), then tick hands-free again.",
+    "service-not-allowed": "the browser does not allow speech recognition here (it needs Chrome or Edge, online).",
+    "audio-capture": "no microphone was found. Plug one in, then tick hands-free again.",
+  };
   const speakOn = () => document.getElementById("voice-speak").checked;
   function pickVoice() {
     const vs = (window.speechSynthesis && speechSynthesis.getVoices()) || [];
@@ -1717,7 +1865,13 @@ const VOICE = (() => {
     if (listening) { rec && rec.stop(); return; }
     rec = new SR(); rec.lang = navigator.language || "en-US"; rec.interimResults = true; rec.continuous = continuous;
     rec.onresult = (ev) => { for (let i = ev.resultIndex; i < ev.results.length; i++) handle(ev.results[i][0].transcript, ev.results[i].isFinal); };
-    rec.onerror = (ev) => { heard().textContent = "voice: " + ev.error + (ev.error === "not-allowed" ? " (allow the microphone for this page)" : ""); };
+    rec.onerror = (ev) => {
+      const why = FATAL[ev.error];
+      if (!why) { heard().textContent = "voice: " + ev.error; return; }
+      handsFree = false; document.getElementById("voice-hands").checked = false;  // retrying cannot help
+      heard().textContent = "voice off: " + why;
+      termLine("sys", "Voice is off: " + why);
+    };
     rec.onend = () => { listening = false; mark("listening", false); if (handsFree) setTimeout(() => start(true), 300); };
     try { rec.start(); listening = true; mark("listening", true); if (window.speechSynthesis) speechSynthesis.cancel(); }
     catch (e) { heard().textContent = "voice: " + e.message; }
@@ -1848,12 +2002,18 @@ for (const b of document.querySelectorAll("button[data-table]")) {
     renderAll(true);
   });
 }
-document.getElementById("theme").addEventListener("click", (ev) => {
-  const order = ["jarvis", "auto", "light", "dark"], next = order[(order.indexOf(state.theme) + 1) % order.length];
-  state.theme = next;
-  if (next === "auto") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.setAttribute("data-theme", next);
-  ev.currentTarget.textContent = "Theme: " + next;
+const THEMES = ["jarvis", "auto", "light", "dark"];
+function applyTheme(name) {
+  state.theme = THEMES.includes(name) ? name : "jarvis";
+  if (state.theme === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", state.theme);
+  document.getElementById("theme").textContent = "Theme: " + state.theme;
+}
+try { applyTheme(localStorage.getItem("trendbot.theme") || "jarvis"); } catch (e) { applyTheme("jarvis"); }
+document.getElementById("theme").addEventListener("click", () => {
+  applyTheme(THEMES[(THEMES.indexOf(state.theme) + 1) % THEMES.length]);
+  try { localStorage.setItem("trendbot.theme", state.theme); } catch (e) { /* private mode: not remembered */ }
+  renderAll(true);
 });
 let resizeTimer = null;
 window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => renderAll(true), 150); });

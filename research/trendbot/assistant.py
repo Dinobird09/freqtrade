@@ -66,27 +66,36 @@ COIN_NAMES = {
     "trx": "TRX",
 }
 
-HELP = """Things you can type (plain words are fine):
-  status                       how the bot is doing right now
-  earnings [today|yesterday|week|month|all]   profit and loss (add "all bots" in a fleet)
-  positions                    open trades with their unrealized P&L
-  trades                       the last closed trades
-  start day / end day          start trading (bot on, entries open) / stop new entries and
-                               get the day's summary ("end day and close all" also sells)
-  execute trade BTC            take BTC's next signal that passes all nine rules
-  close BTC / close all        market-sell a position (asks you to confirm)
-  why BTC                      the latest decision on BTC and its reason
-  brain                        what Chantisimo has learned: mistakes, graduation
-  traders / follow <name>      smart money: other traders ranked; follow = copy their buys
-  pause / resume               new entries off / on (exits always keep running)
-  start bot / stop bot         the bot process
-  bots / use <bot name>        the fleet, and which bot the terminal talks to
-  regime                       the market regime (HMM) and its exposure cap
-  scan                         today's movers: +10%, 5x volume, catalyst, float < 10M
-  lab                          the strategy lab: NNFX, Sneaky Pivot, Fib/FVG research
-  verify                       run the verification agents on the charts and the ledger
-  retrain / collect            the weekly retrain / hourly data job, now
-  help / pull out commands     this list"""
+HELP_ITEMS = (  # one command per line, then what it does: readable on a phone too
+    ("status", "how the bot is doing right now"),
+    ("earnings [today|yesterday|week|month|all]", 'profit and loss (add "all bots" in a fleet)'),
+    ("positions", "open trades with their unrealized P&L"),
+    ("trades", "the last closed trades"),
+    (
+        "start day / end day",
+        "start trading (bot on, entries open) / stop new entries and get the day's summary "
+        '("end day and close all" also sells)',
+    ),
+    ("execute trade BTC", "take BTC's next signal that passes all nine rules (bot running)"),
+    ("close BTC / close all", "market-sell a position (asks you to confirm)"),
+    ("why BTC", "the latest decision on BTC and its reason"),
+    ("brain", "what Chantisimo has learned: mistakes, graduation"),
+    ("traders / follow <name>", "smart money: other traders ranked; follow = copy their buys"),
+    ("pause / resume", "new entries off / on (exits always keep running)"),
+    ("start bot / stop bot", 'the bot process ("stop" alone also stops it)'),
+    ("bots / use <bot name>", "the fleet, and which bot the terminal talks to"),
+    ("regime", "the market regime (HMM) and its exposure cap"),
+    ("scan", "today's movers: +10%, 5x volume, catalyst, float < 10M"),
+    ("lab", "the strategy lab: NNFX, Sneaky Pivot, Fib/FVG research"),
+    ("verify", "run the verification agents on the charts and the ledger"),
+    ("retrain / collect", "the weekly retrain / hourly data job, now"),
+    ("help / pull out commands", "this list"),
+)
+HELP = "Things you can type (plain words are fine):\n" + "\n".join(
+    f"• {cmd}\n    {what}" for cmd, what in HELP_ITEMS
+)
+START_WAIT_S = 2.5  # after Start: a bot that dies this fast is reported, not "started"
+REAL_MONEY_MODES = ("live", "wallet")
 
 
 # ---------------------------------------------------------------------- replies
@@ -179,9 +188,11 @@ class Terminal:
         runtime: Any,
         *,
         now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+        start_wait_s: float = START_WAIT_S,
     ) -> None:
         self.rt = runtime
         self.now_ms = now_ms
+        self.start_wait_s = start_wait_s
         self.pending: dict[str, Any] | None = None
         self._snaps: dict[str, dict[str, Any]] = {}
 
@@ -245,7 +256,30 @@ class Terminal:
         self._snaps.clear()  # the action changed the state
         if code == 409 and body.get("needs_approval"):
             return False, body.get("message", "approval needed"), body
-        return bool(body.get("ok")), str(body.get("message", "")), None
+        msg = str(body.get("message", ""))
+        bot = req.get("bot")
+        if bot and msg.startswith(f"{bot}: "):  # the fleet's "name: message" form
+            msg = msg[len(bot) + 2 :]
+        return bool(body.get("ok")), msg, None
+
+    def _running(self, bot: str) -> bool:
+        return bool((self._snap(bot).get("bot") or {}).get("running"))
+
+    def _start_and_check(self, bot: str) -> tuple[bool, str, dict[str, Any] | None]:
+        """Start the bot, then watch it for a moment: one that exits at once is a failure."""
+        ok, msg, approval = self._act({"action": "start", "bot": bot})
+        ctrl = self.rt.entries[bot][2]
+        if not ok or approval or ctrl is None:
+            return ok, msg, approval
+        deadline = time.monotonic() + self.start_wait_s
+        while True:
+            st = ctrl.bot_status()
+            if not st.get("running"):
+                why = st.get("last_error") or "it exited at once (see bot.stderr.log)"
+                return False, f"the bot stopped right after starting: {why}", None
+            if time.monotonic() >= deadline:
+                return ok, msg, None
+            time.sleep(min(0.25, self.start_wait_s))
 
     # -------------------------------------------------------------- entry point
     def handle(self, text: str, bot: str | None = None) -> dict[str, Any]:
@@ -340,7 +374,14 @@ class Terminal:
             return "stop_all", {}
         if has("(start|run|launch|turn on) (the )?bot"):
             return "start_bot", {}
-        if has("(stop|shut ?down|kill|turn off) (the )?bot"):
+        if has("(stop|shut ?down|kill|turn off) (the )?bot") or t in (
+            "stop",
+            "stop it",
+            "stop now",
+            "shutdown",
+            "shut down",
+            "quit",
+        ):
             return "stop_bot", {}
         if has(
             "why",
@@ -727,7 +768,11 @@ class Terminal:
         except TraderError as exc:
             return Reply(str(exc))
         refresh()
-        return Reply(msg + ". Their buys on this bot's pairs now arm the pair (rules still apply).")
+        if args.get("follow", True):
+            return Reply(
+                msg + ". Their buys on this bot's pairs now arm the pair (rules still apply)."
+            )
+        return Reply(msg + ". Their buys no longer arm any pair.")
 
     def tool_brain(self, args: dict[str, Any], bot: str) -> Reply:
         b = self._snap(bot).get("brain") or {}
@@ -777,14 +822,20 @@ class Terminal:
         return getattr(self, f"do_{p['tool']}")(p["args"], p["bot"])
 
     def _mode(self, bot: str) -> str:
-        return str(self._snap(bot)["meta"].get("mode"))
+        """The mode Start runs: bot.json's, else what the last run recorded."""
+        meta = self._snap(bot)["meta"]
+        return str(meta.get("configured_mode") or meta.get("mode"))
+
+    def _real_money(self, bot: str) -> str:
+        mode = self._mode(bot)
+        if mode == "wallet":
+            return "WALLET mode with real funds (you approve each trade in the wallet)"
+        return "LIVE mode with real funds"
 
     def tool_start_day(self, args: dict[str, Any], bot: str) -> Reply:
-        if self._mode(bot) in ("live", "wallet") and not (self._snap(bot).get("bot") or {}).get(
-            "running"
-        ):
+        if self._mode(bot) in REAL_MONEY_MODES and not self._running(bot):
             return self._prepare(
-                "start_day", args, bot, f"Start the day on {bot} in LIVE mode with real funds?"
+                "start_day", args, bot, f"Start the day on {bot} in {self._real_money(bot)}?"
             )
         return self.do_start_day(args, bot)
 
@@ -792,21 +843,27 @@ class Terminal:
         from .live_bot import write_control
 
         msgs, approval = [], None
-        if not (self._snap(bot).get("bot") or {}).get("running"):
-            ok, msg, approval = self._act({"action": "start", "bot": bot})
-            msgs.append(msg if ok or approval else f"could not start the bot: {msg}")
+        if not self._running(bot):
+            ok, msg, approval = self._start_and_check(bot)
+            if not ok and not approval:
+                return Reply(f"Could not start the day on {bot}: {msg}")
+            msgs.append(msg)
         ok, msg, _ = self._act({"action": "resume", "bot": bot})
         msgs.append(msg)
         write_control(self._dir(bot), day_started_ms=self.now_ms())
+        done = "; ".join(m for m in msgs if m)
+        who = f"{bot}: " if self.rt.is_fleet else ""
         text = (
-            f"Good morning. {bot}: "
-            + "; ".join(m for m in msgs if m)
-            + f". Next 4H close {self._next_close()}."
+            f"Good morning. {who}{done[:1].upper()}{done[1:]}. Next 4H close {self._next_close()}."
         )
         return Reply(text, approval=approval)
 
     def tool_end_day(self, args: dict[str, Any], bot: str) -> Reply:
-        if args.get("close_positions") and self._snap(bot).get("open_positions"):
+        if (
+            args.get("close_positions")
+            and self._snap(bot).get("open_positions")
+            and self._running(bot)
+        ):
             n = len(self._snap(bot)["open_positions"])
             return self._prepare(
                 "end_day",
@@ -851,17 +908,21 @@ class Terminal:
         return Reply(text, data={"day": e})
 
     def tool_start_bot(self, args: dict[str, Any], bot: str) -> Reply:
-        if self._mode(bot) in ("live", "wallet"):
-            return self._prepare(
-                "start_bot", args, bot, f"Start {bot} in LIVE mode with real funds?"
-            )
+        if self._running(bot):
+            return Reply(f"{bot} is already running.")
+        if self._mode(bot) in REAL_MONEY_MODES:
+            return self._prepare("start_bot", args, bot, f"Start {bot} in {self._real_money(bot)}?")
         return self.do_start_bot(args, bot)
 
     def do_start_bot(self, args: dict[str, Any], bot: str) -> Reply:
-        _, msg, approval = self._act({"action": "start", "bot": bot})
+        ok, msg, approval = self._start_and_check(bot)
+        if not ok and not approval:
+            return Reply(f"Could not start {bot}: {msg}")
         return Reply(msg, approval=approval)
 
     def tool_stop_bot(self, args: dict[str, Any], bot: str) -> Reply:
+        if not self._running(bot):
+            return Reply(f"{bot} is not running: there is nothing to stop.")
         return self._prepare(
             "stop_bot",
             args,
@@ -1012,6 +1073,12 @@ class Terminal:
             return Reply("Which one? Open: " + ", ".join(sorted(opn)) + " (or say close all).")
         if pair != "ALL" and pair not in opn:
             return Reply(f"There is no open {pair} position. Open: {', '.join(sorted(opn))}.")
+        if not self._running(bot):
+            return Reply(
+                f"{bot} is not running, so it cannot sell now: only a running bot sends the "
+                "sell order. Type start bot (it manages the open positions again at once), or "
+                "sell on the exchange yourself."
+            )
         q = self._quote(bot)
         if pair == "ALL":
             unreal = sum(p.get("unrealized") or 0 for p in opn.values())
@@ -1040,6 +1107,11 @@ class Terminal:
         snap = self._snap(bot)
         if pair in {p["pair"] for p in snap.get("open_positions") or []}:
             return Reply(f"{bot} already holds {pair}: one position per pair.")
+        if not self._running(bot):
+            return Reply(
+                f"{bot} is not running: only a running bot can take {pair}'s next signal. "
+                "Type start bot (or start day) first, then execute trade again."
+            )
         latest = self._latest_decisions(bot).get(pair)
         last = (
             f" Its latest check: {'allowed' if latest.allowed else 'denied'} "

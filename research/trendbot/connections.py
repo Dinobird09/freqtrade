@@ -53,6 +53,47 @@ class ConnectionSetupError(ValueError):
     """A connection could not be saved or used; the message is safe to show."""
 
 
+_PLAIN = (  # (substring of the lower-cased error, the sentence shown instead)
+    (
+        "tunnel connection failed",
+        "a proxy or firewall on this network blocked the connection",
+    ),
+    ("certificate verify failed", "the server's security certificate could not be verified"),
+    ("timed out", "the server did not answer in time"),
+    ("name or service not known", "the server name could not be found: check the address"),
+    ("nodename nor servname", "the server name could not be found: check the address"),
+    ("getaddrinfo failed", "the server name could not be found: check the address"),
+    ("temporary failure in name resolution", "no internet connection (name lookup failed)"),
+    ("network is unreachable", "no internet connection"),
+    ("connection refused", "the server refused the connection: is it running?"),
+    ("connection reset", "the connection was cut off: try again"),
+    ("remote end closed connection", "the connection was cut off: try again"),
+)
+
+
+def plain_error(exc: BaseException | str) -> str:
+    """A network or library error as a plain sentence, e.g. ``<urlopen error Tunnel
+    connection failed: 403 Forbidden>`` -> "a proxy or firewall on this network blocked
+    the connection (403 Forbidden)"."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"the server answered HTTP {exc.code} ({exc.reason})"
+    if isinstance(exc, TimeoutError):
+        return "the server did not answer in time"
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    text = re.sub(r"^<urlopen error (.*)>$", r"\1", str(reason).strip(), flags=re.S)
+    low = text.lower()
+    for needle, sentence in _PLAIN:
+        if needle in low:
+            m = re.search(r"\b([45]\d\d) ([A-Za-z][A-Za-z ]{2,30})", text)
+            return sentence + (f" ({m.group(1)} {m.group(2).strip()})" if m else "")
+    kind = type(exc).__name__ if isinstance(exc, BaseException) else ""
+    if kind in ("AuthenticationError", "PermissionDenied"):
+        return f"the exchange rejected the API keys ({text[:200]})"
+    if kind in ("NetworkError", "RequestTimeout", "ExchangeNotAvailable", "DDoSProtection"):
+        return f"the exchange could not be reached ({text[:200]})"
+    return text[:300] or kind or "unknown error"
+
+
 # ---------------------------------------------------------------------- .env handling
 def env_path() -> Path:
     return Path(os.environ.get("TRENDBOT_ENV_FILE") or ".env")
@@ -194,7 +235,7 @@ def test_exchange(exchange: str, account: str, ccxt_module: Any = None) -> str:
         bal = ex.fetch_balance()
     except Exception as exc:  # ccxt raises many types; show the message, never the keys
         raise ConnectionSetupError(
-            f"{exchange} {account} login failed: {type(exc).__name__}: {exc}"
+            f"{exchange} {account} login failed: {plain_error(exc)}"
         ) from exc
     free = {c: v for c, v in (bal.get("free") or {}).items() if v}
     shown = ", ".join(f"{c} {v:g}" for c, v in sorted(free.items())[:6]) or "no free balance"
@@ -245,7 +286,9 @@ class McpClient:
                 ) from exc
             raise ConnectionSetupError(f"HTTP {exc.code} from the MCP server") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ConnectionSetupError(f"could not reach the MCP server: {exc}") from exc
+            raise ConnectionSetupError(
+                f"could not reach the MCP server: {plain_error(exc)}"
+            ) from exc
         if "id" not in payload:
             return None  # a notification: no reply expected
         msg = _pick_reply(body, ctype, payload["id"])
@@ -384,8 +427,21 @@ def client_for(name: str, path: Path | None = None) -> McpClient:
 
 
 def test_mcp(name: str, path: Path | None = None) -> dict[str, Any]:
-    c = client_for(name, path)
-    tools = c.list_tools()
+    try:
+        c = client_for(name, path)
+        tools = c.list_tools()
+    except ConnectionSetupError as exc:  # remembered, so the card says the test failed
+        data = load_connections(path)
+        entry = data["mcp"].get(_check_name(name))
+        if entry is not None:
+            entry["last_test"] = {
+                **(entry.get("last_test") or {}),
+                "ok": False,
+                "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "error": str(exc),
+            }
+            save_connections(data, path)
+        raise
     data = load_connections(path)
     entry = data["mcp"][_check_name(name)]
     entry["last_test"] = {
@@ -541,6 +597,8 @@ def status() -> dict[str, Any]:
                 "token_env": e.get("token_env") or token_env(name),
                 "sources": e.get("sources", []),
                 "tested": lt.get("when"),
+                "test_ok": lt.get("ok") if lt else None,
+                "test_error": lt.get("error"),
                 "server": lt.get("server"),
                 "tools": lt.get("tools", []),
             }

@@ -230,6 +230,7 @@ def test_controls_need_the_token_and_write_request_files(state_dir):
         assert code == 200 and body["ok"] and read_control(state_dir)["entries_paused"] is True
         assert post({"action": "resume"})[0] == 200
         assert read_control(state_dir)["entries_paused"] is False
+        _beat(state_dir)  # a running bot: stop / close / rule are requests it reads
         assert post({"action": "close", "pair": "ETH/USDT"})[0] == 200
         assert post({"action": "stop"})[0] == 200
         assert post({"action": "rule", "rule_id": "L1", "status": "disabled"})[0] == 200
@@ -238,6 +239,7 @@ def test_controls_need_the_token_and_write_request_files(state_dir):
         reqs = [r for _, r in pop_requests(state_dir)]
         assert [r["action"] for r in reqs] == ["close", "stop", "rule"]
         assert reqs[0]["pair"] == "ETH/USDT"
+        (state_dir / "heartbeat.json").unlink()
         with urllib.request.urlopen(base + "/") as r:
             assert 'const CONTROL_TOKEN = "tok"' in r.read().decode()
         with urllib.request.urlopen(base + "/api/snapshot") as r:
@@ -246,6 +248,14 @@ def test_controls_need_the_token_and_write_request_files(state_dir):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def _beat(d, pid=None, age_s=0.0, status="running"):
+    import os
+    import time
+
+    beat = {"pid": pid or os.getpid(), "wall_ts": int((time.time() - age_s) * 1000)}
+    (d / "heartbeat.json").write_text(json.dumps({**beat, "status": status}))
 
 
 def test_export_never_contains_a_control_token(state_dir):
@@ -307,3 +317,37 @@ def test_the_dashboard_shows_why_the_bot_stopped(tmp_path, monkeypatch):
     ctrl._start()
     ctrl.proc.wait(timeout=30)
     assert ctrl.bot_status()["last_error"] is None  # a clean exit is not an error
+
+
+def test_market_pages_are_served_without_the_token(state_dir):
+    from http.server import ThreadingHTTPServer
+
+    from research.trendbot.dashboard import Controller
+
+    ctl = Controller(state_dir, None)
+    srv = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(state_dir, StrategyConfig(), 15, ctl, "secret-tok")
+    )
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        for path in ("/market", "/market/"):
+            with urllib.request.urlopen(base + path) as r:
+                body, headers = r.read().decode(), r.headers
+            assert r.status == 200 and "Market terminal" in body and "secret-tok" not in body
+            assert (
+                "https://api.binance.com"
+                in headers["Content-Security-Policy"].split("connect-src", 1)[1].split(";")[0]
+            )
+            assert headers["X-Frame-Options"] == "DENY"
+            assert headers["X-Content-Type-Options"] == "nosniff"
+        with urllib.request.urlopen(base + "/market/tv") as r:
+            assert r.status == 200 and r.headers.get("X-Frame-Options") is None
+            assert "secret-tok" not in r.read().decode()
+            assert "frame-ancestors http://127.0.0.1:*" in r.headers["Content-Security-Policy"]
+        with urllib.request.urlopen(base + "/") as r:  # the dashboard keeps its strict policy
+            assert r.headers["X-Frame-Options"] == "DENY"
+            assert "connect-src 'self';" in r.headers["Content-Security-Policy"]
+    finally:
+        srv.shutdown()
+        srv.server_close()

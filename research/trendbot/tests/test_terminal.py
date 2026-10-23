@@ -74,7 +74,7 @@ def term(tmp_path):
     )
     ctrl = FakeCtrl(d)
     rt = FleetRuntime(None, {"bot": (d, None, ctrl)})
-    return Terminal(rt, now_ms=lambda: NOW), ctrl, d
+    return Terminal(rt, now_ms=lambda: NOW, start_wait_s=0), ctrl, d
 
 
 def test_help_and_pull_out_commands(term):
@@ -125,6 +125,7 @@ def test_start_day_and_end_day(term):
 
 def test_risky_actions_wait_for_yes(term):
     t, ctrl, _ = term
+    ctrl.running = True
     r = t.handle("close eth")
     assert r["confirm"] and "Market-sell the ETH/USDT position" in r["text"]
     assert t.handle("no")["text"].startswith("Cancelled")
@@ -141,7 +142,8 @@ def test_risky_actions_wait_for_yes(term):
 
 
 def test_execute_trade_arms_only_when_entries_are_paused(term):
-    t, _, d = term
+    t, ctrl, d = term
+    ctrl.running = True
     r = t.handle("execute trade BTC")
     assert "Entries are open" in r["text"] and "R2_momentum" in r["text"]
     write_control(d, entries_paused=True)

@@ -18,10 +18,12 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import logging
 import math
 import os
 import secrets
 import subprocess
+import threading
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -42,6 +44,7 @@ from .models import DAY_MS, Candle, Trade
 
 HTML_PATH = Path(__file__).with_name("dashboard.html")
 SNAPSHOT_TOKEN = "/*__SNAPSHOT__*/null"  # noqa: S105 - template marker
+log = logging.getLogger("trendbot.dashboard")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -540,14 +543,49 @@ def _ledger_view(d: Path, tail: int) -> list[dict[str, Any]]:
     return list(reversed(rows[-tail:]))
 
 
-def _html_template() -> str:
-    """The page, read as package data so it also works inside the single-file build."""
+def _html_template(name: str = "dashboard.html") -> str:
+    """A page, read as package data so it also works inside the single-file build."""
     try:
         from importlib.resources import files
 
-        return files(__package__).joinpath("dashboard.html").read_text(encoding="utf-8")
+        return files(__package__).joinpath(name).read_text(encoding="utf-8")
     except (FileNotFoundError, ModuleNotFoundError, TypeError):
-        return HTML_PATH.read_text(encoding="utf-8")
+        return HTML_PATH.with_name(name).read_text(encoding="utf-8")
+
+
+DASHBOARD_CSP = (
+    "default-src 'none'; script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
+)
+# the market terminal pages (no token, no controls): public exchange feeds / TradingView
+MARKET_PAGES: dict[str, tuple[str, dict[str, str]]] = {
+    "/market": (
+        "market.html",
+        {
+            "X-Frame-Options": "DENY",
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                "img-src 'self' data:; connect-src 'self' https://api.binance.com "
+                "https://data-api.binance.vision https://api.binance.us "
+                "https://api.exchange.coinbase.com wss://stream.binance.com:9443 "
+                "wss://data-stream.binance.vision wss://stream.binance.us:9443 "
+                "wss://ws-feed.exchange.coinbase.com; "
+                "frame-src http://127.0.0.1:* http://localhost:*; frame-ancestors 'none'"
+            ),
+        },
+    ),
+    "/market/tv": (
+        "market_tv.html",
+        {
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'unsafe-inline' https://s3.tradingview.com "
+                "https://*.tradingview.com; style-src 'unsafe-inline' https:; "
+                "img-src https: data:; font-src https: data:; connect-src https: wss:; "
+                "frame-src https:; frame-ancestors http://127.0.0.1:* http://localhost:*"
+            ),
+        },
+    ),
+}
 
 
 def render_html(snapshot: dict[str, Any] | None, refresh_s: int, token: str | None = None) -> str:
@@ -558,12 +596,40 @@ def render_html(snapshot: dict[str, Any] | None, refresh_s: int, token: str | No
     return html.replace('"__CONTROL_TOKEN__"', json.dumps(token))
 
 
+STILL_ACTIVE = 259  # GetExitCodeProcess: the process has not exited
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_ACCESS_DENIED = 5
+
+
+def _pid_alive_windows(pid: int, kernel32: Any = None) -> bool:
+    """OpenProcess + GetExitCodeProcess: True while ``pid`` runs (Windows)."""
+    import ctypes
+
+    if kernel32 is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:  # no such process, or one we may not open (it exists, so it runs)
+        get_err = getattr(ctypes, "get_last_error", None)
+        err = get_err() if get_err else 0
+        return err == _ERROR_ACCESS_DENIED or kernel32.GetLastError() == _ERROR_ACCESS_DENIED
+    try:
+        code = ctypes.c_ulong(0)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True  # cannot tell: trust the fresh heartbeat
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_alive(pid: Any) -> bool:
-    """True if ``pid`` is a live process (POSIX); on Windows trust the fresh heartbeat."""
+    """True if ``pid`` is a live process (POSIX: signal 0; Windows: its exit code)."""
     if not isinstance(pid, int) or pid <= 0:
         return False
     if os.name == "nt":
-        return True
+        try:
+            return _pid_alive_windows(pid)
+        except (OSError, AttributeError):
+            return True  # no kernel32 access: trust the fresh heartbeat
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -571,6 +637,38 @@ def _pid_alive(pid: Any) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _read_json_safe(path: Path) -> dict[str, Any]:
+    try:
+        raw = _read_json(path)
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _detached_kwargs(nt: bool | None = None) -> dict[str, Any]:
+    """Popen options so the bot keeps running when the dashboard (or its console) closes."""
+    if os.name == "nt" if nt is None else nt:
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )  # no console of its own: closing the dashboard's window does not kill it
+        return {"creationflags": flags}
+    return {"start_new_session": True}
+
+
+def verify_has_data(st: Mapping[str, Any]) -> bool:
+    """False when the verification agents had nothing to check (a brand-new install)."""
+    for a in st.get("agents") or []:
+        if a.get("status") == "skip":
+            continue
+        pairs = a.get("pairs") or {}
+        if a.get("agent") == "ledger" and all(
+            " 0 closed" in str(r.get("detail", "")) for r in pairs.values()
+        ):
+            continue  # "0 closed trades all match" checks nothing yet
+        return True
+    return False
 
 
 class Controller:
@@ -584,6 +682,8 @@ class Controller:
         self.jobs: dict[str, subprocess.Popen[bytes]] = {}
         self.poll_s = 10.0
         self._settings: tuple[float, Any] | None = None
+        self._exited_ms: float | None = None  # when the bot we started was seen to exit
+        self._lock = threading.Lock()  # one Start at a time: never two bots on one state dir
         if settings_path is not None:
             self.poll_s = self.settings().poll_seconds
 
@@ -600,9 +700,16 @@ class Controller:
 
     def bot_status(self) -> dict[str, Any]:
         beat = _read_json(self.dir / "heartbeat.json")
-        age_s = (time.time() * 1000 - beat.get("wall_ts", 0)) / 1000 if beat else None
+        now_ms = time.time() * 1000
+        age_s = (now_ms - beat.get("wall_ts", 0)) / 1000 if beat else None
         alive = self.proc is not None and self.proc.poll() is None
         fresh = age_s is not None and age_s <= max(90.0, 3 * self.poll_s + 30)
+        if self.proc is not None and not alive:
+            # the bot we started has exited: its last heartbeat still looks fresh for up to
+            # 90 s (and on Windows proc.pid is the venv launcher, not the heartbeat's pid), so
+            # only a heartbeat written after we saw it exit is another, newer bot
+            self._exited_ms = self._exited_ms or now_ms
+            fresh = fresh and beat.get("wall_ts", 0) > self._exited_ms
         running = alive or (
             fresh and beat.get("status") == "running" and _pid_alive(beat.get("pid"))
         )
@@ -629,6 +736,8 @@ class Controller:
         if action == "start":
             return self._start()
         if action == "stop":
+            if not self.bot_status()["running"]:
+                return False, "the bot is not running"
             post_request(self.dir, action="stop")
             return True, "stop requested: the bot finishes its current step and exits"
         if action in ("pause", "resume"):
@@ -640,6 +749,13 @@ class Controller:
             )
         if action == "close":
             pair = str(req.get("pair") or "ALL")
+            if not self.bot_status()["running"]:
+                what = "all positions" if pair == "ALL" else pair
+                return False, (
+                    f"the bot is not running, so {what} cannot be closed now: only a running "
+                    "bot sends the sell order. Start the bot (it manages open positions again "
+                    "at once), or sell on the exchange yourself"
+                )
             post_request(self.dir, action="close", pair=pair)
             return True, f"close requested for {pair}: market sell at the next bot step"
         if action == "verify":
@@ -655,6 +771,8 @@ class Controller:
                     self.dir,
                     config_from_overrides({"exchange_id": state.get("exchange", "binance")}),
                 )
+            if not verify_has_data(st):
+                return True, "verification: nothing to check yet (no candles or trades)"
             bad = [a["agent"] for a in st["agents"] if a["status"] == "fail"]
             return True, f"verification {st['overall']}" + (
                 f": {', '.join(bad)} failed" if bad else ""
@@ -679,8 +797,11 @@ class Controller:
                 "money after 30 days of paper incubation"
             )
         if action == "scan":
-            import ccxt
-
+            try:
+                import ccxt
+            except ImportError:
+                return False, "ccxt is not installed: pip install ccxt"
+            from .connections import plain_error
             from .live_bot import BotSettings
             from .scanner import ScannerSettings, scan
 
@@ -690,10 +811,13 @@ class Controller:
                 if settings
                 else _read_json(self.dir / "state.json").get("exchange", "binance")
             )
-            ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
-            res = scan(
-                ex, self.dir, ScannerSettings(**((settings.scanner if settings else {}) or {}))
-            )
+            try:
+                ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
+                res = scan(
+                    ex, self.dir, ScannerSettings(**((settings.scanner if settings else {}) or {}))
+                )
+            except Exception as exc:  # ccxt raises many types: network, exchange, rate limit
+                return False, f"the scan could not read {ex_id}'s tickers: {plain_error(exc)}"
             return (
                 True,
                 f"scanned {res['tickers']} tickers: {len(res['passing'])} pass every filter",
@@ -716,11 +840,43 @@ class Controller:
             status = req.get("status")
             if status not in ("active", "disabled", None):
                 return False, "rule status must be active, disabled or null"
-            post_request(self.dir, action="rule", rule_id=str(req.get("rule_id")), status=status)
-            return True, f"rule {req.get('rule_id')} -> {status or 'automatic'}"
+            return self._rule_override(str(req.get("rule_id")), status)
         return False, f"unknown action {action!r}"
 
+    def _rule_override(self, rule_id: str, status: str | None) -> tuple[bool, str]:
+        """Switch a learned rule: straight into learnings.json when the bot is stopped (it
+        reads the overrides when it starts), else a request the running bot applies."""
+        from .live_bot import post_request
+
+        label = f"rule {rule_id} -> {status or 'automatic'}"
+        if self.bot_status()["running"]:
+            for path in (self.dir / "requests").glob("*-rule.json"):  # never stack duplicates
+                if _read_json_safe(path).get("rule_id") == rule_id:
+                    path.unlink(missing_ok=True)
+            post_request(self.dir, action="rule", rule_id=rule_id, status=status)
+            return True, label
+        path = self.dir / "learnings.json"
+        raw = _read_json_safe(path)
+        overrides = dict(raw.get("overrides") or {})
+        if status is None:
+            overrides.pop(rule_id, None)
+        else:
+            overrides[rule_id] = status
+        raw["overrides"] = overrides
+        for r in raw.get("rules") or []:  # what the bot will decide (learning.select_active)
+            if r.get("id") == rule_id and status is not None:
+                r["status"] = status
+                r["why"] = f"switched {'off' if status == 'disabled' else 'on'} by the operator"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(raw, indent=1), encoding="utf-8")
+        tmp.replace(path)
+        return True, label + " (saved; the bot uses it from its next start)"
+
     def _start(self) -> tuple[bool, str]:
+        with self._lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> tuple[bool, str]:
         if self.settings_path is None:
             return False, "start needs the dashboard to be launched with --settings"
         if self.bot_status()["running"]:
@@ -734,18 +890,22 @@ class Controller:
             )
         from .launch import command
 
+        for pattern in ("*-stop.json", "*-close.json"):  # an old one must never fire now
+            for path in (self.dir / "requests").glob(pattern):
+                path.unlink(missing_ok=True)
         cmd, env = command("live_bot", "run", "--settings", str(self.settings_path))
-        kwargs: dict[str, Any] = {}
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        else:
-            kwargs["start_new_session"] = True  # keeps running if the dashboard stops
         log = self.dir / "bot.stderr.log"
         self._err_from = log.stat().st_size if log.exists() else 0
         with log.open("ab") as err:  # the bot keeps its own handle
             self.proc = subprocess.Popen(
-                cmd, cwd=Path.cwd(), env=env, stdout=subprocess.DEVNULL, stderr=err, **kwargs
+                cmd,
+                cwd=Path.cwd(),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=err,
+                **_detached_kwargs(),
             )
+        self._exited_ms = None
         return True, f"bot started (pid {self.proc.pid})"
 
     def last_error(self) -> str | None:
@@ -770,6 +930,7 @@ class FleetRuntime:
     ) -> None:
         self.fleet = fleet
         self.entries = dict(entries)
+        self._start_lock = threading.RLock()  # the fleet's room / approval check is one step
 
     @property
     def names(self) -> list[str]:
@@ -795,17 +956,22 @@ class FleetRuntime:
         snap = live_snapshot(state_dir, cfg)
         snap["bot"] = ctrl.bot_status() if ctrl else None
         snap["wallet"] = self._wallet_view(name)
-        snap["meta"]["bot_name"] = name
-        bot = self.fleet.bots.get(name) if self.fleet is not None else None
-        if bot is not None and snap["meta"].get("mode") in (None, "unknown"):
-            snap["meta"]["mode"] = bot.settings.mode  # never started: show the configured mode
-            snap["meta"]["exchange"] = bot.settings.exchange
+        meta = snap["meta"] = {**snap["meta"], "bot_name": name}
+        s = self._bot_settings(name)
+        if s is None and self.fleet is not None and name in self.fleet.bots:
+            s = self.fleet.bots[name].settings
+        if s is not None:
+            # what Start runs: bot.json, not the last run's state.json (asks before real money)
+            meta["configured_mode"] = s.mode
+            if meta.get("mode") in (None, "unknown"):
+                meta["mode"] = s.mode  # never started: show the configured mode
+                meta["exchange"] = s.exchange
         return snap
 
     def _bot_settings(self, name: str) -> Any:
-        ctrl = self._ctrl(name)
+        fn = getattr(self._ctrl(name), "settings", None)  # test doubles may have none
         try:
-            return ctrl.settings() if ctrl is not None else None
+            return fn() if callable(fn) else None
         except (OSError, ValueError, TypeError):
             return None
 
@@ -831,11 +997,13 @@ class FleetRuntime:
             if a == "wallet_connect":
                 provider = str(req.get("provider"))
                 conn = w.connect(state_dir, provider, str(req.get("address")), req.get("chain_id"))
-                msg = f"{provider.title()} connected: {conn['address'][:6]}…{conn['address'][-4:]}"
+                msg = f"{w.NAMES[provider]} connected: {conn['address'][:6]}…{conn['address'][-4:]}"
                 if s is None or s.mode != "wallet":
                     msg += ' (to trade with it, set "mode": "wallet" in bot.json and restart)'
                 elif ws is not None and ws.provider != provider:
-                    msg += f" (bot.json trades with {ws.provider.title()}, not {provider.title()})"
+                    msg += (
+                        f" (bot.json trades with {w.NAMES[ws.provider]}, not {w.NAMES[provider]})"
+                    )
                 elif ws is not None:
                     try:
                         bal = w.refresh_status(state_dir, ws)
@@ -895,12 +1063,20 @@ class FleetRuntime:
             return self.wallet_action(req)
         try:
             if action == "approve":
-                a = self.fleet.take_approval(
-                    str(req.get("approval_id")), str(req.get("confirm", ""))
-                )
-                return self._start_now(a.bots, approved=True)
+                if self.fleet is None:
+                    return 400, {
+                        "ok": False,
+                        "message": "nothing to approve: approvals exist only on a fleet "
+                        "dashboard (--fleet)",
+                    }
+                with self._start_lock:
+                    a = self.fleet.take_approval(
+                        str(req.get("approval_id")), str(req.get("confirm", ""))
+                    )
+                    return self._start_now(a.bots, approved=True)
             if action == "start_all":
-                return self._start_many([n for n in self.names if n not in self.running()])
+                with self._start_lock:
+                    return self._start_many([n for n in self.names if n not in self.running()])
             if action in ("stop_all", "pause_all", "resume_all"):
                 inner = {"stop_all": "stop", "pause_all": "pause", "resume_all": "resume"}[action]
                 msgs = [
@@ -915,7 +1091,8 @@ class FleetRuntime:
         if name not in self.entries:
             return 400, {"ok": False, "message": f"unknown bot {name!r}"}
         if action == "start":
-            return self._start_many([name])
+            with self._start_lock:
+                return self._start_many([name])
         ctrl = self._ctrl(name)
         if ctrl is None:
             return 403, {"ok": False, "message": "controls are off"}
@@ -1069,6 +1246,19 @@ def trader_action(req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
     return 400, {"ok": False, "message": f"unknown action {a!r}"}
 
 
+def _plain(exc: BaseException) -> str:
+    """An exception as a message the page can show."""
+    if isinstance(exc, ImportError) and (exc.name or "").split(".")[0] == "ccxt":
+        return "ccxt is not installed: pip install ccxt"
+    if isinstance(exc, ImportError) and exc.name:
+        return f"{exc.name} is not installed: pip install {exc.name.split('.')[0]}"
+    if isinstance(exc, FileNotFoundError) and exc.filename:
+        return f"{exc.filename} does not exist yet"
+    from .connections import plain_error
+
+    return f"the action failed: {plain_error(exc)}"
+
+
 def make_handler(  # noqa: C901 - one closure per HTTP verb
     state_dir: Path | None,
     cfg: StrategyConfig | None,
@@ -1086,17 +1276,20 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
     terminal = Terminal(runtime)
 
     class Handler(BaseHTTPRequestHandler):
-        def _send(self, status: int, body: bytes, ctype: str) -> None:
+        def _send(
+            self, status: int, body: bytes, ctype: str, headers: Mapping[str, str] | None = None
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header(
-                "Content-Security-Policy",
-                "default-src 'none'; script-src 'unsafe-inline'; "
-                "style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+            extra = (
+                {"X-Frame-Options": "DENY", "Content-Security-Policy": DASHBOARD_CSP}
+                if headers is None
+                else headers
             )
+            for k, v in extra.items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1122,6 +1315,10 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 if path in ("/", "/index.html"):
                     page = render_html(None, refresh_s, token if controls else None)
                     self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8")
+                elif path.rstrip("/") in MARKET_PAGES:
+                    name, headers = MARKET_PAGES[path.rstrip("/")]
+                    page = _html_template(name)
+                    self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8", headers)
                 elif path == "/api/snapshot":
                     self._json(HTTPStatus.OK, runtime.snapshot(self._query().get("bot")))
                 elif path == "/api/fleet":
@@ -1132,8 +1329,8 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                     self._json(HTTPStatus.OK, connections_status())
                 else:
                     self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
-            except (OSError, ValueError) as exc:
-                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            except Exception as exc:  # never drop the connection: say what went wrong
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": _plain(exc)})
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
@@ -1157,7 +1354,10 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 else:
                     code, body = runtime.act(req)
             except (ValueError, OSError) as exc:
-                code, body = 400, {"ok": False, "message": str(exc)}
+                code, body = 400, {"ok": False, "message": _plain(exc)}
+            except Exception as exc:  # a bug or a library error: a message, not "Failed to fetch"
+                log.exception("dashboard action failed")
+                code, body = 500, {"ok": False, "message": _plain(exc)}
             self._json(code, body)
 
         def log_message(self, fmt: str, *args: Any) -> None:
