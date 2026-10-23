@@ -35,9 +35,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runpy.run_module(f"research.trendbot.{module}", run_name="__main__", alter_sys=True)
     except SystemExit as exc:
-        return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        if isinstance(exc.code, int) or exc.code is None:
+            return exc.code or 0
+        print(exc.code, file=sys.stderr)  # a message, e.g. a missing settings file
+        return 1
     return 0
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """The single-file entry point: exits with main()'s status."""
     raise SystemExit(main())
+
+
+if __name__ == "__main__":
+    cli()

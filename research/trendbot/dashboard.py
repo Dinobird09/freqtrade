@@ -1128,6 +1128,7 @@ def main(argv: list[str] | None = None) -> int:
 
         settings = BotSettings.load(args.settings)
         state_dir, cfg = Path(settings.state_dir), settings.strategy_config()
+        state_dir.mkdir(parents=True, exist_ok=True)  # a fresh install has no state yet
     else:
         state_dir = Path(args.state_dir)
         state = _read_json(state_dir / "state.json")

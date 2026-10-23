@@ -41,7 +41,7 @@ def build(out: Path | None = None) -> Path:
             stage,
             out,
             interpreter="/usr/bin/env python3",
-            main="research.trendbot.__main__:main",
+            main="research.trendbot.__main__:cli",
             compressed=True,
         )
     return out
