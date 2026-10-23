@@ -1014,8 +1014,14 @@ class FleetRuntime:
             ws = w.WalletSettings(**s.wallet) if s is not None and s.wallet else None
             if a == "wallet_connect":
                 provider = str(req.get("provider"))
-                conn = w.connect(state_dir, provider, str(req.get("address")), req.get("chain_id"))
-                msg = f"{w.NAMES[provider]} connected: {conn['address'][:6]}…{conn['address'][-4:]}"
+                conn = w.connect(
+                    state_dir,
+                    provider,
+                    str(req.get("address")),
+                    req.get("chain_id"),
+                    req.get("app"),
+                )
+                msg = f"{conn['app']} connected: {conn['address'][:6]}…{conn['address'][-4:]}"
                 if s is None or s.mode != "wallet":
                     msg += ' (to trade with it, set "mode": "wallet" in bot.json and restart)'
                 elif ws is not None and ws.provider != provider:
@@ -1034,8 +1040,17 @@ class FleetRuntime:
                     except w.WalletError as exc:
                         msg += f"; balances not read yet ({exc})"
                 return 200, {"ok": True, "message": msg}
+            if a == "wallet_test":  # the no-cost rehearsal of a trade with a connected wallet
+                provider = str(req.get("provider") or (ws.provider if ws else "phantom"))
+                conn = w.read_connection(state_dir, provider)
+                if ws is None or ws.provider != provider:
+                    evm = (conn or {}).get("chain") or "base"
+                    ws = w.WalletSettings(
+                        provider=provider, chain="solana" if provider == "phantom" else evm
+                    )
+                return 200, {"ok": True, "message": "wallet test done", **w.dry_run(state_dir, ws)}
             if a == "wallet_disconnect":
-                w.disconnect(state_dir)
+                w.disconnect(state_dir, req.get("provider"))
                 return 200, {"ok": True, "message": "wallet disconnected"}
             tid = str(req.get("id", ""))
             if a == "wallet_prepare":
@@ -1287,6 +1302,7 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
     token: str | None = None,
     allowed_hosts: Sequence[str] = (),
     runtime: FleetRuntime | None = None,
+    voice_engine: Any = None,  # tests: a stand-in for the offline speech engine
 ) -> type:
     if runtime is None:
         runtime = FleetRuntime(None, {"bot": (Path(state_dir), cfg, controller)})
@@ -1355,6 +1371,11 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                     self._json(HTTPStatus.OK, runtime.snapshot(self._query().get("bot")))
                 elif path == "/api/fleet":
                     self._json(HTTPStatus.OK, runtime.summary())
+                elif path == "/api/voice/status":
+                    from .voice import status as voice_status
+
+                    ready = {"installed": True, "ready": True, "engine": "custom"}
+                    self._json(HTTPStatus.OK, voice_status() if voice_engine is None else ready)
                 elif path == "/api/connections":
                     from .connections import status as connections_status
 
@@ -1366,7 +1387,7 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
-            if not self._host_ok() or path not in ("/api/control", "/api/terminal"):
+            if not self._host_ok() or path not in ("/api/control", "/api/terminal", "/api/voice"):
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
                 return
             if not controls:
@@ -1376,6 +1397,9 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 self.headers.get("X-Trendbot-Token", ""), token
             ):
                 self._json(HTTPStatus.FORBIDDEN, {"ok": False, "message": "bad token"})
+                return
+            if path == "/api/voice":
+                self._voice()
                 return
             try:
                 size = min(int(self.headers.get("Content-Length") or 0), 10_000)
@@ -1391,6 +1415,21 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 log.exception("dashboard action failed")
                 code, body = 500, {"ok": False, "message": _plain(exc)}
             self._json(code, body)
+
+        def _voice(self) -> None:
+            """A recorded clip (16 kHz mono PCM16) -> its words, with the offline engine."""
+            from . import voice
+
+            size = int(self.headers.get("Content-Length") or 0)
+            if size > voice.SAMPLE_RATE * 2 * voice.MAX_SECONDS:
+                self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "message": "clip too long"})
+                return
+            try:
+                rate = int(self._query().get("rate") or voice.SAMPLE_RATE)
+                text = voice.transcribe(self.rfile.read(size), rate, engine=voice_engine)
+                self._json(HTTPStatus.OK, {"ok": True, "text": text})
+            except (RuntimeError, ValueError) as exc:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "message": str(exc)})
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return

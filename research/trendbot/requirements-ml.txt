@@ -8,3 +8,4 @@ transformers>=4.40    # FinBERT news scoring (ProsusAI/finbert); lexicon scorer 
 vaderSentiment
 textblob
 beautifulsoup4
+vosk>=0.3.45  # offline voice commands (Brave, Firefox): then run "trendbot.pyz voice" once

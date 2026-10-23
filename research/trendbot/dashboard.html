@@ -288,6 +288,8 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     <div class="voice-bar" style="margin-top:8px">
       <button type="button" class="small" id="voice-btn2">🎙 Push to talk</button>
       <button type="button" class="small" id="voice-check">Voice check</button>
+      <select id="voice-engine" aria-label="Voice engine" title="Chrome and Edge use their own speech service; Brave and Firefox use the offline engine on this PC">
+        <option value="auto">voice: auto</option><option value="browser">browser (Chrome, Edge)</option><option value="local">offline (this PC)</option></select>
       <label><input type="checkbox" id="voice-hands"> hands-free (say "Jarvis" or "Chantisimo" first)</label>
       <label><input type="checkbox" id="voice-speak" checked> speak replies</label>
       <span class="muted" id="voice-heard"></span>
@@ -298,7 +300,9 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     <div class="card-head"><h2>Wallet</h2><span class="muted" id="wallet-sub">MetaMask or Phantom: you approve every trade in the wallet</span><span class="spacer"></span>
       <button type="button" class="small" id="wallet-mm">🦊 Connect MetaMask</button>
       <button type="button" class="small" id="wallet-ph">👻 Connect Phantom</button>
+      <button type="button" class="small" id="wallet-test" title="Rehearses a $1 trade: balances, a real route and the chain simulating the swap, then a test signature. Nothing is sent.">🧪 Test my wallet (no cost)</button>
       <button type="button" class="small" id="wallet-off">Disconnect</button></div>
+    <div id="wallet-test-out" class="muted" style="white-space:pre-line;font-size:12.5px"></div>
     <div id="wallet-body"></div>
   </section>
 
@@ -1644,15 +1648,6 @@ function renderVerify(s) {
 
 // ------------------------------------------------------------------ wallet (MetaMask / Phantom)
 const WALLET = { shown: null, busy: false, ticket: null };
-function metamaskProvider() {
-  const e = window.ethereum;
-  if (!e) return null;
-  return (e.providers || []).find((p) => p.isMetaMask) || (e.isMetaMask ? e : null);
-}
-function phantomProvider() {
-  const p = (window.phantom && window.phantom.solana) || window.solana;
-  return p && p.isPhantom ? p : null;
-}
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58encode(bytes) {
   const digits = [0];
@@ -1667,24 +1662,98 @@ function b58encode(bytes) {
   return out;
 }
 function b64decode(s) { return Uint8Array.from(atob(s), (c) => c.charCodeAt(0)); }
+// Wallets announce themselves (EIP-6963), so the real MetaMask is found even in Brave, whose
+// built-in Brave Wallet also calls itself MetaMask. Brave Wallet is used only when the
+// extension you asked for is not installed (or when you connected with it).
+const EIP6963 = new Map();
+window.addEventListener("eip6963:announceProvider", (e) => { const d = e.detail; if (d && d.info && d.provider) EIP6963.set(d.info.rdns, d); });
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+function metamaskProvider() {
+  const ann = EIP6963.get("io.metamask") || EIP6963.get("io.metamask.flask");
+  if (ann) return ann.provider;
+  const e = window.ethereum, real = (p) => p && p.isMetaMask && !p.isBraveWallet && !p.isPhantom;
+  return e ? (e.providers || []).find(real) || (real(e) ? e : null) : null;
+}
+function braveEvmProvider() {
+  const ann = EIP6963.get("com.brave.wallet");
+  if (ann) return ann.provider;
+  return window.ethereum && window.ethereum.isBraveWallet ? window.ethereum : null;
+}
+function phantomProvider() {
+  const p = window.phantom && window.phantom.solana;
+  if (p && p.isPhantom) return p;
+  const s = window.solana;
+  return s && s.isPhantom && !s.isBraveWallet ? s : null;
+}
+function braveSolanaProvider() { return window.braveSolana || (window.solana && window.solana.isBraveWallet ? window.solana : null); }
+const WALLET_APP = { metamask: "MetaMask", phantom: "Phantom", brave: "Brave Wallet" };
+function evmWallet() { return (localStorage.getItem("wallet.evm") === "brave" ? braveEvmProvider() : metamaskProvider()) || braveEvmProvider(); }
+function solWallet() { return (localStorage.getItem("wallet.sol") === "brave" ? braveSolanaProvider() : phantomProvider()) || braveSolanaProvider(); }
+function walletApp(kind) { return localStorage.getItem(kind === "metamask" ? "wallet.evm" : "wallet.sol") === "brave" ? "Brave Wallet" : WALLET_APP[kind]; }
+async function connectWallet(kind) {
+  // -> {address, chain_id, app}; "kind" is the chain family: metamask = EVM, phantom = Solana
+  if (kind === "metamask") {
+    let p = metamaskProvider(), app = "metamask";
+    if (!p && braveEvmProvider()) { p = braveEvmProvider(); app = "brave"; }
+    if (!p) throw new Error("MetaMask is not installed in this browser: add it from metamask.io, then reload this page");
+    const accounts = await p.request({ method: "eth_requestAccounts" });
+    localStorage.setItem("wallet.evm", app);
+    return { address: accounts[0], chain_id: await p.request({ method: "eth_chainId" }), app: WALLET_APP[app] };
+  }
+  let p = phantomProvider(), app = "phantom";
+  if (!p && braveSolanaProvider()) { p = braveSolanaProvider(); app = "brave"; }
+  if (!p) throw new Error("Phantom is not installed in this browser: add it from phantom.com, then reload this page");
+  const r = await p.connect();
+  localStorage.setItem("wallet.sol", app);
+  return { address: ((r && r.publicKey) || p.publicKey).toString(), chain_id: null, app: WALLET_APP[app] };
+}
+async function signAndSendSolana(p, b64) {
+  const bytes = b64decode(b64);
+  try {
+    const res = await p.request({ method: "signAndSendTransaction", params: { message: b58encode(bytes) } });
+    return (res && res.signature) || res;
+  } catch (e) {
+    if (e && (e.code === 4001 || /reject|cancel|denied/i.test(e.message || ""))) throw e;
+    if (typeof p.signAndSendTransaction !== "function") throw e;
+    // a provider without the request method takes a transaction object: one that serializes to these bytes
+    const res = await p.signAndSendTransaction({ version: 0, serialize: () => bytes, signatures: [] });
+    return (res && res.signature) || res;
+  }
+}
 function shortAddr(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "–"; }
 function walletStep(text) { document.getElementById("wallet-step").textContent = text; }
 async function walletConnect(kind) {
   if (!controlsOn()) { toast("Controls are off (static export or --read-only)."); return; }
   try {
-    if (kind === "metamask") {
-      const p = metamaskProvider();
-      if (!p) { toast("✕ MetaMask is not installed in this browser: add the extension from metamask.io, then reload this page."); return; }
-      const accounts = await p.request({ method: "eth_requestAccounts" });
-      const chainId = await p.request({ method: "eth_chainId" });
-      await control({ action: "wallet_connect", provider: "metamask", address: accounts[0], chain_id: chainId });
-    } else {
-      const p = phantomProvider();
-      if (!p) { toast("✕ Phantom is not installed in this browser: add the extension from phantom.com, then reload this page."); return; }
-      const r = await p.connect();
-      await control({ action: "wallet_connect", provider: "phantom", address: (r.publicKey || p.publicKey).toString() });
-    }
+    const c = await connectWallet(kind);
+    await control({ action: "wallet_connect", provider: kind, address: c.address, chain_id: c.chain_id, app: c.app });
   } catch (e) { toast("✕ " + ((e && e.message) || e)); }
+}
+async function signTest(kind, address) {
+  // the last step of the wallet test: the wallet signs a message (it moves no funds)
+  const msg = `Chantisimo wallet test ${new Date().toISOString()}: this signature moves no funds.`;
+  const bytes = new TextEncoder().encode(msg);
+  if (kind === "metamask") {
+    const p = evmWallet(); if (!p) throw new Error("MetaMask is not available in this browser");
+    const hex = "0x" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return await p.request({ method: "personal_sign", params: [hex, address] });
+  }
+  const p = solWallet(); if (!p) throw new Error("Phantom is not available in this browser");
+  if (!p.isConnected) await p.connect();
+  return await p.signMessage(bytes, "utf8");
+}
+async function runWalletTest(kind, body, show) {
+  // -> lines for ``show``: the server's steps (wallet, balances, route, chain simulation) + signing
+  const j = await control(body);
+  const steps = (j && j.steps) || [{ step: "wallet", status: "fail", detail: (j && j.message) || "no answer" }];
+  if (j && j.address) {
+    try { await signTest(kind, j.address); steps.push({ step: "sign", status: "pass", detail: `${walletApp(kind)} signed a test message (no funds move)` }); }
+    catch (e) { steps.push({ step: "sign", status: "fail", detail: `the wallet did not sign: ${(e && e.message) || e}` }); }
+  }
+  const ok = steps.every((x) => x.status === "pass");
+  show([`${ok ? "✓" : "✕"} ${walletApp(kind)} test: ${ok ? "everything works; nothing was signed for real or sent" : "see the ✕ lines"}`,
+    ...steps.map((x) => `${x.status === "pass" ? "✓" : x.status === "fail" ? "✕" : "?"} ${x.step}: ${x.detail}`)]);
+  return ok;
 }
 async function waitReceipt(p, hash) {
   for (let i = 0; i < 90; i++) {
@@ -1706,14 +1775,13 @@ async function walletApprove() {
     let sig;
     try {
       if (tx.kind === "solana") {
-        const p = phantomProvider();
+        const p = solWallet();
         if (!p) throw new Error("Phantom is not available in this browser");
         if (!p.isConnected) await p.connect();
-        walletStep("Confirm the swap in Phantom…");
-        const res = await p.request({ method: "signAndSendTransaction", params: { message: b58encode(b64decode(tx.tx)) } });
-        sig = (res && res.signature) || res;
+        walletStep(`Confirm the swap in ${walletApp("phantom")}…`);
+        sig = await signAndSendSolana(p, tx.tx);
       } else {
-        const p = metamaskProvider();
+        const p = evmWallet();
         if (!p) throw new Error("MetaMask is not available in this browser");
         const cur = await p.request({ method: "eth_chainId" });
         if (parseInt(cur, 16) !== parseInt(tx.chain_id, 16)) {
@@ -1760,12 +1828,20 @@ function renderWallet(s) {
   if (!w) return;
   const on = controlsOn();
   for (const [id, fn] of [["wallet-mm", () => walletConnect("metamask")], ["wallet-ph", () => walletConnect("phantom")],
-    ["wallet-off", () => control({ action: "wallet_disconnect" }, "Disconnect the wallet from this bot?")]]) {
+    ["wallet-test", async () => {
+      const out = document.getElementById("wallet-test-out"), kinds = Object.keys(w.connections || {});
+      if (!kinds.length) { out.textContent = "Connect MetaMask or Phantom first, then test it."; return; }
+      out.textContent = "Testing… (your wallet will ask you to sign a test message)";
+      const lines = [];
+      for (const kind of kinds) await runWalletTest(kind, { action: "wallet_test", provider: kind }, (l) => { lines.push(...l, ""); out.textContent = lines.join("\n"); });
+      termLine("sys", lines.join("\n"));
+    }],
+    ["wallet-off", () => control({ action: "wallet_disconnect" }, "Disconnect the wallets from this bot?")]]) {
     const b = document.getElementById(id); b.disabled = !on; b.onclick = fn;
   }
   const c = w.connected;
   document.getElementById("wallet-sub").textContent = c
-    ? `${c.provider === "phantom" ? "Phantom" : "MetaMask"} ${shortAddr(c.address)} connected` + (w.mode === "wallet" ? ` · trading on ${w.chain_name}, at most $${money(w.max_trade_usd)} a swap` : "")
+    ? Object.values(w.connections || { x: c }).map((x) => `${x.app || (x.provider === "phantom" ? "Phantom" : "MetaMask")} ${shortAddr(x.address)}`).join(" + ") + " connected" + (w.mode === "wallet" ? ` · trading on ${w.chain_name}, at most $${money(w.max_trade_usd)} a swap` : "")
     : "MetaMask or Phantom: you approve every trade in the wallet";
   if (w.mode !== "wallet") {
     host.append(el("div", { class: "empty" }, 'To trade with a wallet, set "mode": "wallet" and "wallet": {"provider": "phantom", "chain": "solana"} (or "metamask" with "base", "ethereum", "arbitrum", "bsc", "polygon") in bot.json, connect the wallet here, then start the bot.'));
@@ -1868,9 +1944,93 @@ const VOICE = (() => {
     if (cmd) termSend(cmd);
     else say("Yes?");
   }
+  // ---- the offline engine: record here, transcribe on this PC (Brave ships the browser API
+  // without the speech service behind it, so voice there needs this)
+  const isBrave = !!(navigator.brave && typeof navigator.brave.isBrave === "function");
+  const pref = () => document.getElementById("voice-engine").value;
+  let engine = null;  // "browser" | "local"
+  const LOCAL = { ctx: null, stream: null, node: null, pre: [] };
+  async function localStatus() {
+    try { return await (await fetch("api/voice/status", { cache: "no-store" })).json(); }
+    catch (e) { return { installed: false, hint: "the dashboard did not answer" }; }
+  }
+  function pickEngine() { return pref() !== "auto" ? pref() : SR && !isBrave ? "browser" : "local"; }
+  function stopLocal() {
+    if (LOCAL.node) LOCAL.node.onaudioprocess = null;
+    if (LOCAL.stream) LOCAL.stream.getTracks().forEach((t) => t.stop());
+    if (LOCAL.ctx) LOCAL.ctx.close().catch(() => {});
+    LOCAL.ctx = LOCAL.stream = LOCAL.node = null;
+    listening = false; mark("listening", false);
+  }
+  async function sendClip(frames, rate) {
+    const n = frames.reduce((a, f) => a + f.length, 0), ratio = rate / 16000;
+    const flat = new Float32Array(n); let o = 0;
+    for (const f of frames) { flat.set(f, o); o += f.length; }
+    const out = new Int16Array(Math.floor(n / ratio));
+    for (let i = 0; i < out.length; i++) {  // average down to 16 kHz
+      const a = Math.floor(i * ratio), b = Math.min(n, Math.floor((i + 1) * ratio));
+      let sum = 0; for (let j = a; j < b; j++) sum += flat[j];
+      out[i] = Math.max(-1, Math.min(1, sum / Math.max(1, b - a))) * 32767;
+    }
+    heard().textContent = "transcribing…";
+    try {
+      const r = await fetch("api/voice?rate=16000", { method: "POST", cache: "no-store",
+        headers: { "Content-Type": "application/octet-stream", "X-Trendbot-Token": CONTROL_TOKEN }, body: out.buffer });
+      const j = await r.json();
+      if (!j.ok) { heard().textContent = "voice: offline engine error"; termLine("sys", "Voice: " + j.message); return; }
+      if (j.text) handle(j.text, true); else heard().textContent = "voice: I didn't catch that";
+    } catch (e) { heard().textContent = "voice: " + e.message; }
+  }
+  async function startLocal(continuous) {
+    if (listening) { stopLocal(); return; }
+    const st = await localStatus();
+    if (!st.installed) {
+      termLine("sys", `Voice in ${isBrave ? "Brave" : "this browser"} uses the offline engine on your PC, and it is not installed yet: ${st.hint}. Then run "trendbot.pyz voice" once and restart the dashboard. (Chrome and Edge work without it.)`);
+      handsFree = false; document.getElementById("voice-hands").checked = false;
+      return;
+    }
+    try { LOCAL.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }); }
+    catch (e) {
+      const why = e.name === "NotAllowedError" ? FATAL["not-allowed"] : e.name === "NotFoundError" ? FATAL["audio-capture"] : e.message;
+      handsFree = false; document.getElementById("voice-hands").checked = false;
+      heard().textContent = "voice off: " + why; termLine("sys", "Voice is off: " + why);
+      return;
+    }
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const node = ctx.createScriptProcessor(4096, 1, 1);
+    Object.assign(LOCAL, { ctx, node });
+    const frameMs = 4096 / ctx.sampleRate * 1000;
+    let clip = [], talking = false, silence = 0, total = 0, waited = 0, floor = 0.004;
+    node.onaudioprocess = (ev) => {  // a simple voice detector: a clip runs from loud to 0.9 s quiet
+      const x = ev.inputBuffer.getChannelData(0);
+      let sum = 0; for (let i = 0; i < x.length; i++) sum += x[i] * x[i];
+      const rms = Math.sqrt(sum / x.length);
+      if (!talking) floor = floor * 0.95 + rms * 0.05;
+      const loud = rms > Math.max(0.012, floor * 3);
+      if (loud && !talking) { talking = true; clip = LOCAL.pre.slice(); }
+      if (talking) {
+        clip.push(new Float32Array(x)); total += frameMs; silence = loud ? 0 : silence + frameMs;
+        if (silence > 900 || total > 8000) {
+          const c = clip; clip = []; talking = false; silence = total = waited = 0;
+          if (!continuous) stopLocal();
+          sendClip(c, ctx.sampleRate);
+        }
+      } else {
+        LOCAL.pre = [new Float32Array(x)];
+        waited += frameMs;
+        if (!continuous && waited > 7000) { stopLocal(); heard().textContent = "voice: heard nothing"; termLine("sys", "Voice: " + HINT["no-speech"]); }
+      }
+    };
+    ctx.createMediaStreamSource(LOCAL.stream).connect(node);
+    node.connect(ctx.destination);  // the processor only runs while connected (it outputs silence)
+    listening = true; mark("listening", true);
+    heard().textContent = continuous ? "listening for \"Jarvis …\" (offline engine)" : "listening… speak now (offline engine)";
+  }
   function start(continuous) {
-    if (!SR) { termLine("sys", "Voice needs Chrome or Edge (the browser's speech recognition). Firefox and Safari don't support it here."); return; }
     if (!controlsOn()) { termLine("sys", "Voice commands need the live dashboard with controls on."); return; }
+    engine = pickEngine();
+    if (engine === "local") { startLocal(continuous); return; }
+    if (!SR) { termLine("sys", "This browser has no speech recognition: pick \"offline (this PC)\" next to Voice check."); return; }
     if (listening) { rec && rec.stop(); return; }
     // commands are English: a Windows language such as Filipino would mis-hear them
     const lang = navigator.language || "";
@@ -1878,6 +2038,21 @@ const VOICE = (() => {
     rec.onstart = () => { heard().textContent = continuous ? "listening for \"Jarvis …\"" : "listening… speak now"; };
     rec.onresult = (ev) => { for (let i = ev.resultIndex; i < ev.results.length; i++) handle(ev.results[i][0].transcript, ev.results[i].isFinal); };
     rec.onerror = (ev) => {
+      if (pref() === "auto" && (ev.error === "network" || ev.error === "service-not-allowed")) {
+        // Brave, or a network that blocks the browser's speech service: use the PC's engine
+        const again = handsFree;
+        localStatus().then((st) => {
+          if (!st.installed) {
+            termLine("sys", "Voice: " + HINT.network + ` Or install the offline engine on your PC: ${st.hint}.`);
+            handsFree = false; document.getElementById("voice-hands").checked = false;
+            return;
+          }
+          termLine("sys", "The browser's speech service is not reachable here: switching to the offline engine on your PC.");
+          document.getElementById("voice-engine").value = "local"; localStorage.setItem("voice.engine", "local");
+          setTimeout(() => startLocal(again), 400);
+        });
+        return;
+      }
       const why = FATAL[ev.error];
       if (!why) {
         heard().textContent = "voice: " + ev.error;
@@ -1888,7 +2063,7 @@ const VOICE = (() => {
       heard().textContent = "voice off: " + why;
       termLine("sys", "Voice is off: " + why);
     };
-    rec.onend = () => { listening = false; mark("listening", false); if (handsFree) setTimeout(() => start(true), 300); };
+    rec.onend = () => { listening = false; mark("listening", false); if (handsFree && engine === "browser") setTimeout(() => start(true), 300); };
     try { rec.start(); listening = true; mark("listening", true); if (window.speechSynthesis) speechSynthesis.cancel(); }
     catch (e) { heard().textContent = "voice: " + e.message; }
   }
@@ -1896,12 +2071,17 @@ const VOICE = (() => {
   document.getElementById("voice-hands").addEventListener("change", (ev) => {
     handsFree = ev.currentTarget.checked;
     if (handsFree) { start(true); say("Hands-free on. Say Jarvis, then your command."); }
+    else if (engine === "local") stopLocal();
     else if (rec) { rec.stop(); }
   });
+  const eng = document.getElementById("voice-engine");
+  eng.value = localStorage.getItem("voice.engine") || "auto";
+  eng.addEventListener("change", () => { localStorage.setItem("voice.engine", eng.value); if (listening) { stopLocal(); if (rec) rec.stop(); } });
   if (!SR) for (const b of btns()) if (b) b.title = "Voice needs Chrome or Edge";
   async function check() {  // step by step: browser, microphone, speech out
     const out = (t) => termLine("sys", t);
-    out(`Voice check: speech recognition ${SR ? "available" : "NOT available (use Chrome or Edge)"}; spoken replies ${window.speechSynthesis ? "available" : "not available"}; page ${window.isSecureContext ? "secure (OK)" : "NOT secure: open it as http://127.0.0.1:8050"}.`);
+    const st = await localStatus();
+    out(`Voice check: ${isBrave ? "Brave" : "this browser"}; voice engine ${pickEngine() === "local" ? "offline (this PC)" : "the browser's"}; browser speech recognition ${SR ? (isBrave ? "present but switched off by Brave" : "available") : "not available"}; offline engine ${st.installed ? (st.ready ? "ready" : "installed (loads with the first command)") : "not installed: " + st.hint}; spoken replies ${window.speechSynthesis ? "available" : "not available"}; page ${window.isSecureContext ? "secure (OK)" : "NOT secure: open it as http://127.0.0.1:8050"}.`);
     try {
       const st = navigator.permissions ? (await navigator.permissions.query({ name: "microphone" })).state : "unknown";
       out(`Microphone permission: ${st}${st === "denied" ? ": allow it in the site settings (icon left of the address)" : ""}.`);
@@ -1926,7 +2106,7 @@ const VOICE = (() => {
       document.getElementById("voice-speak").checked = was;
       out("You should hear a sentence now. If not, check the speaker volume and the browser tab is not muted.");
     }
-    if (SR) out("Last step: press 🎙 Push to talk and say \"status\".");
+    out("Last step: press 🎙 Push to talk and say \"status\".");
   }
   document.getElementById("voice-check").addEventListener("click", check);
   return { say, start, check };

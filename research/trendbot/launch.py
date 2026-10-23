@@ -20,6 +20,7 @@ COMMANDS = {
     "dex_scan": "dex",
     "lab": "lab",
     "fetch_data": "fetch",
+    "voice": "voice",
 }
 
 

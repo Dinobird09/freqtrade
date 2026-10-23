@@ -104,6 +104,7 @@ th { color: var(--text-muted); font-weight: 500; font-size: 11px; }
   </select></label>
   <span id="wallet-state" class="muted">no wallet</span>
   <button type="button" id="connect">Connect wallet</button>
+  <button type="button" id="wallet-test" title="Rehearses a $1 trade with no cost: balances, a real route, the chain simulating the swap, and a test signature">🧪 Test wallet</button>
   <a href="./">← dashboard</a> <a href="market">market terminal</a>
 </header>
 <main>
@@ -175,8 +176,6 @@ async function control(body) {
 }
 
 // ------------------------------------------------------------------ wallets (same providers as the dashboard)
-function metamaskProvider() { const e = window.ethereum; if (!e) return null; return (e.providers || []).find((p) => p.isMetaMask) || (e.isMetaMask ? e : null); }
-function phantomProvider() { const p = (window.phantom && window.phantom.solana) || window.solana; return p && p.isPhantom ? p : null; }
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58encode(bytes) {
   const digits = [0];
@@ -186,6 +185,90 @@ function b58encode(bytes) {
   return out;
 }
 function b64decode(s) { return Uint8Array.from(atob(s), (c) => c.charCodeAt(0)); }
+// Wallets announce themselves (EIP-6963), so the real MetaMask is found even in Brave, whose
+// built-in Brave Wallet also calls itself MetaMask. Brave Wallet is used only when the
+// extension you asked for is not installed (or when you connected with it).
+const EIP6963 = new Map();
+window.addEventListener("eip6963:announceProvider", (e) => { const d = e.detail; if (d && d.info && d.provider) EIP6963.set(d.info.rdns, d); });
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+function metamaskProvider() {
+  const ann = EIP6963.get("io.metamask") || EIP6963.get("io.metamask.flask");
+  if (ann) return ann.provider;
+  const e = window.ethereum, real = (p) => p && p.isMetaMask && !p.isBraveWallet && !p.isPhantom;
+  return e ? (e.providers || []).find(real) || (real(e) ? e : null) : null;
+}
+function braveEvmProvider() {
+  const ann = EIP6963.get("com.brave.wallet");
+  if (ann) return ann.provider;
+  return window.ethereum && window.ethereum.isBraveWallet ? window.ethereum : null;
+}
+function phantomProvider() {
+  const p = window.phantom && window.phantom.solana;
+  if (p && p.isPhantom) return p;
+  const s = window.solana;
+  return s && s.isPhantom && !s.isBraveWallet ? s : null;
+}
+function braveSolanaProvider() { return window.braveSolana || (window.solana && window.solana.isBraveWallet ? window.solana : null); }
+const WALLET_APP = { metamask: "MetaMask", phantom: "Phantom", brave: "Brave Wallet" };
+function evmWallet() { return (localStorage.getItem("wallet.evm") === "brave" ? braveEvmProvider() : metamaskProvider()) || braveEvmProvider(); }
+function solWallet() { return (localStorage.getItem("wallet.sol") === "brave" ? braveSolanaProvider() : phantomProvider()) || braveSolanaProvider(); }
+function walletApp(kind) { return localStorage.getItem(kind === "metamask" ? "wallet.evm" : "wallet.sol") === "brave" ? "Brave Wallet" : WALLET_APP[kind]; }
+async function connectWallet(kind) {
+  // -> {address, chain_id, app}; "kind" is the chain family: metamask = EVM, phantom = Solana
+  if (kind === "metamask") {
+    let p = metamaskProvider(), app = "metamask";
+    if (!p && braveEvmProvider()) { p = braveEvmProvider(); app = "brave"; }
+    if (!p) throw new Error("MetaMask is not installed in this browser: add it from metamask.io, then reload this page");
+    const accounts = await p.request({ method: "eth_requestAccounts" });
+    localStorage.setItem("wallet.evm", app);
+    return { address: accounts[0], chain_id: await p.request({ method: "eth_chainId" }), app: WALLET_APP[app] };
+  }
+  let p = phantomProvider(), app = "phantom";
+  if (!p && braveSolanaProvider()) { p = braveSolanaProvider(); app = "brave"; }
+  if (!p) throw new Error("Phantom is not installed in this browser: add it from phantom.com, then reload this page");
+  const r = await p.connect();
+  localStorage.setItem("wallet.sol", app);
+  return { address: ((r && r.publicKey) || p.publicKey).toString(), chain_id: null, app: WALLET_APP[app] };
+}
+async function signAndSendSolana(p, b64) {
+  const bytes = b64decode(b64);
+  try {
+    const res = await p.request({ method: "signAndSendTransaction", params: { message: b58encode(bytes) } });
+    return (res && res.signature) || res;
+  } catch (e) {
+    if (e && (e.code === 4001 || /reject|cancel|denied/i.test(e.message || ""))) throw e;
+    if (typeof p.signAndSendTransaction !== "function") throw e;
+    // a provider without the request method takes a transaction object: one that serializes to these bytes
+    const res = await p.signAndSendTransaction({ version: 0, serialize: () => bytes, signatures: [] });
+    return (res && res.signature) || res;
+  }
+}
+async function signTest(kind, address) {
+  // the last step of the wallet test: the wallet signs a message (it moves no funds)
+  const msg = `Chantisimo wallet test ${new Date().toISOString()}: this signature moves no funds.`;
+  const bytes = new TextEncoder().encode(msg);
+  if (kind === "metamask") {
+    const p = evmWallet(); if (!p) throw new Error("MetaMask is not available in this browser");
+    const hex = "0x" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return await p.request({ method: "personal_sign", params: [hex, address] });
+  }
+  const p = solWallet(); if (!p) throw new Error("Phantom is not available in this browser");
+  if (!p.isConnected) await p.connect();
+  return await p.signMessage(bytes, "utf8");
+}
+async function runWalletTest(kind, body, show) {
+  // -> lines for ``show``: the server's steps (wallet, balances, route, chain simulation) + signing
+  const j = await control(body);
+  const steps = (j && j.steps) || [{ step: "wallet", status: "fail", detail: (j && j.message) || "no answer" }];
+  if (j && j.address) {
+    try { await signTest(kind, j.address); steps.push({ step: "sign", status: "pass", detail: `${walletApp(kind)} signed a test message (no funds move)` }); }
+    catch (e) { steps.push({ step: "sign", status: "fail", detail: `the wallet did not sign: ${(e && e.message) || e}` }); }
+  }
+  const ok = steps.every((x) => x.status === "pass");
+  show([`${ok ? "✓" : "✕"} ${walletApp(kind)} test: ${ok ? "everything works; nothing was signed for real or sent" : "see the ✕ lines"}`,
+    ...steps.map((x) => `${x.status === "pass" ? "✓" : x.status === "fail" ? "✕" : "?"} ${x.step}: ${x.detail}`)]);
+  return ok;
+}
 async function waitReceipt(p, hash) {
   for (let i = 0; i < 90; i++) { const r = await p.request({ method: "eth_getTransactionReceipt", params: [hash] });
     if (r && r.status) { if (parseInt(r.status, 16) !== 1) throw new Error("the approval failed on chain"); return; }
@@ -195,30 +278,20 @@ async function waitReceipt(p, hash) {
 async function connect() {
   const kind = CHAIN_WALLET[S.chain];
   try {
-    if (kind === "phantom") {
-      const p = phantomProvider();
-      if (!p) { status("✕ Phantom is not installed in this browser (phantom.com), then reload this page."); return; }
-      const r = await p.connect();
-      await control({ action: "meme_connect", provider: "phantom", address: (r.publicKey || p.publicKey).toString() });
-    } else {
-      const p = metamaskProvider();
-      if (!p) { status("✕ MetaMask is not installed in this browser (metamask.io), then reload this page."); return; }
-      const acc = await p.request({ method: "eth_requestAccounts" });
-      await control({ action: "meme_connect", provider: "metamask", address: acc[0], chain_id: await p.request({ method: "eth_chainId" }) });
-    }
+    const c = await connectWallet(kind);
+    await control({ action: "meme_connect", provider: kind, address: c.address, chain_id: c.chain_id, app: c.app });
     pollPositions();
   } catch (e) { status("✕ " + ((e && e.message) || e)); }
 }
 async function sendToWallet(j) {
   const tx = j.tx;
   if (tx.kind === "solana") {
-    const p = phantomProvider(); if (!p) throw new Error("Phantom is not available in this browser");
+    const p = solWallet(); if (!p) throw new Error("Phantom is not available in this browser");
     if (!p.isConnected) await p.connect();
-    status("Confirm the swap in Phantom…");
-    const res = await p.request({ method: "signAndSendTransaction", params: { message: b58encode(b64decode(tx.tx)) } });
-    return (res && res.signature) || res;
+    status(`Confirm the swap in ${walletApp("phantom")}…`);
+    return await signAndSendSolana(p, tx.tx);
   }
-  const p = metamaskProvider(); if (!p) throw new Error("MetaMask is not available in this browser");
+  const p = evmWallet(); if (!p) throw new Error("MetaMask is not available in this browser");
   if (parseInt(await p.request({ method: "eth_chainId" }), 16) !== parseInt(tx.chain_id, 16)) {
     status("Switch the network in MetaMask…");
     await p.request({ method: "wallet_switchEthereumChain", params: [{ chainId: tx.chain_id }] });
@@ -356,6 +429,9 @@ function renderReport() {
   if (r.chart) {
     body.append(el("h3", {}, "Chart (DexScreener)"));
     body.append(el("iframe", { id: "chart", src: r.chart, title: "DexScreener chart", referrerpolicy: "no-referrer" }));
+    const alt = el("div", { class: "src" }, "Chart blank? Brave Shields can block embedded charts: ");
+    alt.append(el("a", { href: r.url || r.chart.replace("?embed=1", ""), target: "_blank", rel: "noopener noreferrer" }, "open it on DexScreener"));
+    body.append(alt);
   }
   if ((r.market.daily || []).length) {
     body.append(el("h3", {}, `Daily volume, last ${r.market.daily.length} days`));
@@ -413,8 +489,8 @@ document.getElementById("buy").onclick = () => trade("buy", { usd: parseFloat(do
 async function pollPositions() {
   let p;
   try { p = await getJSON("api/memes/positions"); } catch (e) { return; }
-  const w = p.wallet;
-  document.getElementById("wallet-state").textContent = w ? `${w.provider === "phantom" ? "Phantom" : "MetaMask"} ${short(w.address)}` : "no wallet";
+  const w = (p.wallets || {})[CHAIN_WALLET[S.chain]] || null;  // the wallet of the chain you picked
+  document.getElementById("wallet-state").textContent = w ? `${w.app || (w.provider === "phantom" ? "Phantom" : "MetaMask")} ${short(w.address)}` : "no wallet";
   document.getElementById("connect").textContent = w ? "Reconnect" : `Connect ${CHAIN_WALLET[S.chain] === "phantom" ? "Phantom" : "MetaMask"}`;
   const host = clear(document.getElementById("positions"));
   if (!(p.positions || []).length) host.append(el("div", { class: "empty" }, "No positions yet."));
@@ -464,6 +540,14 @@ chainSel.value = S.chain;
 chainSel.onchange = () => { S.chain = chainSel.value; localStorage.setItem("memes.chain", S.chain); S.sel = null; S.report = null; renderTrade(); loadFeed(); pollPositions(); };
 document.getElementById("minliq").onchange = loadFeed;
 document.getElementById("connect").onclick = connect;
+document.getElementById("wallet-test").onclick = async () => {
+  status("Testing your wallet… (it will ask you to sign a test message)");
+  await runWalletTest(CHAIN_WALLET[S.chain], { action: "meme_test", chain: S.chain }, (lines) => {
+    const host = clear(document.getElementById("recent"));
+    host.append(el("div", { style: "white-space:pre-line" }, lines.join("\n")));
+    status(lines[0]);
+  });
+};
 document.getElementById("recheck").onclick = () => S.sel && pick(S.sel, true);
 document.getElementById("addr-form").onsubmit = (e) => { e.preventDefault(); const a = document.getElementById("addr").value.trim(); if (a) pick(a); };
 renderTrade();

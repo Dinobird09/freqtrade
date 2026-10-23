@@ -119,6 +119,7 @@ tbody tr { cursor: default; }
       <div id="ohlc"></div>
       <div id="chart-msg"></div>
       <iframe id="tv-frame" title="TradingView chart" referrerpolicy="no-referrer"></iframe>
+      <a id="tv-open" target="_blank" rel="noopener noreferrer" style="display:none;position:absolute;right:10px;bottom:8px;font-size:12px;background:#021018;padding:2px 6px;border-radius:4px" title="If Brave Shields or a blocker hides the chart">open on TradingView ↗</a>
     </div>
   </section>
 
@@ -617,7 +618,10 @@ function setView(v) {
     const u = tvUrl();
     if (f.dataset.src !== u) { f.src = u; f.dataset.src = u; }
     f.style.display = "block";
-  } else { f.style.display = "none"; S.dirty = true; }
+    const open = document.getElementById("tv-open");
+    open.href = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(src().tv(sel()))}`;
+    open.style.display = "";
+  } else { f.style.display = "none"; document.getElementById("tv-open").style.display = "none"; S.dirty = true; }
   document.getElementById("ohlc").style.display = v === "live" ? "" : "none";
 }
 document.getElementById("view-live").onclick = () => setView("live");

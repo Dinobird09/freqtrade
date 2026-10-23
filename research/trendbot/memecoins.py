@@ -1215,8 +1215,8 @@ def new_trade(
         raise w.WalletError("side must be buy or sell")
     d = memes_dir(state_dir)
     ws = wallet_settings(chain, slippage_bps)
-    conn = w.read_connection(d)
-    if conn is None or conn.get("provider") != ws.provider:
+    conn = w.read_connection(d, ws.provider)
+    if conn is None:
         raise w.WalletError(f"connect {w.NAMES[ws.provider]} first (top right of the meme desk)")
     dec = decimals if decimals is not None else token_decimals(chain, address, src)
     sym = (symbol or "TOKEN").upper()[:16]
@@ -1417,6 +1417,7 @@ def positions(
         )
     return {
         "wallet": w.read_connection(d),
+        "wallets": w.connections(d),
         "positions": rows,
         "tickets": w.open_tickets(d),
         "recent": w.recent_tickets(d, 10),
@@ -1478,15 +1479,19 @@ class Desk:
         try:
             if a == "meme_connect":
                 conn = w.connect(
-                    d, str(req.get("provider")), str(req.get("address")), req.get("chain_id")
+                    d,
+                    str(req.get("provider")),
+                    str(req.get("address")),
+                    req.get("chain_id"),
+                    req.get("app"),
                 )
                 short = f"{conn['address'][:6]}…{conn['address'][-4:]}"
-                return 200, {
-                    "ok": True,
-                    "message": f"{w.NAMES[conn['provider']]} connected: {short}",
-                }
+                return 200, {"ok": True, "message": f"{conn['app']} connected: {short}"}
+            if a == "meme_test":  # the no-cost rehearsal for the chain you picked
+                ws = wallet_settings(str(req.get("chain") or "solana"))
+                return 200, {"ok": True, "message": "wallet test done", **w.dry_run(d, ws)}
             if a == "meme_disconnect":
-                w.disconnect(d)
+                w.disconnect(d, req.get("provider"))
                 return 200, {"ok": True, "message": "wallet disconnected from the meme desk"}
             if a == "meme_confirm":
                 yes = bool(req.get("yes", True))

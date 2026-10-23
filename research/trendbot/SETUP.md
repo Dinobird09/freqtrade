@@ -184,8 +184,21 @@ to the bot:
 - **Replies:** they are spoken aloud (untick *speak replies* to turn that off).
 - **Confirming:** a command that needs confirmation waits for you to say "yes" or "no".
 
-Voice uses your browser's speech recognition, so use **Chrome or Edge**, and allow the
-microphone the first time. It works on `http://127.0.0.1` or over an SSH tunnel to
+In **Chrome and Edge**, voice uses the browser's own speech service. Allow the microphone the
+first time.
+
+**Brave** (and Firefox) switch that service off, so voice there uses an offline engine that
+runs on your PC (Vosk). Nothing you say leaves the computer. Set it up once:
+
+```
+.venv\Scripts\python -m pip install vosk
+.venv\Scripts\python trendbot.pyz voice
+```
+
+The second command downloads the English model (about 40 MB). Then restart the dashboard.
+The page picks the right engine by itself; to force one, use the menu next to **Voice
+check**. **Voice check** says which engine is in use, whether the microphone hears you and
+whether replies are spoken. It works on `http://127.0.0.1` or over an SSH tunnel to
 `localhost`. In Chrome and Edge, the browser sends your speech to its own speech service
 (Google or Microsoft) to turn it into text. Only the recognized words reach the bot.
 
@@ -256,6 +269,31 @@ you have positions.
 4. Start the dashboard and press **🦊 Connect MetaMask** or **👻 Connect Phantom** in the
    **Wallet** card. Your balances appear there.
 5. Press **Start**.
+
+**Test my wallet (no cost):** press **🧪 Test my wallet** in the Wallet card (or **🧪 Test
+wallet** on the meme desk). For each connected wallet it:
+
+- reads your balances;
+- gets a real $1 swap route;
+- has the blockchain simulate that swap from your address;
+- asks the wallet to sign a test message.
+
+Nothing is sent and no fee is paid. Every step shows ✓ or ✕ with the reason, so you know a
+real trade will work before you make one.
+
+**Both wallets at once:** MetaMask and Phantom stay connected side by side. The bot uses the
+one its chain needs.
+
+**Brave:**
+
+- Brave has its own **Brave Wallet**, which also answers as "MetaMask". The page finds the
+  real MetaMask and Phantom extensions when they are installed, and uses Brave Wallet only
+  when they are not. The Wallet card shows which one connected.
+- To make sure MetaMask always wins, set Brave's **Settings → Wallet → Default Ethereum
+  wallet** and **Default Solana wallet** to **Extensions (no fallback)**.
+- If an embedded chart stays blank, Brave Shields blocked it. Use the *open it on
+  DexScreener* or *open on TradingView* link under it, or lower Shields for
+  `127.0.0.1`.
 
 **Wallet settings** (all optional except `provider` and `chain`):
 

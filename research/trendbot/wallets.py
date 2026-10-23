@@ -450,8 +450,8 @@ def refresh_status(
     state_dir: Path, ws: WalletSettings, http: Http | None = None
 ) -> dict[str, float]:
     """Read the connected wallet's balances now (the dashboard does this on connect)."""
-    conn = read_connection(state_dir)
-    if conn is None or conn.get("provider") != ws.provider:
+    conn = read_connection(state_dir, ws.provider)
+    if conn is None:
         raise WalletError(f"connect {NAMES[ws.provider]} first")
     bal = all_balances(Chain(ws, http, lambda s: None), ws, str(conn["address"]))
     write_status(state_dir, ws, str(conn["address"]), bal, int(time.time() * 1000))
@@ -463,13 +463,25 @@ def wallet_dir(state_dir: Path) -> Path:
     return Path(state_dir) / "wallet" / "tickets"
 
 
-def read_connection(state_dir: Path) -> dict[str, Any] | None:
-    p = Path(state_dir) / "wallet.json"
+def connections(state_dir: Path) -> dict[str, dict[str, Any]]:
+    """Every wallet connected for this bot, by chain family: MetaMask and Phantom can both be."""
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads((Path(state_dir) / "wallet.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) and data.get("address") else None
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("address"):  # the one-wallet format of earlier versions
+        return {str(data.get("provider")): data}
+    return {k: v for k, v in data.items() if isinstance(v, dict) and v.get("address")}
+
+
+def read_connection(state_dir: Path, provider: str | None = None) -> dict[str, Any] | None:
+    """The connected ``provider`` wallet (or the latest connected one)."""
+    conns = connections(state_dir)
+    if provider is not None:
+        return conns.get(provider)
+    return max(conns.values(), key=lambda c: int(c.get("connected_ms") or 0), default=None)
 
 
 def _write(path: Path, data: Mapping[str, Any]) -> None:
@@ -521,7 +533,7 @@ def open_tickets(state_dir: Path, now_ms: int | None = None) -> list[dict[str, A
             t = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if t.get("status") in ("pending", "approved", "sent"):
+        if t.get("status") in ("pending", "approved", "sent") and not t.get("dry_run"):
             t["seconds_left"] = max(0, round((int(t.get("expires_ms", 0)) - now) / 1000))
             out.append(t)
     return sorted(out, key=lambda t: -int(t.get("created_ms", 0)))
@@ -570,8 +582,8 @@ class WalletBroker:
     def connect(cls, exchange_id: str, ws: WalletSettings, state_dir: Path) -> WalletBroker:
         from .live_exchange import CcxtGateway, exchange_config
 
-        conn = read_connection(state_dir)
-        if conn is None or conn.get("provider") != ws.provider:
+        conn = read_connection(state_dir, ws.provider)
+        if conn is None:
             raise SystemExit(
                 f"connect {NAMES[ws.provider]} first: open the dashboard, Wallet card, "
                 f"Connect {NAMES[ws.provider]}"
@@ -605,15 +617,10 @@ class WalletBroker:
     # ------------------------------------------------------------------ the wallet
     @property
     def address(self) -> str:
-        conn = read_connection(self.dir)
+        conn = read_connection(self.dir, self.ws.provider)
         if conn is None:
             raise WalletError(
                 f"no wallet connected: open the dashboard and connect {NAMES[self.ws.provider]}"
-            )
-        if conn.get("provider") != self.ws.provider:
-            raise WalletError(
-                f"the dashboard connected {conn.get('provider')}, "
-                f"but bot.json says {self.ws.provider}"
             )
         return str(conn["address"])
 
@@ -799,8 +806,15 @@ class WalletBroker:
 
 
 # ---------------------------------------------------------------------- the dashboard side
-def connect(state_dir: Path, provider: str, address: str, chain_id: Any = None) -> dict[str, Any]:
-    """Save the wallet the page connected (public address only)."""
+APPS = ("MetaMask", "Phantom", "Brave Wallet")
+
+
+def connect(
+    state_dir: Path, provider: str, address: str, chain_id: Any = None, app: str | None = None
+) -> dict[str, Any]:
+    """Save the wallet the page connected (public address only). ``provider`` is the chain
+    family (metamask = EVM, phantom = Solana); ``app`` the wallet that signs (Brave Wallet
+    can stand in for either)."""
     if provider not in PROVIDERS:
         raise WalletError("unknown wallet")
     address = str(address or "").strip()
@@ -825,13 +839,19 @@ def connect(state_dir: Path, provider: str, address: str, chain_id: Any = None) 
         "address": address,
         "chain": chain or ("solana" if provider == "phantom" else None),
         "connected_ms": int(time.time() * 1000),
+        "app": app if app in APPS else NAMES[provider],
     }
-    _write(Path(state_dir) / "wallet.json", conn)
+    _write(Path(state_dir) / "wallet.json", {**connections(state_dir), provider: conn})
     return conn
 
 
-def disconnect(state_dir: Path) -> None:
-    (Path(state_dir) / "wallet.json").unlink(missing_ok=True)
+def disconnect(state_dir: Path, provider: str | None = None) -> None:
+    """Forget one wallet (or all of them)."""
+    rest = {k: v for k, v in connections(state_dir).items() if provider and k != provider}
+    if rest:
+        _write(Path(state_dir) / "wallet.json", rest)
+    else:
+        (Path(state_dir) / "wallet.json").unlink(missing_ok=True)
 
 
 def _why(reply: Any, key: str) -> Any:
@@ -1004,7 +1024,8 @@ def wallet_view(state_dir: Path, settings: Mapping[str, Any] | None) -> dict[str
         "chain_name": ws.spec["name"] if ws else None,
         "chain_id": ws.spec.get("chain_id") if ws else None,
         "max_trade_usd": ws.max_trade_usd if ws else None,
-        "connected": read_connection(state_dir),
+        "connected": read_connection(state_dir, ws.provider if ws else None),
+        "connections": connections(state_dir),
         "status": status,
         "tickets": open_tickets(state_dir),
         "recent": [
@@ -1028,3 +1049,129 @@ def wallet_view(state_dir: Path, settings: Mapping[str, Any] | None) -> dict[str
         ],
         "explorer": ws.spec["explorer"] if ws else None,
     }
+
+
+# ---------------------------------------------------------------------- the no-cost rehearsal
+def _step(name: str, ok: bool | None, detail: str) -> dict[str, Any]:
+    return {
+        "step": name,
+        "status": "pass" if ok else "unknown" if ok is None else "fail",
+        "detail": detail,
+    }
+
+
+def _simulate(chain: Chain, ws: WalletSettings, tx: Mapping[str, Any]) -> dict[str, Any]:
+    """Ask the chain to run the swap without sending it (no signature, no fee)."""
+    if ws.spec["kind"] == "solana":
+        opts = {"encoding": "base64", "sigVerify": False, "replaceRecentBlockhash": True}
+        res = _dict_or_empty(chain.rpc("simulateTransaction", [tx["tx"], opts]))
+        val = _dict_or_empty(res.get("value"))
+        if val.get("err") is None and val:
+            units = val.get("unitsConsumed")
+            return _step(
+                "simulate", True, f"the chain ran the swap without errors ({units} compute units)"
+            )
+        logs = [x for x in val.get("logs") or [] if "rror" in x or "failed" in x][-2:]
+        why = f"{val.get('err')}" + (": " + " | ".join(logs) if logs else "")
+        return _step("simulate", False, f"the chain refused the swap: {why}")
+    if tx.get("approve"):
+        gas = chain.rpc("eth_estimateGas", [tx["approve"]])
+        return _step(
+            "simulate",
+            True,
+            f"the one-time token approval would work (gas {int(gas, 16):,}); your wallet asks "
+            "for it before your first swap of this token, and the swap itself runs after it",
+        )
+    gas = chain.rpc("eth_estimateGas", [tx["swap"]])
+    return _step("simulate", True, f"the chain ran the swap without errors (gas {int(gas, 16):,})")
+
+
+def _dict_or_empty(v: Any) -> dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+
+def dry_run(
+    state_dir: Path,
+    ws: WalletSettings,
+    *,
+    usd: float = 1.0,
+    http: Http | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Rehearse a real trade with nothing signed or sent: the connected wallet, its balances,
+    a real route for ``usd`` of the stable coin into the network coin, and the chain
+    simulating that swap. The page adds the last step: the wallet signs a test message."""
+    steps = []
+    conn = read_connection(state_dir, ws.provider)
+    if conn is None:
+        steps.append(_step("wallet", False, f"connect {NAMES[ws.provider]} first"))
+        return {"ok": False, "steps": steps}
+    addr = str(conn["address"])
+    steps.append(
+        _step(
+            "wallet",
+            True,
+            f"{conn.get('app') or NAMES[ws.provider]} {addr[:6]}…{addr[-4:]} on {ws.spec['name']}",
+        )
+    )
+    chain = Chain(ws, http, sleep)
+    stable, native = ws.token(ws.stable or ws.spec["stable"]), ws.token(ws.spec["native"])
+    try:
+        bal = all_balances(chain, ws, addr)
+    except WalletError as exc:
+        steps.append(_step("balances", False, f"the {ws.spec['name']} RPC did not answer: {exc}"))
+        return {"ok": False, "steps": steps}
+    have, gas = bal.get(stable["symbol"], 0.0), bal.get(native["symbol"], 0.0)
+    detail = ", ".join(f"{v:.6g} {k}" for k, v in sorted(bal.items()) if v) or "empty"
+    if have <= 0:
+        detail += f"; add some {stable['symbol']} to trade"
+    if gas < ws.reserve / 2:
+        detail += f"; add about {ws.reserve:g} {native['symbol']} for network fees"
+    steps.append(_step("balances", have > 0 and gas >= ws.reserve / 2, detail))
+    amount = min(usd, have) if have > 0 else usd
+    now = int(time.time() * 1000)
+    tid = f"{now}-test{uuid.uuid4().hex[:4]}"
+    ticket = {
+        "id": tid,
+        "status": "pending",
+        "dry_run": True,
+        "side": "buy",
+        "pair": f"{native['symbol']}/{stable['symbol']}",
+        "provider": ws.provider,
+        "chain": ws.chain,
+        "chain_name": ws.spec["name"],
+        "chain_id": ws.spec.get("chain_id"),
+        "address": addr,
+        "token_in": stable,
+        "token_out": native,
+        "amount_in": amount,
+        "amount_in_raw": str(to_raw(amount, stable["decimals"])),
+        "est_out": 0.0,
+        "slippage_bps": ws.slippage_bps,
+        "pre": {},
+        "created_ms": now,
+        "expires_ms": now + 60_000,
+    }
+    _write(wallet_dir(state_dir) / f"{tid}.json", ticket)
+    try:
+        tx = prepare(state_dir, tid, ws, http=http, sleep=sleep)
+        out = int(tx["out_raw"] or 0) / 10 ** native["decimals"]
+        via = "Jupiter" if ws.spec["kind"] == "solana" else "KyberSwap"
+        steps.append(
+            _step(
+                "route",
+                True,
+                f"{via} would swap {amount:g} {stable['symbol']} "
+                f"for about {out:.6g} {native['symbol']}",
+            )
+        )
+        steps.append(_simulate(chain, ws, tx))
+    except WalletError as exc:
+        steps.append(_step("route", False, str(exc)))
+    finally:
+        t = read_ticket(state_dir, tid)
+        if t is not None:
+            t.update(status="tested", error="a test: nothing was signed or sent")
+            _write(wallet_dir(state_dir) / f"{tid}.json", t)
+    ok = all(s["status"] == "pass" for s in steps)
+    return {"ok": ok, "steps": steps, "address": addr, "app": conn.get("app")}

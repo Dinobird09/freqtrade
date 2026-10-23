@@ -10,6 +10,7 @@ Commands::
     dex        the DEX memecoin scanner                (dex_scan)
     lab        the strategy lab's research, now        (lab)
     fetch      download candles                        (fetch_data)
+    voice      set up offline voice commands (Brave)   (voice)
 """
 
 from __future__ import annotations

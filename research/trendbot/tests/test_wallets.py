@@ -33,6 +33,7 @@ class FakeChain:
         self.allow = {}
         self.txs = {}
         self.wrong_decimals = set()
+        self.sim_err = None
         self.n = 0
 
     def fund(self, sym, amount):
@@ -112,7 +113,7 @@ class FakeChain:
             }
         raise AssertionError(url)
 
-    def rpc(self, method, params):
+    def rpc(self, method, params):  # noqa: C901 - one branch per RPC method
         native = next(a for a, t in self.tokens.items() if t["native"])
         if method == "getBalance":
             return {"value": self.raw[native]}
@@ -150,6 +151,18 @@ class FakeChain:
                 return hex(self.raw[to])
             if sel == w.ALLOWANCE:
                 return hex(self.allow.get(to, 0))
+        if method == "simulateTransaction":
+            self.simulated = params
+            return {
+                "value": {
+                    "err": self.sim_err,
+                    "logs": ["Program log: Error: insufficient funds"] if self.sim_err else [],
+                    "unitsConsumed": 81234,
+                }
+            }
+        if method == "eth_estimateGas":
+            self.estimated = params[0]
+            return hex(46_000)
         if method == "eth_getTransactionReceipt":
             st = self.txs.get(params[0])
             return None if st is None else {"status": "0x1" if st == "ok" else "0x0"}
@@ -376,7 +389,8 @@ def test_the_dashboard_connects_and_approves_through_its_api(tmp_path):
     assert code == 400 and "no such trade ticket" in body["message"]
     snap = rt.snapshot("bot")
     assert snap["wallet"]["mode"] == "wallet" and snap["wallet"]["chain_name"] == "Solana"
-    assert snap["wallet"]["connected"]["provider"] == "metamask"
+    assert snap["wallet"]["connected"] is None  # bot.json trades with Phantom
+    assert snap["wallet"]["connections"]["metamask"]["provider"] == "metamask"
     raw["mode"] = "paper"
     time.sleep(0.01)
     settings.write_text(json.dumps(raw))
@@ -456,3 +470,47 @@ def test_the_bot_trades_through_wallet_tickets(tmp_path, monkeypatch):
         assert qty == pytest.approx(
             sum(t.qty for t in trades if not t.is_closed and t.pair.startswith(sym)), abs=1e-6
         )
+
+
+def test_both_wallets_stay_connected_side_by_side(tmp_path):
+    w.connect(tmp_path, "phantom", SOL_ADDR, app="Phantom")
+    w.connect(tmp_path, "metamask", EVM_ADDR, "0x2105", app="Brave Wallet")
+    assert set(w.connections(tmp_path)) == {"phantom", "metamask"}
+    assert w.read_connection(tmp_path, "phantom")["address"] == SOL_ADDR
+    assert w.read_connection(tmp_path, "metamask")["app"] == "Brave Wallet"
+    w.disconnect(tmp_path, "metamask")
+    assert set(w.connections(tmp_path)) == {"phantom"}
+    (tmp_path / "wallet.json").write_text(json.dumps({"provider": "phantom", "address": SOL_ADDR}))
+    assert w.read_connection(tmp_path, "phantom")["address"] == SOL_ADDR  # the old one-wallet file
+
+
+def test_the_wallet_test_rehearses_a_trade_and_sends_nothing(tmp_path):
+    ws, chain, _ = _wallet(tmp_path)
+    chain.fund("USDC", 20)
+    chain.fund("SOL", 0.5)
+    out = w.dry_run(tmp_path, ws, http=chain, sleep=lambda s: None)
+    assert out["ok"], out["steps"]
+    assert [s["step"] for s in out["steps"]] == ["wallet", "balances", "route", "simulate"]
+    assert chain.simulated[1]["sigVerify"] is False  # simulated, never signed or sent
+    assert chain.human("USDC") == 20 and not chain.txs
+    assert w.open_tickets(tmp_path) == [] and w.recent_tickets(tmp_path)[0]["status"] == "tested"
+    chain.sim_err = {"InstructionError": [3, "Custom"]}
+    out = w.dry_run(tmp_path, ws, http=chain, sleep=lambda s: None)
+    sim = out["steps"][-1]
+    assert not out["ok"] and sim["status"] == "fail" and "insufficient funds" in sim["detail"]
+    empty, chain2, _ = _wallet(tmp_path / "empty")
+    out = w.dry_run(tmp_path / "empty", empty, http=chain2, sleep=lambda s: None)
+    assert (
+        "add some USDC" in out["steps"][1]["detail"]
+        and "for network fees" in out["steps"][1]["detail"]
+    )
+
+
+def test_the_wallet_test_on_metamask_checks_the_token_approval(tmp_path):
+    ws, chain, _ = _wallet(tmp_path, "metamask", "base")
+    chain.fund("USDC", 50)
+    chain.fund("ETH", 0.01)
+    out = w.dry_run(tmp_path, ws, http=chain, sleep=lambda s: None)
+    assert out["ok"] and "one-time token approval would work" in out["steps"][-1]["detail"]
+    assert chain.estimated["data"].startswith("0x" + w.APPROVE)
+    assert not w.dry_run(tmp_path / "none", ws, http=chain)["ok"]  # nothing connected there
