@@ -282,3 +282,28 @@ def test_live_snapshot_caches_files_and_overlays_live_prices(state_dir):
     write_journal([], state_dir / "journal.csv")  # a file changed: rebuilt
     c = dash.live_snapshot(state_dir, cfg, now_ms=now + 700)
     assert c["pairs"] is not a["pairs"] and c["open_positions"] == []
+
+
+def test_the_dashboard_shows_why_the_bot_stopped(tmp_path, monkeypatch):
+    import sys
+
+    from research.trendbot import launch
+    from research.trendbot.dashboard import Controller
+
+    d = tmp_path / "state"
+    d.mkdir()
+    (d / "bot.stderr.log").write_bytes(b"an old run's error\n")
+    settings = tmp_path / "bot.json"
+    settings.write_text(json.dumps({"state_dir": str(d)}))
+    crash = "import sys; sys.exit('ccxt is not installed: pip install ccxt')"
+    monkeypatch.setattr(launch, "command", lambda *a: ([sys.executable, "-c", crash], None))
+    ctrl = Controller(d, settings)
+    ok, _ = ctrl._start()
+    assert ok
+    ctrl.proc.wait(timeout=30)
+    st = ctrl.bot_status()
+    assert st["running"] is False and st["last_error"] == "ccxt is not installed: pip install ccxt"
+    monkeypatch.setattr(launch, "command", lambda *a: ([sys.executable, "-c", "pass"], None))
+    ctrl._start()
+    ctrl.proc.wait(timeout=30)
+    assert ctrl.bot_status()["last_error"] is None  # a clean exit is not an error

@@ -580,6 +580,7 @@ class Controller:
         self.dir = state_dir
         self.settings_path = settings_path
         self.proc: subprocess.Popen[bytes] | None = None
+        self._err_from = 0
         self.jobs: dict[str, subprocess.Popen[bytes]] = {}
         self.poll_s = 10.0
         if settings_path is not None:
@@ -600,6 +601,7 @@ class Controller:
             "pid": beat.get("pid"),
             "heartbeat_age_s": None if age_s is None else round(age_s, 1),
             "last_status": beat.get("status"),
+            "last_error": None if running else self.last_error(),
             "can_start": self.settings_path is not None,
             "jobs_running": sorted(
                 [n for n, p in self.jobs.items() if p.poll() is None]
@@ -728,11 +730,26 @@ class Controller:
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             kwargs["start_new_session"] = True  # keeps running if the dashboard stops
-        err = (self.dir / "bot.stderr.log").open("ab")
-        self.proc = subprocess.Popen(
-            cmd, cwd=Path.cwd(), env=env, stdout=subprocess.DEVNULL, stderr=err, **kwargs
-        )
+        log = self.dir / "bot.stderr.log"
+        self._err_from = log.stat().st_size if log.exists() else 0
+        with log.open("ab") as err:  # the bot keeps its own handle
+            self.proc = subprocess.Popen(
+                cmd, cwd=Path.cwd(), env=env, stdout=subprocess.DEVNULL, stderr=err, **kwargs
+            )
         return True, f"bot started (pid {self.proc.pid})"
+
+    def last_error(self) -> str | None:
+        """Why the bot this dashboard started has exited: the end of what it wrote to stderr."""
+        if self.proc is None or self.proc.poll() in (None, 0):
+            return None
+        try:
+            with (self.dir / "bot.stderr.log").open("rb") as fh:
+                fh.seek(self._err_from)
+                text = fh.read().decode("utf-8", "replace")
+        except OSError:
+            text = ""
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        return " | ".join(lines[-2:])[-400:] or f"it exited with code {self.proc.returncode}"
 
 
 class FleetRuntime:

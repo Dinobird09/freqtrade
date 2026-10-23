@@ -1089,6 +1089,7 @@ function renderControls(s) {
   const st = clear(document.getElementById("bot-status"));
   if (!bot) st.append(status("warning", EMBEDDED ? "Static snapshot: no live status" : "Read-only dashboard"));
   else if (bot.running) st.append(status("good", `Bot running (pid ${bot.pid ?? "?"}, heartbeat ${bot.heartbeat_age_s ?? "–"}s ago)`));
+  else if (bot.last_error) st.append(status("critical", `Bot stopped: ${bot.last_error}`));
   else st.append(status("critical", "Bot stopped" + (bot.heartbeat_age_s ? ` (last heartbeat ${Math.round(bot.heartbeat_age_s)}s ago)` : "")));
   const paused = !!(s.control && s.control.entries_paused);
   const start = document.getElementById("btn-start"), stop = document.getElementById("btn-stop");
