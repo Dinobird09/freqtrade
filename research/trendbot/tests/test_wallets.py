@@ -10,9 +10,9 @@ import urllib.parse
 import pytest
 
 from research.trendbot import wallets as w
-from research.trendbot.live_exchange import CcxtGateway
-from research.trendbot.live_bot import BotSettings, TrendBot
 from research.trendbot.journal import read_journal
+from research.trendbot.live_bot import BotSettings, TrendBot
+from research.trendbot.live_exchange import CcxtGateway
 
 from .test_live_bot import PAIRS, WARMUP, FakeExchange
 
@@ -253,7 +253,7 @@ def test_tokens_map_per_chain_and_wrong_setups_are_refused():
 
 
 def test_connect_validates_the_address(tmp_path):
-    with pytest.raises(w.WalletError, match="not a Metamask address"):
+    with pytest.raises(w.WalletError, match="not a MetaMask address"):
         w.connect(tmp_path, "metamask", "0x123")
     with pytest.raises(w.WalletError, match="not a Phantom address"):
         w.connect(tmp_path, "phantom", "0OIl" * 10)

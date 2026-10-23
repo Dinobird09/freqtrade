@@ -189,6 +189,88 @@ microphone the first time. It works on `http://127.0.0.1` or over an SSH tunnel 
 `localhost`. In Chrome and Edge, the browser sends your speech to its own speech service
 (Google or Microsoft) to turn it into text. Only the recognized words reach the bot.
 
+## 4e. Market terminal: live charts with no API key
+
+Open **📈 Market terminal** in the dashboard header, or go to http://127.0.0.1:8050/market.
+It works even when the bot is stopped:
+
+- **Watchlist:** live prices and 24-hour change. Add any coin by typing its symbol (e.g.
+  `LINK`); remove one with ×. The bot's own pairs are added for you.
+- **Live chart:** candlesticks from 1 minute to 1 day, updated tick by tick, with volume and
+  EMA 9, 21 and 200. Scroll to zoom, drag to pan, double-click to reset; hover for the
+  candle's open, high, low and close. The bot's open positions are drawn on it: entry, stop
+  and target.
+- **TradingView:** the same coin in TradingView's free chart (all of TradingView's
+  drawing tools and indicators). It needs no TradingView account or key.
+- **Order book and trades:** the best 12 bids and asks and every trade as it happens.
+- **Price alerts:** type a price and press **Set**. When the price crosses it you get a
+  browser notification and a spoken alert.
+
+**Data:** the page reads the exchanges' free public market data straight from your
+browser: Binance, Binance US or Coinbase (pick one under *data*). If one is blocked where
+you are, pick another. No key is needed and nothing is sent to the exchange except which
+coins to show.
+
+## 4f. Wallets: trading with MetaMask or Phantom
+
+The bot can trade from your own wallet instead of an exchange account:
+
+- **Phantom:** trades on Solana. Example pairs: `SOL/USDT`, `JUP/USDT`, `BONK/USDT`.
+- **MetaMask:** trades on Base, Ethereum, Arbitrum, BNB Chain or Polygon. Example pairs:
+  `ETH/USDT` and `BTC/USDT` on Base; `BNB/USDT` on BNB Chain.
+
+The bot never sees your private key or recovery phrase. Each trade comes to you first:
+
+1. The bot finds a trade that passes the nine rules, or a stop or target is hit.
+2. The dashboard pops up **Chantisimo wants to trade** (and says it out loud if voice is
+   on). It shows the coin, the amount, and the token address.
+3. **Approve in wallet** gets the best swap route (Jupiter on Solana, KyberSwap on the
+   other chains), and your wallet opens with the transaction. Confirm it there. On
+   MetaMask, the first trade of a token asks twice: once to allow the swap to spend it,
+   then for the swap itself.
+4. The bot checks the transaction on the blockchain and records the trade from the
+   change in your wallet balance.
+
+If you don't approve within 2 minutes (`approve_seconds`), an entry is skipped. A stop or
+target exit asks you again every second until it is done, so keep the dashboard open while
+you have positions.
+
+**Set it up:**
+
+1. Install the MetaMask or Phantom browser extension in Chrome or Edge. On a company
+   laptop, ask for it through Iru Self Service, or Freddy in Slack if it isn't there.
+2. Put stable coins in the wallet (USDC; USDT on BNB Chain) to trade with. Also keep a
+   little of the network coin for fees: SOL on Solana, ETH on Base, Ethereum and
+   Arbitrum, BNB on BNB Chain, POL on Polygon.
+3. Edit `bot.json`. Use one state folder per wallet:
+
+   ```json
+   "mode": "wallet",
+   "pairs": ["SOL/USDT", "JUP/USDT"],
+   "state_dir": "trendbot_state/phantom-solana",
+   "wallet": {"provider": "phantom", "chain": "solana", "max_trade_usd": 100}
+   ```
+
+   For MetaMask, use `"provider": "metamask"` with `"chain": "base"` (or `"ethereum"`,
+   `"arbitrum"`, `"bsc"`, `"polygon"`).
+4. Start the dashboard and press **🦊 Connect MetaMask** or **👻 Connect Phantom** in the
+   **Wallet** card. Your balances appear there.
+5. Press **Start**.
+
+**Wallet settings** (all optional except `provider` and `chain`):
+
+| setting | default | what it does |
+|---|---|---|
+| `max_trade_usd` | 100 | most a single swap may spend |
+| `slippage_bps` | 50 | price slippage the swap accepts (50 = 0.5%) |
+| `approve_seconds` | 120 | how long a trade waits for your approval |
+| `rpc_url` | public node | your own RPC URL (Helius, Alchemy, QuickNode…) if the public one is slow |
+| `tokens` | built in | more coins: `{"WIF": {"address": "<mint or contract>", "decimals": 6}}` |
+
+Prices, candles and signals still come from the exchange named in `exchange` (public data,
+no key). Before its first trade of a token, the bot checks the token's decimals on chain, so
+a mistyped address is refused instead of traded.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,
@@ -611,6 +693,17 @@ python trendbot.pyz lab --settings bot.json             # the strategy research,
 
 The dashboard's Start button and the background jobs re-launch the same file. Rebuild it
 after updating the code.
+
+**On Windows, step by step** (a folder with only `trendbot.pyz` and `bot.json` in it):
+
+1. Open the folder in File Explorer, click the address bar, type `cmd` and press Enter.
+2. Once: `py -m venv .venv`, then `.venv\Scripts\python -m pip install ccxt`.
+3. Each time: `.venv\Scripts\python trendbot.pyz dashboard --settings bot.json`. Then open
+   http://127.0.0.1:8050/ and press **Start**.
+
+Always start the command with `.venv\Scripts\python`. A plain `python` opens the Microsoft
+Store instead ("Python was not found"). If the bot can't start, the dashboard's status line
+says why (for example "ccxt is not installed"). Save `bot.json` as UTF-8 in Notepad.
 
 ## 9. Tests (optional)
 

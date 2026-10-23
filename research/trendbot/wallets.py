@@ -55,6 +55,7 @@ from .models import Candle, base_of
 log = logging.getLogger("trendbot.wallet")
 
 PROVIDERS = {"metamask": "evm", "phantom": "solana"}
+NAMES = {"metamask": "MetaMask", "phantom": "Phantom"}
 NATIVE_EVM = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"  # the aggregators' "native coin" address
 STABLES = ("USDT", "USDC", "USD", "BUSD", "FDUSD", "DAI")
 JUPITER = "https://lite-api.jup.ag"
@@ -294,13 +295,14 @@ def _retry(fn: Callable[[], Any], what: str, sleep: Callable[[float], None]) -> 
 
 class Rpc:
     def __init__(
-        self, url: str, http: Http = http_json, sleep: Callable[[float], None] = time.sleep
+        self, url: str, http: Http | None = None, sleep: Callable[[float], None] = time.sleep
     ):
         self.url, self.http, self.sleep = url, http, sleep
 
     def __call__(self, method: str, params: list[Any]) -> Any:
         body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        reply = _retry(lambda: self.http(self.url, body, None), f"RPC {method}", self.sleep)
+        http = self.http or http_json  # looked up per call, so a test can swap the network
+        reply = _retry(lambda: http(self.url, body, None), f"RPC {method}", self.sleep)
         if not isinstance(reply, Mapping):
             raise WalletError(f"RPC {method}: unexpected reply")
         if reply.get("error"):
@@ -336,7 +338,7 @@ class Chain:
     def __init__(
         self,
         ws: WalletSettings,
-        http: Http = http_json,
+        http: Http | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ):
         self.ws = ws
@@ -444,11 +446,13 @@ def write_status(
         log.warning("wallet status not written: %s", exc)
 
 
-def refresh_status(state_dir: Path, ws: WalletSettings, http: Http = http_json) -> dict[str, float]:
+def refresh_status(
+    state_dir: Path, ws: WalletSettings, http: Http | None = None
+) -> dict[str, float]:
     """Read the connected wallet's balances now (the dashboard does this on connect)."""
     conn = read_connection(state_dir)
     if conn is None or conn.get("provider") != ws.provider:
-        raise WalletError(f"connect {ws.provider.title()} first")
+        raise WalletError(f"connect {NAMES[ws.provider]} first")
     bal = all_balances(Chain(ws, http, lambda s: None), ws, str(conn["address"]))
     write_status(state_dir, ws, str(conn["address"]), bal, int(time.time() * 1000))
     return bal
@@ -548,7 +552,7 @@ class WalletBroker:
         ws: WalletSettings,
         state_dir: Path,
         *,
-        http: Http = http_json,
+        http: Http | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -569,8 +573,8 @@ class WalletBroker:
         conn = read_connection(state_dir)
         if conn is None or conn.get("provider") != ws.provider:
             raise SystemExit(
-                f"connect {ws.provider.title()} first: open the dashboard, Wallet card, "
-                f"Connect {ws.provider.title()}"
+                f"connect {NAMES[ws.provider]} first: open the dashboard, Wallet card, "
+                f"Connect {NAMES[ws.provider]}"
             )
         try:
             import ccxt
@@ -604,7 +608,7 @@ class WalletBroker:
         conn = read_connection(self.dir)
         if conn is None:
             raise WalletError(
-                f"no wallet connected: open the dashboard and connect {self.ws.provider.title()}"
+                f"no wallet connected: open the dashboard and connect {NAMES[self.ws.provider]}"
             )
         if conn.get("provider") != self.ws.provider:
             raise WalletError(
@@ -701,7 +705,7 @@ class WalletBroker:
             tin["symbol"],
             est_out,
             tout["symbol"],
-            self.ws.provider.title(),
+            NAMES[self.ws.provider],
             tid,
         )
         return self._await(tid)
@@ -776,7 +780,7 @@ class WalletBroker:
                 error="no swap seen in the wallet",
             )
             raise WalletError(
-                f"ticket {t['id']}: no swap seen in the wallet; check {self.ws.provider.title()}"
+                f"ticket {t['id']}: no swap seen in the wallet; check {NAMES[self.ws.provider]}"
             )
         spent = min(spent, float(t["amount_in"])) if spent > 0 else float(t["amount_in"])
         if tin["native"]:
@@ -809,7 +813,7 @@ def connect(state_dir: Path, provider: str, address: str, chain_id: Any = None) 
     else:
         ok = 32 <= len(address) <= 44 and all(c in _B58 for c in address)
     if not ok:
-        raise WalletError(f"that is not a {provider.title()} address")
+        raise WalletError(f"that is not a {NAMES[provider]} address")
     chain = None
     if chain_id is not None:
         try:
@@ -842,10 +846,11 @@ def prepare(
     tid: str,
     ws: WalletSettings,
     *,
-    http: Http = http_json,
+    http: Http | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Approve a pending ticket: fetch a route and return the transaction(s) for the wallet."""
+    http = http or http_json
     t = read_ticket(state_dir, tid)
     if t is None:
         raise WalletError("no such trade ticket")

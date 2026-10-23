@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en" data-theme="jarvis">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chantisimo · market terminal</title>
+<style>
+/* Live market terminal: free public market data (no API keys), the bot's positions on top. */
+:root {
+  --page: #020b14; --surface-1: rgba(4, 20, 34, 0.82); --surface-2: rgba(0, 40, 60, 0.45);
+  --border: rgba(0, 229, 255, 0.28); --text-primary: #d6f8ff; --text-secondary: #8fc3d1; --text-muted: #5f8a97;
+  --accent: #00e5ff; --up: #2ee6a6; --down: #ff5c6c; --warn: #ffc857; --glow: 0 0 16px rgba(0, 229, 255, 0.25);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: radial-gradient(ellipse at 50% -10%, #06324a 0%, var(--page) 60%); color: var(--text-primary);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border);
+  flex-wrap: wrap; }
+h1 { margin: 0; font-size: 18px; letter-spacing: 0.14em; text-transform: uppercase; color: #7fefff;
+  font-family: "Orbitron", "Rajdhani", ui-monospace, monospace; text-shadow: 0 0 8px rgba(0, 229, 255, 0.55); }
+h2 { margin: 0; font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase; color: #7fefff;
+  font-family: "Orbitron", "Rajdhani", ui-monospace, monospace; }
+a { color: var(--accent); }
+.spacer { flex: 1; }
+.muted { color: var(--text-muted); }
+button, select, input { font: inherit; color: var(--text-primary); background: rgba(0, 40, 60, 0.6);
+  border: 1px solid var(--border); border-radius: 5px; padding: 4px 9px; }
+button { cursor: pointer; }
+button:hover { box-shadow: var(--glow); border-color: var(--accent); }
+button.on { background: linear-gradient(180deg, #00b8d4, #007c99); color: #001018; border-color: var(--accent); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); margin-right: 6px; }
+.dot.live { background: var(--up); box-shadow: 0 0 8px var(--up); }
+.dot.bad { background: var(--down); }
+main { display: grid; gap: 10px; padding: 10px; height: calc(100% - 52px);
+  grid-template-columns: 280px minmax(0, 1fr) 290px; grid-template-rows: minmax(0, 1fr) auto; }
+.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 4px; box-shadow: var(--glow);
+  display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.panel-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.panel-body { overflow: auto; min-height: 0; flex: 1; }
+#watch { grid-row: 1 / 3; }
+#chart-panel { grid-column: 2; grid-row: 1; }
+#side { grid-column: 3; grid-row: 1 / 3; display: grid; grid-template-rows: minmax(0, 1.2fr) minmax(0, 1fr); gap: 10px; min-height: 0; }
+#bot { grid-column: 2; grid-row: 2; max-height: 230px; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { padding: 4px 8px; text-align: right; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text-muted); font-weight: 500; font-size: 11px; position: sticky; top: 0; background: #041a2a; }
+tbody tr { cursor: default; }
+#watch tbody tr { cursor: pointer; }
+#watch th, #watch td { padding: 4px 5px; }
+#watch tbody tr:hover td, #watch tbody tr.sel td { background: rgba(0, 229, 255, 0.07); }
+#watch tbody tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.up { color: var(--up); } .down { color: var(--down); }
+.flash-up { animation: fu 0.6s; } .flash-down { animation: fd 0.6s; }
+@keyframes fu { from { background: rgba(46, 230, 166, 0.25); } to { background: transparent; } }
+@keyframes fd { from { background: rgba(255, 92, 108, 0.25); } to { background: transparent; } }
+.x { border: 0; background: none; color: var(--text-muted); padding: 0 4px; }
+.add { display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid var(--border); }
+.add input { flex: 1; min-width: 0; text-transform: uppercase; }
+#chart-wrap { position: relative; flex: 1; min-height: 260px; }
+#chart { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+#tv-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: none; background: #000; }
+#ohlc { position: absolute; left: 10px; top: 6px; right: 80px; pointer-events: none; font-variant-numeric: tabular-nums;
+  color: var(--text-secondary); font-size: 12px; text-shadow: 0 0 4px #000; }
+#chart-msg { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; text-align: center;
+  padding: 20px; color: var(--text-secondary); }
+.seg { display: inline-flex; gap: 2px; }
+.seg button { padding: 3px 7px; }
+.book td { padding: 2px 8px; position: relative; }
+.book .bar { position: absolute; top: 1px; bottom: 1px; right: 0; opacity: 0.18; pointer-events: none; }
+.book .mid td { text-align: center; padding: 6px; font-size: 15px; font-weight: 600; }
+.tape td { padding: 2px 8px; }
+.kv { display: flex; gap: 18px; flex-wrap: wrap; padding: 8px 10px; }
+.kv b { color: var(--text-primary); font-weight: 600; }
+.alert-row { display: flex; gap: 6px; align-items: center; }
+.alert-row input { width: 110px; }
+@media (max-width: 1100px) {
+  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; height: auto; }
+  #watch, #chart-panel, #side, #bot { grid-column: 1; grid-row: auto; }
+  #watch .panel-body { max-height: 260px; }
+  #chart-wrap { height: 62vh; flex: none; }
+  #side { grid-template-rows: 380px 320px; }
+  #bot { max-height: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Market terminal</h1>
+  <span class="muted">live prices &amp; charts from free public exchange data, no API key</span>
+  <span class="spacer"></span>
+  <label class="muted">data <select id="source" aria-label="Data source">
+    <option value="binance">Binance</option><option value="binanceus">Binance US</option><option value="coinbase">Coinbase</option>
+  </select></label>
+  <span id="conn"><span class="dot"></span>connecting…</span>
+  <a href="./" id="back">← dashboard</a>
+</header>
+<main>
+  <section class="panel" id="watch" aria-label="Watchlist">
+    <div class="panel-head"><h2>Watchlist</h2><span class="spacer"></span><span class="muted" id="watch-sub"></span></div>
+    <div class="panel-body"><table><thead><tr><th>pair</th><th>last</th><th>24h</th><th></th></tr></thead><tbody id="watch-rows"></tbody></table></div>
+    <form class="add" id="add-form"><input id="add-input" placeholder="add coin, e.g. LINK" aria-label="Add a coin" autocomplete="off"><button type="submit">Add</button></form>
+  </section>
+
+  <section class="panel" id="chart-panel" aria-label="Chart">
+    <div class="panel-head">
+      <h2 id="chart-title">–</h2><span id="chart-last" style="font-size:16px;font-weight:600"></span><span id="chart-chg"></span>
+      <span class="spacer"></span>
+      <span class="seg" id="tfs" role="group" aria-label="Timeframe"></span>
+      <span class="seg" role="group" aria-label="Indicators">
+        <button type="button" class="on" data-ema="9">EMA9</button><button type="button" class="on" data-ema="21">EMA21</button><button type="button" class="on" data-ema="200">EMA200</button>
+      </span>
+      <span class="seg" role="group" aria-label="Chart type"><button type="button" class="on" id="view-live">Live chart</button><button type="button" id="view-tv">TradingView</button></span>
+    </div>
+    <div id="chart-wrap">
+      <canvas id="chart" aria-label="Price chart. Drag to pan, scroll to zoom, double-click to reset."></canvas>
+      <div id="ohlc"></div>
+      <div id="chart-msg"></div>
+      <iframe id="tv-frame" title="TradingView chart" referrerpolicy="no-referrer"></iframe>
+    </div>
+  </section>
+
+  <div id="side">
+    <section class="panel" aria-label="Order book">
+      <div class="panel-head"><h2>Order book</h2><span class="spacer"></span><span class="muted" id="book-sub"></span></div>
+      <div class="panel-body"><table class="book"><thead><tr><th>price</th><th>size</th><th>total</th></tr></thead><tbody id="book-rows"></tbody></table></div>
+    </section>
+    <section class="panel" aria-label="Recent trades">
+      <div class="panel-head"><h2>Trades</h2><span class="spacer"></span><span class="muted" id="tape-sub"></span></div>
+      <div class="panel-body"><table class="tape"><thead><tr><th>time</th><th>price</th><th>size</th></tr></thead><tbody id="tape-rows"></tbody></table></div>
+    </section>
+  </div>
+
+  <section class="panel" id="bot" aria-label="The bot">
+    <div class="panel-head"><h2>Chantisimo</h2><span class="muted" id="bot-sub">looking for the bot…</span><span class="spacer"></span>
+      <span class="alert-row"><span class="muted">alert at</span><input id="alert-px" inputmode="decimal" placeholder="price" aria-label="Alert price"><button type="button" id="alert-set">Set</button><span class="muted" id="alert-list"></span></span>
+    </div>
+    <div class="panel-body" id="bot-body"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// ------------------------------------------------------------------ helpers
+function el(tag, attrs, text) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v !== null && v !== undefined) n.setAttribute(k, v);
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); return n; }
+function decimals(p) { const a = Math.abs(p); return a >= 1000 ? 2 : a >= 10 ? 3 : a >= 1 ? 4 : a >= 0.01 ? 5 : 8; }
+function fmt(p, d) { return p === null || p === undefined || !isFinite(p) ? "–" : Number(p).toLocaleString(undefined, { minimumFractionDigits: d ?? decimals(p), maximumFractionDigits: d ?? decimals(p) }); }
+function compact(v) { return !isFinite(v) ? "–" : Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 2 }).format(v); }
+function hhmmss(ms) { return new Date(ms).toLocaleTimeString(undefined, { hour12: false }); }
+const store = { get(k, d) { try { const v = JSON.parse(localStorage.getItem("mt." + k)); return v ?? d; } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("mt." + k, JSON.stringify(v)); } catch (e) { /* private mode */ } } };
+
+// ------------------------------------------------------------------ data sources (public, keyless)
+const TF = { "1m": 60e3, "5m": 300e3, "15m": 900e3, "1h": 3600e3, "4h": 14400e3, "1d": 86400e3 };
+const TV_TF = { "1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D" };
+async function getJSON(urls, path) {
+  let last;
+  for (const base of urls) {
+    try {
+      const r = await fetch(base + path, { cache: "no-store" });
+      if (r.ok) return await r.json();
+      last = new Error(`${r.status} ${r.statusText}`);
+    } catch (e) { last = e; }
+  }
+  throw last || new Error("unreachable");
+}
+function binanceLike(name, rest, ws, tvPrefix) {
+  const sym = (p) => p.replace("/", "");
+  return {
+    name, tvPrefix, quote: "USDT",
+    pair: (base) => `${base}/USDT`,
+    tv: (p) => `${tvPrefix}:${sym(p)}`,
+    async candles(p, tf) {
+      const rows = await getJSON(rest, `/api/v3/klines?symbol=${sym(p)}&interval=${tf}&limit=500`);
+      return rows.map((r) => ({ t: r[0], o: +r[1], h: +r[2], l: +r[3], c: +r[4], v: +r[5] }));
+    },
+    async stats(pairs) {
+      const out = {};
+      const rows = await getJSON(rest, `/api/v3/ticker/24hr?symbols=${encodeURIComponent(JSON.stringify(pairs.map(sym)))}`);
+      for (const r of rows) { const p = pairs.find((x) => sym(x) === r.symbol); if (p) out[p] = { last: +r.lastPrice, open: +r.openPrice, vol: +r.quoteVolume }; }
+      return out;
+    },
+    async book(p) { const b = await getJSON(rest, `/api/v3/depth?symbol=${sym(p)}&limit=20`); return { bids: b.bids.map((x) => [+x[0], +x[1]]), asks: b.asks.map((x) => [+x[0], +x[1]]) }; },
+    connect(p, tf, watch, on) {
+      const s = sym(p).toLowerCase();
+      const streams = [`${s}@kline_${tf}`, `${s}@aggTrade`, `${s}@depth20@100ms`, ...watch.map((w) => `${sym(w).toLowerCase()}@miniTicker`)];
+      let i = 0, sock = null, closed = false;
+      const open = () => {
+        sock = new WebSocket(`${ws[i % ws.length]}/stream?streams=${streams.join("/")}`);
+        sock.onopen = () => on.status(true);
+        sock.onmessage = (ev) => {
+          const m = JSON.parse(ev.data), d = m.data || {}, st = m.stream || "";
+          if (st.endsWith(`@kline_${tf}`)) { const k = d.k; on.candle({ t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c, v: +k.v }); }
+          else if (st.endsWith("@aggTrade")) on.trade({ t: d.T, p: +d.p, q: +d.q, buy: !d.m });
+          else if (st.includes("@depth")) on.book({ bids: d.bids.map((x) => [+x[0], +x[1]]), asks: d.asks.map((x) => [+x[0], +x[1]]) });
+          else if (st.endsWith("@miniTicker")) { const w = watch.find((x) => sym(x) === d.s); if (w) on.ticker(w, { last: +d.c, open: +d.o, vol: +d.q }); }
+        };
+        sock.onclose = () => { on.status(false); if (!closed) { i++; setTimeout(open, Math.min(30e3, 1500 * i)); } };
+      };
+      open();
+      return () => { closed = true; if (sock) sock.close(); };
+    },
+  };
+}
+function coinbase() {
+  const rest = ["https://api.exchange.coinbase.com"];
+  const id = (p) => p.replace("/USDT", "/USD").replace("/USDC", "/USD").replace("/", "-");
+  const gran = { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 3600, "1d": 86400 };
+  return {
+    name: "Coinbase", quote: "USD",
+    pair: (base) => `${base}/USD`,
+    tv: (p) => `COINBASE:${id(p).replace("-", "")}`,
+    async candles(p, tf) {
+      const rows = await getJSON(rest, `/products/${id(p)}/candles?granularity=${gran[tf]}`);
+      let cs = rows.map((r) => ({ t: r[0] * 1000, l: +r[1], h: +r[2], o: +r[3], c: +r[4], v: +r[5] })).sort((a, b) => a.t - b.t);
+      if (tf === "4h") {  // Coinbase has no 4h candles: built from 1h
+        const out = [];
+        for (const c of cs) {
+          const t = Math.floor(c.t / TF["4h"]) * TF["4h"], last = out[out.length - 1];
+          if (last && last.t === t) { last.h = Math.max(last.h, c.h); last.l = Math.min(last.l, c.l); last.c = c.c; last.v += c.v; }
+          else out.push({ ...c, t });
+        }
+        cs = out;
+      }
+      return cs;
+    },
+    async stats(pairs) {
+      const out = {};
+      await Promise.all(pairs.map(async (p) => {
+        try { const s = await getJSON(rest, `/products/${id(p)}/stats`); out[p] = { last: +s.last, open: +s.open, vol: +s.volume * +s.last }; } catch (e) { /* unknown on Coinbase */ }
+      }));
+      return out;
+    },
+    async book(p) {
+      const b = await getJSON(rest, `/products/${id(p)}/book?level=2`);
+      return { bids: b.bids.slice(0, 20).map((x) => [+x[0], +x[1]]), asks: b.asks.slice(0, 20).map((x) => [+x[0], +x[1]]) };
+    },
+    connect(p, tf, watch, on) {
+      let sock = null, closed = false, n = 0, poll = null;
+      const ids = [...new Set([id(p), ...watch.map(id)])];
+      const open = () => {
+        sock = new WebSocket("wss://ws-feed.exchange.coinbase.com");
+        sock.onopen = () => { on.status(true); sock.send(JSON.stringify({ type: "subscribe", product_ids: ids, channels: ["ticker", "matches"] })); };
+        sock.onmessage = (ev) => {
+          const m = JSON.parse(ev.data);
+          if (m.type === "ticker") {
+            const w = watch.find((x) => id(x) === m.product_id);
+            if (w) on.ticker(w, { last: +m.price, open: +m.open_24h, vol: +m.volume_24h * +m.price });
+            if (m.product_id === id(p)) on.price(+m.price, Date.parse(m.time) || Date.now());
+          } else if ((m.type === "match" || m.type === "last_match") && m.product_id === id(p)) {
+            on.trade({ t: Date.parse(m.time) || Date.now(), p: +m.price, q: +m.size, buy: m.side === "sell" });
+          }
+        };
+        sock.onclose = () => { on.status(false); if (!closed) { n++; setTimeout(open, Math.min(30e3, 1500 * n)); } };
+      };
+      open();
+      const book = () => this.book(p).then(on.book).catch(() => {});
+      book(); poll = setInterval(book, 3000);
+      return () => { closed = true; clearInterval(poll); if (sock) sock.close(); };
+    },
+  };
+}
+const SOURCES = {
+  binance: binanceLike("Binance", ["https://api.binance.com", "https://data-api.binance.vision"], ["wss://stream.binance.com:9443", "wss://data-stream.binance.vision"], "BINANCE"),
+  binanceus: binanceLike("Binance US", ["https://api.binance.us"], ["wss://stream.binance.us:9443"], "BINANCEUS"),
+  coinbase: coinbase(),
+};
+
+// ------------------------------------------------------------------ state
+const S = {
+  source: store.get("source", "binance"), tf: store.get("tf", "1h"),
+  bases: store.get("bases", ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]), base: store.get("base", "BTC"),
+  ema: store.get("ema", { 9: true, 21: true, 200: true }), view: "live",
+  candles: [], stats: {}, trades: [], book: null, bot: null, alerts: store.get("alerts", []),
+  offset: 0, barW: 8, hover: null, dirty: true, stop: null, gen: 0,
+};
+const src = () => SOURCES[S.source];
+const pairOf = (b) => src().pair(b);
+const sel = () => pairOf(S.base);
+
+// ------------------------------------------------------------------ watchlist
+function renderWatch() {
+  const tb = clear(document.getElementById("watch-rows"));
+  for (const b of S.bases) {
+    const p = pairOf(b), st = S.stats[p] || {};
+    const chg = st.open ? (st.last / st.open - 1) * 100 : null;
+    const tr = el("tr", { class: b === S.base ? "sel" : null, "data-base": b, tabindex: "0" });
+    tr.append(el("td", {}, p), el("td", { class: "last" }, fmt(st.last)),
+      el("td", { class: chg === null ? "" : chg >= 0 ? "up" : "down" }, chg === null ? "–" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`));
+    const x = el("button", { type: "button", class: "x", title: `remove ${b}`, "aria-label": `remove ${b}` }, "×");
+    x.onclick = (e) => { e.stopPropagation(); S.bases = S.bases.filter((y) => y !== b); store.set("bases", S.bases); if (S.base === b) select(S.bases[0] || "BTC"); else restart(); };
+    const td = el("td"); td.append(x); tr.append(td);
+    tr.onclick = () => select(b);
+    tr.onkeydown = (e) => { if (e.key === "Enter") select(b); };
+    tb.append(tr);
+  }
+  document.getElementById("watch-sub").textContent = src().name;
+}
+function updateTicker(p, st) {
+  const prev = S.stats[p];
+  S.stats[p] = st;
+  const base = S.bases.find((b) => pairOf(b) === p);
+  const row = base && document.querySelector(`#watch-rows tr[data-base="${base}"]`);
+  if (row) {
+    const last = row.querySelector(".last"), chgCell = row.children[2];
+    if (prev && prev.last !== st.last) { last.classList.remove("flash-up", "flash-down"); void last.offsetWidth; last.classList.add(st.last > prev.last ? "flash-up" : "flash-down"); }
+    last.textContent = fmt(st.last);
+    const chg = st.open ? (st.last / st.open - 1) * 100 : null;
+    chgCell.className = chg === null ? "" : chg >= 0 ? "up" : "down";
+    chgCell.textContent = chg === null ? "–" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`;
+  }
+  if (p === sel()) header();
+  checkAlerts(p, st.last, prev && prev.last);
+}
+document.getElementById("add-form").onsubmit = (e) => {
+  e.preventDefault();
+  const inp = document.getElementById("add-input");
+  const b = inp.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/(USDT|USDC|USD)$/, "");
+  inp.value = "";
+  if (!b || b.length > 12) return;
+  if (!S.bases.includes(b)) { S.bases.push(b); store.set("bases", S.bases); }
+  select(b);
+};
+
+// ------------------------------------------------------------------ chart
+const cv = document.getElementById("chart"), ctx = cv.getContext("2d");
+function ema(cs, n) {
+  const k = 2 / (n + 1), out = new Array(cs.length).fill(null);
+  let e = null;
+  for (let i = 0; i < cs.length; i++) { e = e === null ? cs[i].c : cs[i].c * k + e * (1 - k); if (i >= n - 1) out[i] = e; }
+  return out;
+}
+const EMA_COLOR = { 9: "#ffc857", 21: "#b28dff", 200: "#00e5ff" };
+function layout() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  if (cv.width !== Math.round(r.width * dpr) || cv.height !== Math.round(r.height * dpr)) {
+    cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { W: r.width, H: r.height, axis: 72, bottom: 22 };
+}
+function visible(L) {
+  const n = Math.max(5, Math.floor((L.W - L.axis) / S.barW));
+  const end = Math.max(0, S.candles.length - S.offset);
+  return { from: Math.max(0, end - n), to: end, n };
+}
+function draw() {
+  S.dirty = false;
+  const L = layout(), cs = S.candles;
+  ctx.clearRect(0, 0, L.W, L.H);
+  if (!cs.length) return;
+  const v = visible(L), win = cs.slice(v.from, v.to);
+  if (!win.length) return;
+  const priceH = (L.H - L.bottom) * 0.8, volTop = priceH + 6, volH = L.H - L.bottom - volTop;
+  const lines = botLines();
+  let lo = Math.min(...win.map((c) => c.l)), hi = Math.max(...win.map((c) => c.h));
+  for (const ln of lines) if (ln.p > lo - (hi - lo) * 0.5 && ln.p < hi + (hi - lo) * 0.5) { lo = Math.min(lo, ln.p); hi = Math.max(hi, ln.p); }
+  const pad = (hi - lo) * 0.06 || hi * 0.01 || 1; lo -= pad; hi += pad;
+  const y = (p) => 8 + (hi - p) / (hi - lo) * (priceH - 8);
+  const plotW = L.W - L.axis, x0 = plotW - win.length * S.barW;
+  const x = (i) => x0 + (i - v.from) * S.barW + S.barW / 2;
+  // grid + price axis
+  ctx.font = "11px system-ui, sans-serif"; ctx.textBaseline = "middle";
+  const step = niceStep((hi - lo) / 6);
+  for (let p = Math.ceil(lo / step) * step; p <= hi; p += step) {
+    ctx.strokeStyle = "rgba(0,229,255,0.07)"; ctx.beginPath(); ctx.moveTo(0, y(p)); ctx.lineTo(plotW, y(p)); ctx.stroke();
+    ctx.fillStyle = "#5f8a97"; ctx.fillText(fmt(p), plotW + 6, y(p));
+  }
+  // time axis
+  const every = Math.max(1, Math.ceil(90 / S.barW));
+  ctx.fillStyle = "#5f8a97"; ctx.textAlign = "center";
+  for (let i = v.from; i < v.to; i++) if ((i - v.from) % every === 0) {
+    const d = new Date(cs[i].t);
+    const label = TF[S.tf] >= TF["1d"] ? d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      : TF[S.tf] >= TF["4h"] ? `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${String(d.getHours()).padStart(2, "0")}h`
+      : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+    ctx.fillText(label, x(i), L.H - L.bottom / 2);
+    ctx.strokeStyle = "rgba(0,229,255,0.05)"; ctx.beginPath(); ctx.moveTo(x(i), 0); ctx.lineTo(x(i), L.H - L.bottom); ctx.stroke();
+  }
+  ctx.textAlign = "left";
+  // volume
+  const vmax = Math.max(...win.map((c) => c.v)) || 1;
+  for (let i = v.from; i < v.to; i++) {
+    const c = cs[i], h = c.v / vmax * volH;
+    ctx.fillStyle = c.c >= c.o ? "rgba(46,230,166,0.28)" : "rgba(255,92,108,0.28)";
+    ctx.fillRect(x(i) - S.barW * 0.35, volTop + volH - h, Math.max(1, S.barW * 0.7), h);
+  }
+  // candles
+  for (let i = v.from; i < v.to; i++) {
+    const c = cs[i], up = c.c >= c.o, col = up ? "#2ee6a6" : "#ff5c6c";
+    ctx.strokeStyle = col; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.moveTo(Math.round(x(i)) + 0.5, y(c.h)); ctx.lineTo(Math.round(x(i)) + 0.5, y(c.l)); ctx.stroke();
+    const top = y(Math.max(c.o, c.c)), bh = Math.max(1, Math.abs(y(c.o) - y(c.c)));
+    ctx.fillRect(x(i) - S.barW * 0.35, top, Math.max(1, S.barW * 0.7), bh);
+  }
+  // EMAs (computed on the whole history, so EMA200 is right at the left edge too)
+  for (const n of [9, 21, 200]) {
+    if (!S.ema[n]) continue;
+    const e = ema(cs, n);
+    ctx.strokeStyle = EMA_COLOR[n]; ctx.lineWidth = 1.2; ctx.beginPath();
+    let started = false;
+    for (let i = v.from; i < v.to; i++) { if (e[i] === null) continue; if (!started) { ctx.moveTo(x(i), y(e[i])); started = true; } else ctx.lineTo(x(i), y(e[i])); }
+    ctx.stroke(); ctx.lineWidth = 1;
+  }
+  // the bot's entry / stop / target, and price alerts
+  for (const ln of lines) {
+    if (ln.p < lo || ln.p > hi) continue;
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = ln.color; ctx.beginPath(); ctx.moveTo(0, y(ln.p)); ctx.lineTo(plotW, y(ln.p)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = ln.color; ctx.fillText(`${ln.label} ${fmt(ln.p)}`, 8, y(ln.p) - 8);
+  }
+  // last price
+  const last = cs[cs.length - 1];
+  if (v.to === cs.length) {
+    const ly = y(last.c), col = last.c >= last.o ? "#2ee6a6" : "#ff5c6c";
+    ctx.setLineDash([2, 3]); ctx.strokeStyle = col; ctx.beginPath(); ctx.moveTo(0, ly); ctx.lineTo(plotW, ly); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = col; ctx.fillRect(plotW + 1, ly - 9, L.axis - 2, 18);
+    ctx.fillStyle = "#001018"; ctx.fillText(fmt(last.c), plotW + 6, ly);
+  }
+  // crosshair
+  const hv = S.hover;
+  let shown = last;
+  if (hv && hv.x < plotW && hv.y < L.H - L.bottom) {
+    const i = Math.min(v.to - 1, Math.max(v.from, v.from + Math.floor((hv.x - x0) / S.barW)));
+    shown = cs[i];
+    ctx.strokeStyle = "rgba(214,248,255,0.35)"; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x(i), 0); ctx.lineTo(x(i), L.H - L.bottom); ctx.moveTo(0, hv.y); ctx.lineTo(plotW, hv.y); ctx.stroke(); ctx.setLineDash([]);
+    if (hv.y < priceH) {
+      const p = hi - (hv.y - 8) / (priceH - 8) * (hi - lo);
+      ctx.fillStyle = "#0a3550"; ctx.fillRect(plotW + 1, hv.y - 9, L.axis - 2, 18);
+      ctx.fillStyle = "#d6f8ff"; ctx.fillText(fmt(p), plotW + 6, hv.y);
+    }
+  }
+  const chg = shown.o ? (shown.c / shown.o - 1) * 100 : 0;
+  document.getElementById("ohlc").textContent = `${new Date(shown.t).toLocaleString(undefined, { hour12: false })}   O ${fmt(shown.o)}  H ${fmt(shown.h)}  L ${fmt(shown.l)}  C ${fmt(shown.c)}  ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%  vol ${compact(shown.v)}`;
+}
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw || 1))), m = raw / p;
+  return (m < 1.5 ? 1 : m < 3 ? 2 : m < 7 ? 5 : 10) * p;
+}
+function botLines() {
+  const out = [];
+  const pos = ((S.bot && S.bot.open_positions) || []).filter((p) => p.pair.split("/")[0] === S.base);
+  for (const p of pos) {
+    out.push({ p: p.entry, label: `entry #${p.trade_id ?? ""}`, color: "#d6f8ff" });
+    out.push({ p: p.stop, label: "stop", color: "#ff5c6c" });
+    out.push({ p: p.target, label: "target", color: "#2ee6a6" });
+  }
+  for (const a of S.alerts) if (a.base === S.base) out.push({ p: a.price, label: "alert", color: "#ffc857" });
+  return out;
+}
+function frame() { if (S.dirty && S.view === "live") draw(); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+new ResizeObserver(() => { S.dirty = true; }).observe(cv);
+let drag = null;
+cv.addEventListener("pointerdown", (e) => { drag = { x: e.clientX, off: S.offset }; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", (e) => {
+  const r = cv.getBoundingClientRect();
+  S.hover = { x: e.clientX - r.left, y: e.clientY - r.top };
+  if (drag) S.offset = Math.max(0, Math.min(S.candles.length - 5, drag.off + Math.round((e.clientX - drag.x) / S.barW)));
+  S.dirty = true;
+});
+cv.addEventListener("pointerup", () => { drag = null; });
+cv.addEventListener("pointerleave", () => { S.hover = null; S.dirty = true; });
+cv.addEventListener("wheel", (e) => { e.preventDefault(); S.barW = Math.max(3, Math.min(40, S.barW * (e.deltaY < 0 ? 1.15 : 0.87))); S.dirty = true; }, { passive: false });
+cv.addEventListener("dblclick", () => { S.offset = 0; S.barW = 8; S.dirty = true; });
+
+function onCandle(c) {
+  const cs = S.candles, last = cs[cs.length - 1];
+  if (last && c.t === last.t) cs[cs.length - 1] = c;
+  else if (!last || c.t > last.t) { cs.push(c); if (cs.length > 1500) cs.shift(); if (S.offset > 0) S.offset++; }
+  S.dirty = true; header();
+}
+function onPrice(p, t) {  // sources without a candle stream: grow the forming candle from trades
+  const cs = S.candles, ms = TF[S.tf], start = Math.floor(t / ms) * ms, last = cs[cs.length - 1];
+  if (!last) return;
+  if (start > last.t) onCandle({ t: start, o: p, h: p, l: p, c: p, v: 0 });
+  else onCandle({ ...last, h: Math.max(last.h, p), l: Math.min(last.l, p), c: p });
+}
+function header() {
+  const p = sel(), st = S.stats[p] || {}, last = S.candles.length ? S.candles[S.candles.length - 1].c : st.last;
+  document.getElementById("chart-title").textContent = p;
+  document.getElementById("chart-last").textContent = fmt(last);
+  const chg = st.open && last ? (last / st.open - 1) * 100 : null, c = document.getElementById("chart-chg");
+  c.className = chg === null ? "muted" : chg >= 0 ? "up" : "down";
+  c.textContent = chg === null ? "" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}% 24h`;
+  document.title = `${fmt(last)} ${p} · Chantisimo`;
+}
+
+// ------------------------------------------------------------------ book + tape
+function renderBook() {
+  const b = S.book, tb = clear(document.getElementById("book-rows"));
+  if (!b) return;
+  const asks = b.asks.slice(0, 12).reverse(), bids = b.bids.slice(0, 12);
+  const max = Math.max(...[...asks, ...bids].map((r) => r[1])) || 1;
+  const row = (r, side) => {
+    const tr = el("tr");
+    const td = el("td", { class: side }, fmt(r[0]));
+    const bar = el("div", { class: "bar" }); bar.style.width = `${(r[1] / max) * 100}%`; bar.style.background = side === "up" ? "var(--up)" : "var(--down)";
+    td.append(bar);
+    tr.append(td, el("td", {}, compact(r[1])), el("td", { class: "muted" }, compact(r[0] * r[1])));
+    tb.append(tr);
+  };
+  for (const r of asks) row(r, "down");
+  const mid = el("tr", { class: "mid" });
+  const spread = b.asks[0] && b.bids[0] ? b.asks[0][0] - b.bids[0][0] : null;
+  const td = el("td", { colspan: "3" }, b.bids[0] ? fmt((b.asks[0][0] + b.bids[0][0]) / 2) : "–");
+  mid.append(td); tb.append(mid);
+  for (const r of bids) row(r, "up");
+  document.getElementById("book-sub").textContent = spread !== null ? `spread ${fmt(spread)}` : "";
+}
+let bookTimer = null;
+function onBook(b) { S.book = b; if (!bookTimer) bookTimer = setTimeout(() => { bookTimer = null; renderBook(); }, 250); }
+function onTrade(t) {
+  S.trades.unshift(t); if (S.trades.length > 60) S.trades.pop();
+  const tb = document.getElementById("tape-rows");
+  const tr = el("tr", { class: t.buy ? "flash-up" : "flash-down" });
+  tr.append(el("td", { class: "muted" }, hhmmss(t.t)), el("td", { class: t.buy ? "up" : "down" }, fmt(t.p)), el("td", {}, compact(t.q)));
+  tb.prepend(tr);
+  while (tb.children.length > 60) tb.removeChild(tb.lastChild);
+  document.getElementById("tape-sub").textContent = `${t.buy ? "buy" : "sell"} ${compact(t.q)} @ ${fmt(t.p)}`;
+}
+
+// ------------------------------------------------------------------ alerts
+function renderAlerts() {
+  const host = clear(document.getElementById("alert-list"));
+  for (const a of S.alerts) {
+    const b = el("button", { type: "button", class: "x", title: "remove alert" }, `${a.base} ${fmt(a.price)} ×`);
+    b.onclick = () => { S.alerts = S.alerts.filter((x) => x !== a); store.set("alerts", S.alerts); renderAlerts(); S.dirty = true; };
+    host.append(b);
+  }
+}
+function checkAlerts(p, now, before) {
+  if (!before) return;
+  for (const a of [...S.alerts]) {
+    if (pairOf(a.base) !== p) continue;
+    if ((before < a.price && now >= a.price) || (before > a.price && now <= a.price)) {
+      const msg = `${a.base} crossed ${fmt(a.price)} (now ${fmt(now)})`;
+      if (window.Notification && Notification.permission === "granted") new Notification("Chantisimo price alert", { body: msg });
+      if (window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance(msg));
+      document.getElementById("bot-sub").textContent = "⚠ " + msg;
+      S.alerts = S.alerts.filter((x) => x !== a); store.set("alerts", S.alerts); renderAlerts(); S.dirty = true;
+    }
+  }
+}
+document.getElementById("alert-set").onclick = () => {
+  const inp = document.getElementById("alert-px"), price = parseFloat(inp.value.replace(/,/g, ""));
+  if (!(price > 0)) { inp.focus(); return; }
+  S.alerts.push({ base: S.base, price }); store.set("alerts", S.alerts); inp.value = ""; renderAlerts(); S.dirty = true;
+  if (window.Notification && Notification.permission === "default") Notification.requestPermission();
+};
+
+// ------------------------------------------------------------------ the bot (same server, read-only)
+async function pollBot() {
+  try {
+    const r = await fetch("api/snapshot", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    S.bot = await r.json();
+    const m = S.bot.meta || {}, bot = S.bot.bot || {};
+    document.getElementById("bot-sub").textContent = `${m.exchange || ""} · ${m.mode || "?"} · ${bot.running ? "running" : "stopped"}`;
+    for (const p of Object.keys(S.bot.pairs || {})) {
+      const b = p.split("/")[0];
+      if (!S.bases.includes(b)) { S.bases.push(b); store.set("bases", S.bases); renderWatch(); }
+    }
+    const host = clear(document.getElementById("bot-body")), pos = S.bot.open_positions || [];
+    const kv = el("div", { class: "kv" });
+    const st = S.bot.stats || {};
+    for (const [k, v] of [["equity", st.equity], ["return", st.return_pct !== undefined && st.return_pct !== null ? `${st.return_pct.toFixed(2)}%` : null], ["closed trades", st.closed_trades], ["win rate", st.win_rate_pct !== undefined && st.win_rate_pct !== null ? `${st.win_rate_pct.toFixed(0)}%` : null], ["open", pos.length]]) {
+      if (v === undefined || v === null) continue;
+      const s = el("span", { class: "muted" }, `${k} `); s.append(el("b", {}, typeof v === "number" ? (Number.isInteger(v) ? String(v) : fmt(v, 2)) : v)); kv.append(s);
+    }
+    host.append(kv);
+    if (pos.length) {
+      const t = el("table"), h = el("tr");
+      for (const c of ["pair", "qty", "entry", "stop", "target", "last", "unrealized", "R now"]) h.append(el("th", {}, c));
+      const th = el("thead"); th.append(h); t.append(th);
+      const tb = el("tbody");
+      for (const p of pos) {
+        const tr = el("tr");
+        tr.append(el("td", {}, p.pair), el("td", {}, fmt(p.qty, 6)), el("td", {}, fmt(p.entry)), el("td", { class: "down" }, fmt(p.stop)),
+          el("td", { class: "up" }, fmt(p.target)), el("td", {}, fmt(p.last)),
+          el("td", { class: (p.unrealized || 0) >= 0 ? "up" : "down" }, fmt(p.unrealized, 2)), el("td", {}, p.r_now === null || p.r_now === undefined ? "–" : p.r_now.toFixed(2)));
+        tr.onclick = () => select(p.pair.split("/")[0]);
+        tb.append(tr);
+      }
+      t.append(tb); host.append(t);
+    } else host.append(el("div", { class: "muted", style: "padding:8px 10px" }, "No open positions. The bot's entries, stops and targets are drawn on the chart when it has one."));
+    S.dirty = true;
+  } catch (e) {
+    document.getElementById("bot-sub").textContent = "dashboard not reachable: start it to see the bot here";
+  }
+}
+
+// ------------------------------------------------------------------ TradingView (free widget, no key)
+function tvUrl() {
+  // Served by the dashboard from the OTHER loopback name, so TradingView's script runs on a
+  // different origin and can never read this page or the dashboard's control token.
+  const other = location.hostname === "localhost" ? "127.0.0.1" : "localhost";
+  const q = new URLSearchParams({ symbol: src().tv(sel()), interval: TV_TF[S.tf] });
+  return `${location.protocol}//${other}${location.port ? ":" + location.port : ""}/market/tv?${q}`;
+}
+function setView(v) {
+  S.view = v;
+  document.getElementById("view-live").classList.toggle("on", v === "live");
+  document.getElementById("view-tv").classList.toggle("on", v === "tv");
+  const f = document.getElementById("tv-frame"), msg = document.getElementById("chart-msg");
+  msg.style.display = "none";
+  if (v === "tv") {
+    if (location.protocol === "file:") { msg.textContent = "Open this page from the dashboard (http://127.0.0.1:8050/market) to use the TradingView chart."; msg.style.display = "flex"; return; }
+    const u = tvUrl();
+    if (f.dataset.src !== u) { f.src = u; f.dataset.src = u; }
+    f.style.display = "block";
+  } else { f.style.display = "none"; S.dirty = true; }
+  document.getElementById("ohlc").style.display = v === "live" ? "" : "none";
+}
+document.getElementById("view-live").onclick = () => setView("live");
+document.getElementById("view-tv").onclick = () => setView("tv");
+
+// ------------------------------------------------------------------ wiring
+const tfs = document.getElementById("tfs");
+for (const tf of Object.keys(TF)) {
+  const b = el("button", { type: "button", "data-tf": tf }, tf);
+  b.onclick = () => { S.tf = tf; store.set("tf", tf); restart(); };
+  tfs.append(b);
+}
+for (const b of document.querySelectorAll("[data-ema]")) {
+  const n = b.dataset.ema; b.classList.toggle("on", !!S.ema[n]);
+  b.onclick = () => { S.ema[n] = !S.ema[n]; store.set("ema", S.ema); b.classList.toggle("on", S.ema[n]); S.dirty = true; };
+}
+const srcSel = document.getElementById("source");
+srcSel.value = S.source;
+srcSel.onchange = () => { S.source = srcSel.value; store.set("source", S.source); S.stats = {}; restart(); };
+function select(b) { S.base = b; store.set("base", b); restart(); }
+function setConn(ok, text) {
+  const c = clear(document.getElementById("conn"));
+  c.append(el("span", { class: "dot " + (ok ? "live" : "bad") }), document.createTextNode(text));
+}
+async function restart() {
+  const gen = ++S.gen;
+  if (S.stop) { S.stop(); S.stop = null; }
+  for (const b of tfs.children) b.classList.toggle("on", b.dataset.tf === S.tf);
+  S.candles = []; S.trades = []; S.book = null; S.offset = 0; S.dirty = true;
+  clear(document.getElementById("tape-rows")); clear(document.getElementById("book-rows"));
+  renderWatch(); header(); renderAlerts();
+  if (S.view === "tv") setView("tv");
+  const msg = document.getElementById("chart-msg");
+  const s = src(), p = sel(), watch = S.bases.map(pairOf);
+  setConn(false, `loading ${p} from ${s.name}…`);
+  try {
+    const [cs, stats] = await Promise.all([s.candles(p, S.tf), s.stats(watch).catch(() => ({}))]);
+    if (gen !== S.gen) return;
+    S.candles = cs;
+    for (const [k, v] of Object.entries(stats)) updateTicker(k, v);
+    msg.style.display = "none";
+  } catch (e) {
+    if (gen !== S.gen) return;
+    msg.textContent = `${s.name} did not answer for ${p} (${e.message || e}). If this exchange is blocked where you are, pick another data source above.`;
+    msg.style.display = "flex"; setConn(false, `${s.name} unreachable`);
+    return;
+  }
+  S.dirty = true; header();
+  S.stop = s.connect(p, S.tf, watch, {
+    status: (ok) => { if (gen === S.gen) setConn(ok, ok ? `live · ${s.name}` : `reconnecting to ${s.name}…`); },
+    candle: (c) => { if (gen === S.gen) onCandle(c); },
+    price: (px, t) => { if (gen === S.gen) onPrice(px, t); },
+    trade: (t) => { if (gen === S.gen) { onTrade(t); if (s.name === "Coinbase") onPrice(t.p, t.t); } },
+    book: (b) => { if (gen === S.gen) onBook(b); },
+    ticker: (w, st) => { if (gen === S.gen) updateTicker(w, st); },
+  });
+}
+if (location.protocol === "file:") document.getElementById("back").style.display = "none";
+restart();
+pollBot();
+setInterval(pollBot, 2000);
+</script>
+</body>
+</html>

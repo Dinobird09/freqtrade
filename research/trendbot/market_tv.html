@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TradingView chart</title>
+<style>html, body, #w { margin: 0; height: 100%; width: 100%; background: #000; }</style>
+</head>
+<body>
+<!-- TradingView's free Advanced Chart widget: live prices, no API key. The market terminal
+     frames this page from the other loopback name, so TradingView's script runs on its own
+     origin and cannot read the dashboard. -->
+<div class="tradingview-widget-container" id="w"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div></div>
+<script>
+const q = new URLSearchParams(location.search);
+const symbol = /^[A-Z0-9:._-]{1,40}$/.test(q.get("symbol") || "") ? q.get("symbol") : "BINANCE:BTCUSDT";
+const interval = ["1", "5", "15", "60", "240", "D"].includes(q.get("interval")) ? q.get("interval") : "60";
+const s = document.createElement("script");
+s.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";
+s.async = true;
+s.text = JSON.stringify({ autosize: true, symbol, interval, timezone: "Etc/UTC", theme: "dark", style: "1",
+  locale: "en", allow_symbol_change: true, calendar: false, support_host: "https://www.tradingview.com" });
+document.getElementById("w").appendChild(s);
+</script>
+</body>
+</html>
