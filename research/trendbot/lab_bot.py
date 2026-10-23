@@ -21,14 +21,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 from .capital import CapitalGuard, CapitalSettings, read_lock, write_lock
-from .data import save_candles_csv, timeframe_to_ms
-from .journal import ms_to_iso, read_journal, write_journal
+from .data import pair_filename, save_candles_csv, timeframe_to_ms
+from .journal import atomic_write_text, ms_to_iso, read_journal
 from .live_exchange import PaperBroker
 from .models import EXIT_END, EXIT_SL, EXIT_TP, Trade, base_of
 from .sizing import max_risk_pct
@@ -71,23 +70,22 @@ class LabBot:
         return self.dir / "journal.csv"
 
     def _save(self) -> None:
-        tmp = self.dir / "state.json.tmp"
-        tmp.write_text(json.dumps(self.state, indent=1), encoding="utf-8")
-        tmp.replace(self.dir / "state.json")
-        write_journal(self.trades, self.journal_path)
+        from .live_bot import save_journal
 
-    def _heartbeat(self, status: str) -> None:
-        beat = {
-            "pid": os.getpid(),
-            "ts": self.gw.now_ms(),
-            "wall_ts": int(time.time() * 1000),
-            "status": status,
-            "mode": self.s.mode,
-            "exchange": self.s.exchange,
-        }
-        tmp = self.dir / "heartbeat.json.tmp"
-        tmp.write_text(json.dumps(beat), encoding="utf-8")
-        tmp.replace(self.dir / "heartbeat.json")
+        atomic_write_text(self.dir / "state.json", json.dumps(self.state, indent=1))
+        save_journal(self.trades, self.journal_path)
+
+    def _heartbeat(self, status: str, error: str | None = None) -> None:
+        from .live_bot import write_heartbeat
+
+        write_heartbeat(self.dir, self.s, status, self.gw.now_ms(), error)
+
+    def _fatal(self, message: str) -> None:
+        for last in (self._save, lambda: self._heartbeat("error", message)):
+            try:
+                last()
+            except Exception as exc:
+                log.warning("could not write the final state: %s", exc)
 
     # -------------------------------------------------------------- start
     def start(self) -> None:
@@ -156,12 +154,19 @@ class LabBot:
 
     # -------------------------------------------------------------- loop
     def run(self, max_steps: int | None = None) -> None:
+        from .live_bot import LoopGuard
+
+        guard = LoopGuard(self.s.exchange, self.s.poll_seconds, self._fatal)
         steps = 0
         while not self.stop_requested and (max_steps is None or steps < max_steps):
-            self.step()
+            try:
+                self.step()
+                delay = guard.ok()
+            except Exception as exc:  # outages and locked files must not kill the bot
+                delay = guard.failed(exc)
             steps += 1
             if not self.stop_requested and (max_steps is None or steps < max_steps):
-                self.sleep(self.s.poll_seconds)
+                self.sleep(delay)
         self._save()
         self._heartbeat("stopped")
 
@@ -205,7 +210,7 @@ class LabBot:
         if not cs or cs[-1].ts != last_closed:
             return
         self.state["last_bar"] = last_closed
-        save_candles_csv(cs, self.dir / "candles" / f"{self.pair.replace('/', '_')}-{self.tf}.csv")
+        save_candles_csv(cs, self.dir / "candles" / pair_filename(self.pair, self.tf))
         for s in self.strategy.signals(cs):
             if s.i != len(cs) - 1 or s.ts in self.state["seen"]:
                 continue
@@ -371,7 +376,10 @@ class LabBot:
             self.pair,
             min(o["qty"] - sum(q for q, _ in o["exits"]), self.gw.free(base_of(self.pair))),
         )
-        if left > 0:
+        mn_amt, mn_cost = self.gw.min_order(self.pair)
+        if left > 0 and (left < mn_amt or left * bid < mn_cost):
+            log.error("%s: %.8g left is below the exchange minimum; not sold", self.key, left)
+        elif left > 0:
             fill = self.gw.sell(self.pair, left)
             o["exits"].append([fill.qty, fill.price])
             o["fees"] += (

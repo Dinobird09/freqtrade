@@ -53,10 +53,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import operator
+import os
 import sys
+import time
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -135,6 +138,39 @@ def iso_to_ms(text: str) -> int:
     return (dt - _EPOCH) // _MS
 
 
+# ---------------------------------------------------------------------------- files
+def atomic_write_text(
+    path: str | Path,
+    text: str,
+    *,
+    attempts: int = 10,
+    sleep: Callable[[float], None] | None = None,
+) -> None:
+    """Write ``text`` to a temp file next to ``path``, then ``os.replace`` it into place.
+
+    Readers never see a half-written file. On Windows the replace fails with
+    ``PermissionError`` while another process (the dashboard, Excel, an antivirus scan) has
+    the target open, so it is retried ``attempts`` times with short sleeps before the last
+    error is raised. ``\\n`` is written as is (no ``\\r\\n`` translation).
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")  # per process: the dashboard writes too
+    try:
+        with tmp.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        for i in range(attempts):
+            try:
+                tmp.replace(p)
+                return
+            except PermissionError:
+                if i == attempts - 1:
+                    raise
+                (sleep or time.sleep)(0.05 * (i + 1))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------- writing
 def journal_header(trades: Iterable[Trade]) -> tuple[str, ...]:
     """Full header for ``trades``: ``JOURNAL_COLUMNS`` + sorted ``f_<name>`` feature columns."""
@@ -172,13 +208,13 @@ def write_journal(trades: Iterable[Trade], path: str | Path) -> None:
     rows = list(trades)
     header = journal_header(rows)
     feature_keys = tuple(c[len(FEATURE_PREFIX) :] for c in header[len(JOURNAL_COLUMNS) :])
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh, lineterminator="\n")
-        writer.writerow(header)
-        for t in rows:
-            writer.writerow(_row(t, feature_keys))
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(header)
+    for t in rows:
+        writer.writerow(_row(t, feature_keys))
+    # temp file + replace: a reader (the dashboard, Excel) never sees a half-written journal
+    atomic_write_text(path, buf.getvalue())
 
 
 # ---------------------------------------------------------------------------- reading

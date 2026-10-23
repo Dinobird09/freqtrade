@@ -80,7 +80,7 @@ class FakeExchange:
     def fetch_balance(self):
         return {k: {"free": v, "total": v} for k, v in self.balances.items()}
 
-    def create_order(self, pair, kind, side, qty):
+    def create_order(self, pair, kind, side, qty, price=None, params=None):
         assert kind == "market"
         base, quote = pair.split("/")
         px = self.price(pair)

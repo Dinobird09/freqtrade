@@ -86,10 +86,12 @@ class Fleet:
     # ------------------------------------------------------------------ loading
     @classmethod
     def load(cls, path: str | Path) -> Fleet:
-        from .live_bot import BotSettings
+        from .live_bot import BotSettings, read_settings_json
 
         p = Path(path)
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = read_settings_json(p)  # utf-8-sig; a friendly ValueError for a bad file
+        if not isinstance(raw, dict):
+            raise FleetError(f"could not read {p.name}: it must be a JSON object {{...}}")
         max_bots = int(raw.get("max_bots", HARD_MAX_BOTS))
         threshold = int(raw.get("approval_threshold", 5))
         if not 1 <= max_bots <= HARD_MAX_BOTS:
@@ -207,6 +209,7 @@ def summary_row(name: str, snap: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "name": name,
         "mode": meta.get("mode"),
+        "configured_mode": meta.get("configured_mode"),  # what Start runs (bot.json)
         "exchange": meta.get("exchange"),
         "running": bool(bot.get("running")),
         "heartbeat_age_s": bot.get("heartbeat_age_s"),

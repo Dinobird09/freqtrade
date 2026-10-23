@@ -50,13 +50,22 @@ from .allocation import AllocationSettings, RegimeAllocator, exposure_room
 from .capital import CapitalGuard, CapitalSettings, fee_warning, read_lock, write_lock
 from .chantisimo import BrainSettings, Chantisimo
 from .config import StrategyConfig
-from .data import load_candles_csv, save_candles_csv, timeframe_to_ms
+from .data import load_candles_csv, pair_filename, save_candles_csv, timeframe_to_ms
 from .gatekeeper import DecisionRecord, EntryDecision, LiveSession
-from .journal import ms_to_iso, read_journal, write_journal
+from .journal import atomic_write_text, ms_to_iso, read_journal, write_journal
 from .journal_rules import audit, render_markdown
 from .layers import LayerBook, MarketView
 from .learning import LearningBook, LearningSettings, entry_context, expected_outcome
-from .live_exchange import CcxtGateway, Fill, OrderError, PaperBroker, quote_of
+from .live_exchange import (
+    CcxtGateway,
+    Fill,
+    OrderError,
+    PaperBroker,
+    combine_fills,
+    fatal_reason,
+    quote_of,
+    transient_errors,
+)
 from .models import EXIT_END, EXIT_SL, EXIT_TP, Candle, Trade, base_of
 from .news import NewsCalendar, load_events
 from .retrain import due
@@ -66,6 +75,33 @@ log = logging.getLogger("trendbot.bot")
 
 MODES = ("paper", "testnet", "live", "wallet")  # wallet: MetaMask / Phantom (wallets.py)
 STATE_VERSION = 1
+MAX_BACKOFF_S = 60.0  # longest wait between steps while the exchange / network is down
+MAX_FILLED_GAP = 6  # missing 4H candles bridged with flat candles (one day)
+
+
+def read_settings_json(path: str | Path) -> Any:
+    """A settings file (bot.json, fleet.json) as JSON; ValueError with a plain-English reason.
+
+    Windows editors may save a byte-order mark (accepted) or UTF-16 ("Unicode", refused).
+    """
+    p = Path(path)
+    hint = f"could not read {p.name}"
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        raise ValueError(f"{hint}: {p} does not exist") from None
+    except UnicodeDecodeError:
+        text = "\x00"
+    except OSError as exc:
+        raise ValueError(f"{hint}: {exc}") from None
+    if "\x00" in text:
+        raise ValueError(f"{hint}: it is not UTF-8 text; save it as UTF-8 in Notepad") from None
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"{hint}: it is not valid JSON ({exc}); fix it, then save it as UTF-8 in Notepad"
+        ) from None
 
 
 @dataclass
@@ -125,7 +161,9 @@ class BotSettings:
 
     @classmethod
     def load(cls, path: str | Path, **overrides: Any) -> BotSettings:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        raw = read_settings_json(path)
+        if not isinstance(raw, dict):
+            raise ValueError(f"could not read {Path(path).name}: it must be a JSON object {{...}}")
         unknown = set(raw) - set(cls.__dataclass_fields__)
         if unknown:
             raise ValueError(f"unknown settings keys: {sorted(unknown)}")
@@ -185,6 +223,7 @@ class TrendBot:
         self._alloc_mtime: float | None = None
         self.settings_path: Path | None = None  # set by main(); needed to spawn jobs
         self._jobs: dict[str, Any] = {}
+        self._entry_fill: Fill | None = None  # the buy enter() got, until it is booked
         if hasattr(gateway, "on_wait"):  # a wallet ticket waits for you: stay "running"
             gateway.on_wait = lambda: self._heartbeat("running")
 
@@ -291,18 +330,21 @@ class TrendBot:
 
     def _save(self) -> None:
         sess = self._sess()
-        write_journal(sess.journal_trades(), self.journal_path)
-        self.state["reservations"] = {str(k): v for k, v in sess.reservations().items()}
-        if isinstance(self.gw, PaperBroker):
-            self.state["paper_balances"] = self.gw.state()
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=1, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.state_path)
+        save_journal(sess.journal_trades(), self.journal_path)
+        self._save_state()
         self.book.write(sess.journal_trades(), self.state.get("trade_context", {}))
         new = sess.decision_log[self._decisions_saved :]
         if new:
             append_decisions(new, self.decisions_path)
             self._decisions_saved = len(sess.decision_log)
+
+    def _save_state(self) -> None:
+        """state.json alone (reservations, last candle per pair, paper balances)."""
+        sess = self._sess()
+        self.state["reservations"] = {str(k): v for k, v in sess.reservations().items()}
+        if isinstance(self.gw, PaperBroker):
+            self.state["paper_balances"] = self.gw.state()
+        atomic_write_text(self.state_path, json.dumps(self.state, indent=1, sort_keys=True))
 
     def _sess(self) -> LiveSession:
         if self.session is None:
@@ -310,10 +352,13 @@ class TrendBot:
         return self.session
 
     def _reconcile(self) -> None:
-        """Warn when an open journal position is not backed by the exchange balance."""
-        for pair, t in self._sess().open_positions.items():
+        """Warn when the journal and the exchange balance disagree, either way."""
+        positions = self._sess().open_positions
+        for pair in sorted(self.s.pairs):
+            t = positions.get(pair)
+            journal = t.qty if t is not None else 0.0
             held = self.gw.free(base_of(pair))
-            if held < t.qty * 0.98:
+            if t is not None and held < t.qty * 0.98:
                 log.warning(
                     "%s: journal holds %.8g but the account has %.8g free; the exit "
                     "will sell what is there",
@@ -321,18 +366,35 @@ class TrendBot:
                     t.qty,
                     held,
                 )
+            elif held > journal * 1.02 and self._sellable(pair, held - journal, self.gw.bid(pair)):
+                log.warning(
+                    "%s: the account holds %.8g %s but the journal only %.8g: the bot does not "
+                    "manage the difference (no stop). It may be your own coins, or an order "
+                    "whose reply was lost: check the exchange's order history",
+                    pair,
+                    held,
+                    base_of(pair),
+                    journal,
+                )
+
+    def _sellable(self, pair: str, qty: float, price: float) -> bool:
+        """``qty`` meets the exchange minimum amount and cost."""
+        min_amount, min_cost = self.gw.min_order(pair)
+        return qty > 0 and qty >= min_amount and qty * price >= min_cost
 
     # ------------------------------------------------------------------ main loop
     def run(self, max_steps: int | None = None) -> None:
+        guard = LoopGuard(self.s.exchange, self.s.poll_seconds, self._fatal)
         steps = 0
         while not self.stop_requested and (max_steps is None or steps < max_steps):
             try:
                 self.step()
-            except OrderError as exc:
-                log.error("order problem: %s", exc)
+                delay = guard.ok()
+            except Exception as exc:  # the loop must outlive outages: open positions need it
+                delay = guard.failed(exc)
             steps += 1
             if not self.stop_requested and (max_steps is None or steps < max_steps):
-                self.sleep(self.s.poll_seconds)
+                self.sleep(delay)
         self._save()
         self._heartbeat("stopped")
         log.info("stopped")
@@ -382,18 +444,16 @@ class TrendBot:
             if pair in ("ALL", p):
                 self.exit_position(t, EXIT_END, self.gw.bid(p))
 
-    def _heartbeat(self, status: str) -> None:
-        beat = {
-            "pid": os.getpid(),
-            "ts": self.gw.now_ms(),
-            "wall_ts": int(time.time() * 1000),
-            "status": status,
-            "mode": self.s.mode,
-            "exchange": self.s.exchange,
-        }
-        tmp = self.dir / "heartbeat.json.tmp"
-        tmp.write_text(json.dumps(beat), encoding="utf-8")
-        tmp.replace(self.dir / "heartbeat.json")
+    def _heartbeat(self, status: str, error: str | None = None) -> None:
+        write_heartbeat(self.dir, self.s, status, self.gw.now_ms(), error)
+
+    def _fatal(self, message: str) -> None:
+        """Last words before a fatal error stops the bot: state and an "error" heartbeat."""
+        for last in (self._save, lambda: self._heartbeat("error", message)):
+            try:
+                last()
+            except Exception as exc:
+                log.warning("could not write the final state: %s", exc)
 
     # ------------------------------------------------------------------ learning
     def _relearn(self) -> None:
@@ -487,6 +547,8 @@ class TrendBot:
             try:
                 got = tickers(list(self.s.pairs))
             except Exception as exc:  # the feed is for display; trading falls back to bid()
+                if fatal_reason(exc, self.s.exchange):
+                    raise
                 log.warning("live prices unavailable: %s", exc)
                 return
             self._prices = {
@@ -535,9 +597,10 @@ class TrendBot:
             "forming": self._forming,
             "capital": {k: cap.get(k) for k in ("equity_mtm", "daily_dd_pct", "peak_dd_pct")},
         }
-        tmp = self.dir / "live.json.tmp"
-        tmp.write_text(json.dumps(beat), encoding="utf-8")
-        tmp.replace(self.dir / "live.json")
+        try:
+            atomic_write_text(self.dir / "live.json", json.dumps(beat))
+        except PermissionError as exc:  # the dashboard is reading it: skip this second's feed
+            log.debug("live.json not written: %s", exc)
 
     # ------------------------------------------------------------------ regime allocation
     def update_regime(self) -> None:
@@ -619,27 +682,62 @@ class TrendBot:
         return self.gw.bid(pair)
 
     def manage_exits(self) -> None:
+        partials = self.state.get("partial_exits") or {}
         for pair, t in sorted(self._sess().open_positions.items()):
             bid = self._bid(pair)
-            if bid <= t.stop:
+            part = partials.get(str(t.trade_id))
+            if part is not None:  # a sell filled only partly: sell the rest now
+                self.exit_position(t, part["reason"], bid)
+            elif bid <= t.stop:
                 self.exit_position(t, EXIT_SL, bid)
             elif bid >= t.target:
                 self.exit_position(t, EXIT_TP, bid)
 
-    def exit_position(self, t: Trade, reason: str, bid: float) -> Trade:
+    def exit_position(self, t: Trade, reason: str, bid: float) -> Trade | None:
+        """Sell the position and close its journal row; None while part of it is still held.
+
+        A sell that fills only partly (a thin testnet book) is kept in
+        ``state["partial_exits"]`` and the rest is sold on the next loop; the row is closed
+        with the combined fill once what remains is below the exchange minimum.
+        """
         sess = self._sess()
-        qty = self.gw.round_qty(t.pair, min(t.qty, self.gw.free(base_of(t.pair))))
-        if qty <= 0:
-            log.error(
-                "%s #%d: nothing left to sell; closing the journal row at the bid",
-                t.pair,
-                t.trade_id,
-            )
-            fill = Fill(0.0, bid, None, self.gw.now_ms(), "none")
+        key, base = str(t.trade_id), base_of(t.pair)
+        partials = self.state.setdefault("partial_exits", {})
+        part = partials.get(key)
+        prior = Fill(**part["fill"]) if part else None
+        reason = part["reason"] if part else reason
+        left = t.qty - (prior.qty if prior else 0.0)
+        qty = self.gw.round_qty(t.pair, min(left, self.gw.free(base)))
+        if not self._sellable(t.pair, qty, bid):
+            if prior is None:
+                log.error(
+                    "%s #%d: nothing left to sell (%.8g is below the exchange minimum); "
+                    "closing the journal row at the bid",
+                    t.pair,
+                    t.trade_id,
+                    qty,
+                )
+            fill = prior or Fill(0.0, bid, None, self.gw.now_ms(), "none")
         else:
-            fill = self.gw.sell(t.pair, qty)
-            if fill.qty <= 0:
+            sold = self.gw.sell(t.pair, qty)
+            if sold.qty <= 0:
                 raise OrderError(f"{t.pair} #{t.trade_id}: sell of {qty} did not fill")
+            fill = sold if prior is None else combine_fills(prior, sold)
+            if sold.qty < qty * 0.999:
+                rest = self.gw.round_qty(t.pair, min(left - sold.qty, self.gw.free(base)))
+                if self._sellable(t.pair, rest, bid):
+                    partials[key] = {"fill": _fill_dict(fill), "reason": reason}
+                    log.warning(
+                        "%s #%d: the sell filled %.8g of %.8g; the rest (%.8g) is sold next",
+                        t.pair,
+                        t.trade_id,
+                        sold.qty,
+                        qty,
+                        rest,
+                    )
+                    self._save()
+                    return None
+        partials.pop(key, None)
         entry_fee = self.state["entry_fees"].pop(str(t.trade_id), None)
         fees = None if entry_fee is None or fill.fee_quote is None else entry_fee + fill.fee_quote
         closed = sess.on_exit(t.trade_id, max(fill.ts, t.entry_ts), fill.price, reason, fees=fees)
@@ -666,10 +764,14 @@ class TrendBot:
 
     def flatten(self) -> list[Trade]:
         """Sell every open position at market (journaled as END exits)."""
-        return [
-            self.exit_position(t, EXIT_END, self.gw.bid(p))
-            for p, t in sorted(self._sess().open_positions.items())
-        ]
+        closed = []
+        for p, t in sorted(self._sess().open_positions.items()):
+            for _ in range(3):  # a partly filled sell: sell the rest right away
+                out = self.exit_position(t, EXIT_END, self.gw.bid(p))
+                if out is not None:
+                    closed.append(out)
+                    break
+        return closed
 
     # ------------------------------------------------------------------ entries
     def process_closed_candles(self) -> None:
@@ -714,7 +816,7 @@ class TrendBot:
             self._save()
 
     def _candle_path(self, pair: str) -> Path:
-        return self.dir / "candles" / f"{pair.replace('/', '_')}-4h.csv"
+        return self.dir / "candles" / pair_filename(pair)  # no ':' (an NTFS stream)
 
     def refresh_candles(self, pair: str) -> list[Candle]:
         """The pair's full closed-candle history: cached on disk, topped up incrementally.
@@ -737,13 +839,39 @@ class TrendBot:
             log.info("%s: candle cache has a gap; re-downloading history", pair)
         cache = self.gw.closed_candles(pair, self.s.history_candles)
         if not _contiguous(cache, self.tf_ms):
-            log.warning("%s: exchange history has gaps; using the latest contiguous run", pair)
-            cache = _latest_contiguous(cache, self.tf_ms)
+            cache = _repair_history(pair, cache, self.tf_ms)
         self._cache[pair] = cache
         save_candles_csv(cache, self._candle_path(pair))
         return cache
 
     def enter(self, pair: str, dec: EntryDecision) -> Trade | None:
+        """Buy for an allowed decision. Any error before the position is booked resolves
+        the pending decision first (else every later candle close is refused), then raises."""
+        self._entry_fill = None
+        try:
+            return self._enter(pair, dec)
+        except Exception as exc:
+            try:
+                self._sess().on_fill_skipped(pair, dec, f"{pair}: buy failed: {exc}")
+            except ValueError:
+                pass  # already booked, refused or skipped
+            else:
+                fill = self._entry_fill
+                if fill is not None and fill.qty > 0:
+                    log.error(
+                        "%s: bought %.8g at %.8g but could not book it (%s); it is not "
+                        "managed: sell it by hand",
+                        pair,
+                        fill.qty,
+                        fill.price,
+                        exc,
+                    )
+                    self.state["unmanaged"].append(
+                        {"pair": pair, "buy": fill.price, "qty": fill.qty, "ts": fill.ts}
+                    )
+            raise
+
+    def _enter(self, pair: str, dec: EntryDecision) -> Trade | None:
         sess = self._sess()
         ask = self.gw.ask(pair)
         slip = self.cfg.slippage_pct / 100.0
@@ -774,16 +902,14 @@ class TrendBot:
             sess.on_fill_skipped(pair, dec, reason)
             log.info("SKIP %s", reason)
             return None
-        try:
-            ex = {"maker_first": True, "maker_wait_seconds": 15, **self.s.execution}
-            maker = getattr(self.gw, "buy_maker_first", None)
-            if ex["maker_first"] and self.s.mode != "paper" and maker is not None:
-                fill = maker(pair, qty, wait_s=float(ex["maker_wait_seconds"]))
-            else:
-                fill = self.gw.buy(pair, qty)
-        except OrderError as exc:
-            sess.on_fill_skipped(pair, dec, f"{pair}: buy failed: {exc}")
-            raise
+        self._save_state()  # the signal candle is spent even if the process dies mid-order
+        ex = {"maker_first": True, "maker_wait_seconds": 15, **self.s.execution}
+        maker = getattr(self.gw, "buy_maker_first", None)
+        if ex["maker_first"] and self.s.mode != "paper" and maker is not None:
+            fill = maker(pair, qty, wait_s=float(ex["maker_wait_seconds"]))
+        else:
+            fill = self.gw.buy(pair, qty)
+        self._entry_fill = fill
         if fill.qty <= 0:
             sess.on_fill_skipped(pair, dec, f"{pair}: buy of {qty} did not fill")
             return None
@@ -797,9 +923,13 @@ class TrendBot:
         if actual.ok and actual.sizing is not None and held > actual.sizing.qty:
             keep = self.gw.round_qty(pair, actual.sizing.qty)
             excess = self.gw.round_qty(pair, held - keep)
-            if excess > 0:
-                self.gw.sell(pair, excess)
-                held -= excess
+            if excess > 0 and not self._sellable(pair, excess, fill.price):
+                log.info("%s: excess %.8g is below the exchange minimum; not sold", pair, excess)
+            elif excess > 0:
+                try:
+                    held -= self.gw.sell(pair, excess).qty
+                except Exception as exc:  # the position itself is fine: book it regardless
+                    log.warning("%s: selling the excess %.8g failed: %s", pair, excess, exc)
             held = min(held, actual.sizing.qty)
         d = dec.decision_ts
         fill_ts = fill.ts if d <= fill.ts < d + self.tf_ms else None
@@ -888,10 +1018,94 @@ def read_control(state_dir: Path) -> dict[str, Any]:
 def write_control(state_dir: Path, **flags: Any) -> dict[str, Any]:
     current = read_control(state_dir)
     current.update(flags)
-    tmp = Path(state_dir) / "control.json.tmp"
-    tmp.write_text(json.dumps(current, indent=1), encoding="utf-8")
-    tmp.replace(Path(state_dir) / "control.json")
+    atomic_write_text(Path(state_dir) / "control.json", json.dumps(current, indent=1))
     return current
+
+
+def save_journal(trades: Sequence[Trade], path: Path) -> bool:
+    """write_journal, but a journal held open by another program (Excel on Windows) only
+    logs a warning: the whole journal is rewritten from memory at the next save."""
+    try:
+        write_journal(trades, path)
+        return True
+    except PermissionError as exc:
+        log.warning("%s is open in another program (close it): not written now: %s", path.name, exc)
+        return False
+
+
+def write_heartbeat(
+    state_dir: Path, settings: Any, status: str, ts: int, error: str | None = None
+) -> None:
+    """heartbeat.json: the dashboard's sign of life (status running / stopped / error)."""
+    beat = {
+        "pid": os.getpid(),
+        "ts": ts,
+        "wall_ts": int(time.time() * 1000),
+        "status": status,
+        "mode": settings.mode,
+        "exchange": settings.exchange,
+    }
+    if error:
+        beat["error"] = error
+    atomic_write_text(Path(state_dir) / "heartbeat.json", json.dumps(beat))
+
+
+class LoopGuard:
+    """What the run loop does when a step raises, so one bad second never kills the bot.
+
+    - transient (network, exchange 5xx / 429 / 418, a file locked by another program):
+      one log line, then wait ``poll * 2^n`` seconds (at most 60) and continue;
+    - fatal (rejected keys, suspended account, unknown pair, HTTP 451): log it, call
+      ``on_fatal`` (final state + an "error" heartbeat) and exit via SystemExit;
+    - an order problem: logged, the next step retries;
+    - anything else: the traceback once per distinct error, then the same back-off.
+    """
+
+    def __init__(self, exchange: str, poll_seconds: float, on_fatal: Callable[[str], None]):
+        self.exchange = exchange
+        self.poll = float(poll_seconds)
+        self.on_fatal = on_fatal
+        self.failures = 0
+        self._seen: set[str] = set()
+
+    def ok(self) -> float:
+        """A step went through: seconds until the next one."""
+        self.failures = 0
+        return self.poll
+
+    def failed(self, exc: Exception) -> float:
+        """Seconds to wait before the next step; raises SystemExit on a fatal error."""
+        fatal = fatal_reason(exc, self.exchange)
+        if fatal is not None:
+            log.critical(fatal)
+            self.on_fatal(fatal)
+            raise SystemExit(fatal) from exc
+        if isinstance(exc, OrderError):
+            log.error("order problem: %s", exc)
+            return self.poll
+        self.failures += 1
+        delay = max(self.poll, min(self.poll * 2**self.failures, MAX_BACKOFF_S))
+        if isinstance(exc, transient_errors()):
+            log.warning("%s: %s; trying again in %gs", type(exc).__name__, exc, delay)
+            return delay
+        key = f"{type(exc).__name__}: {exc}"
+        if key in self._seen:
+            log.error("%s (again); trying again in %gs", key, delay)
+        else:
+            self._seen.add(key)
+            log.exception("unexpected error; the bot keeps running (retry in %gs)", delay)
+        return delay
+
+
+def _fill_dict(f: Fill) -> dict[str, Any]:
+    """A Fill as JSON for state.json (``Fill(**d)`` reads it back)."""
+    return {
+        "qty": f.qty,
+        "price": f.price,
+        "fee_quote": f.fee_quote,
+        "ts": f.ts,
+        "order_id": f.order_id,
+    }
 
 
 def _num_or_none(x: Any) -> float | None:
@@ -924,10 +1138,8 @@ def post_request(state_dir: Path, **request: Any) -> Path:
     d = Path(state_dir) / "requests"
     d.mkdir(parents=True, exist_ok=True)
     name = f"{time.time_ns()}-{request.get('action', 'x')}.json"
-    tmp = d / (name + ".tmp")
-    tmp.write_text(json.dumps(request), encoding="utf-8")
     final = d / name
-    tmp.replace(final)
+    atomic_write_text(final, json.dumps(request))
     return final
 
 
@@ -956,6 +1168,57 @@ def _latest_contiguous(candles: Sequence[Candle], tf_ms: int) -> list[Candle]:
     while start > 0 and candles[start].ts - candles[start - 1].ts == tf_ms:
         start -= 1
     return list(candles[start:])
+
+
+def _fill_gaps(
+    candles: Sequence[Candle], tf_ms: int, max_missing: int = MAX_FILLED_GAP
+) -> tuple[list[Candle], int, bool]:
+    """Bridge holes of up to ``max_missing`` candles with flat candles at the previous close
+    (volume 0). A larger hole keeps only the candles after the latest such hole.
+
+    Returns ``(candles, candles added, truncated)``.
+    """
+    start = 0
+    for i in range(1, len(candles)):
+        if (candles[i].ts - candles[i - 1].ts) // tf_ms - 1 > max_missing:
+            start = i
+    out: list[Candle] = []
+    added = 0
+    for c in candles[start:]:
+        if out:
+            prev = out[-1]
+            ts = prev.ts + tf_ms
+            while ts < c.ts:
+                out.append(Candle(ts, prev.close, prev.close, prev.close, prev.close, 0.0))
+                added += 1
+                ts += tf_ms
+        out.append(c)
+    return out, added, start > 0
+
+
+def _repair_history(pair: str, candles: Sequence[Candle], tf_ms: int) -> list[Candle]:
+    """The exchange's history with gaps: small ones filled, else the run after the gap."""
+    out, added, truncated = _fill_gaps(candles, tf_ms)
+    if added:
+        log.warning(
+            "%s: the exchange history misses %d candle(s); filled with flat candles at the "
+            "previous close (volume 0)",
+            pair,
+            added,
+        )
+    if not _contiguous(out, tf_ms):  # misaligned timestamps: keep what is regular
+        out = _latest_contiguous(out, tf_ms)
+        truncated = True
+    if truncated:
+        log.warning(
+            "%s: the exchange history has a gap longer than %d candles; using the %d candles "
+            "after it. Trading %s is paused until the history is long enough again",
+            pair,
+            MAX_FILLED_GAP,
+            len(out),
+            pair,
+        )
+    return out
 
 
 def append_candles(candles: Sequence[Candle], path: Path) -> None:
@@ -1010,10 +1273,22 @@ def _check_adoption(settings: BotSettings, cfg: StrategyConfig, now_ms: int) -> 
     require_stage(load_record(path), "LIVE", cfg, now_ms, base_dir=path.parent)
 
 
+def safe_stdout() -> Any:
+    """sys.stdout that never fails on a character the console cannot show (Windows cp1252
+    consoles and redirected output): unencodable characters are written as escapes."""
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(errors="backslashreplace")
+        except (ValueError, OSError):  # a detached / replaced stream: leave it as it is
+            pass
+    return sys.stdout
+
+
 def _setup_logging(state_dir: str, verbose: bool) -> None:
     Path(state_dir).mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [
-        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(safe_stdout()),
         logging.FileHandler(Path(state_dir) / "bot.log", encoding="utf-8"),
     ]
     logging.basicConfig(
@@ -1038,10 +1313,31 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None, gateway: Any = None) -> int:
     args = _parser().parse_args(argv)
-    settings = BotSettings.load(args.settings, mode=args.mode)
+    try:
+        settings = BotSettings.load(args.settings, mode=args.mode)
+    except ValueError as exc:  # a typo or a Notepad encoding: one line, not a traceback
+        raise SystemExit(str(exc)) from None
     _setup_logging(settings.state_dir, args.verbose)
+    try:
+        return _main(args, settings, gateway)
+    except Exception as exc:  # rejected keys, HTTP 451 ... while connecting / starting
+        fatal = fatal_reason(exc, settings.exchange)
+        if fatal is None:
+            raise
+        log.critical(fatal)
+        try:
+            write_heartbeat(Path(settings.state_dir), settings, "error", 0, fatal)
+        except OSError:
+            pass
+        raise SystemExit(fatal) from None
+
+
+def _main(args: argparse.Namespace, settings: BotSettings, gateway: Any) -> int:
     cfg = settings.strategy_config()
-    gw = gateway if gateway is not None else build_gateway(settings, cfg)
+    try:
+        gw = gateway if gateway is not None else build_gateway(settings, cfg)
+    except ValueError as exc:  # e.g. a .env saved as UTF-16
+        raise SystemExit(str(exc)) from None
     if settings.engine == "lab":
         from .lab_bot import LabBot
 

@@ -568,7 +568,7 @@ class WalletBroker:
 
     @classmethod
     def connect(cls, exchange_id: str, ws: WalletSettings, state_dir: Path) -> WalletBroker:
-        from .live_exchange import CcxtGateway
+        from .live_exchange import CcxtGateway, exchange_config
 
         conn = read_connection(state_dir)
         if conn is None or conn.get("provider") != ws.provider:
@@ -580,7 +580,7 @@ class WalletBroker:
             import ccxt
         except ImportError as exc:
             raise SystemExit("ccxt is not installed: pip install ccxt") from exc
-        public = CcxtGateway(getattr(ccxt, exchange_id)({"enableRateLimit": True}))
+        public = CcxtGateway(getattr(ccxt, exchange_id)(exchange_config(exchange_id)))
         return cls(public, ws, state_dir)
 
     # ------------------------------------------------------------------ market data

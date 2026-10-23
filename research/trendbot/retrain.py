@@ -27,7 +27,6 @@ import argparse
 import importlib
 import json
 import logging
-import sys
 import time
 import traceback
 from collections.abc import Mapping
@@ -63,6 +62,8 @@ def load_cached_candles(state_dir: Path) -> dict[str, list[Any]]:
     d = state_dir / "candles"
     for path in sorted(d.glob("*-4h.csv")) if d.exists() else []:
         pair = path.name[: -len("-4h.csv")].replace("_", "/", 1)
+        if pair.count("_") == 1:  # BTC_USDT_USDT-4h.csv: the futures pair BTC/USDT:USDT
+            pair = pair.replace("_", ":")
         out[pair] = load_candles_csv(path)
     return out
 
@@ -240,10 +241,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .live_bot import BotSettings
+    from .live_bot import BotSettings, safe_stdout
 
     args = _parser().parse_args(argv)
-    settings = BotSettings.load(args.settings)
+    try:
+        settings = BotSettings.load(args.settings)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     state_dir = Path(settings.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -251,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         force=True,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
-            logging.StreamHandler(sys.stdout),
+            logging.StreamHandler(safe_stdout()),  # a cp1252 console cannot show every name
             logging.FileHandler(state_dir / "retrain.log", encoding="utf-8"),
         ],
     )

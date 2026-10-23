@@ -31,6 +31,8 @@ def archive() -> str | None:
 def command(module: str, *args: str) -> tuple[list[str], dict[str, str]]:
     """(argv, environment) to run ``module`` with ``args`` in a new process."""
     env = dict(os.environ)
+    # UTF-8 everywhere: a Windows console (cp1252) must not crash the child on a character
+    env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     pyz = archive()
     if pyz:
         return [sys.executable, pyz, COMMANDS[module], *args], env
