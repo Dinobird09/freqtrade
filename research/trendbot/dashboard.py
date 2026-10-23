@@ -558,6 +558,14 @@ DASHBOARD_CSP = (
     "style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
 )
 # the market terminal pages (no token, no controls): public exchange feeds / TradingView
+MEME_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "img-src https: data:; connect-src 'self'; frame-src https://dexscreener.com; "
+        "frame-ancestors 'none'"
+    ),
+}
 MARKET_PAGES: dict[str, tuple[str, dict[str, str]]] = {
     "/market": (
         "market.html",
@@ -931,6 +939,16 @@ class FleetRuntime:
         self.fleet = fleet
         self.entries = dict(entries)
         self._start_lock = threading.RLock()  # the fleet's room / approval check is one step
+        self._memes: Any = None
+
+    @property
+    def memes(self) -> Any:
+        """The meme desk (/memes), kept in the first bot's state folder."""
+        if self._memes is None:
+            from .memecoins import Desk
+
+            self._memes = Desk(self.entries[self.names[0]][0])
+        return self._memes
 
     @property
     def names(self) -> list[str]:
@@ -1059,6 +1077,8 @@ class FleetRuntime:
         action = req.get("action")
         if str(action).startswith(("keys_", "mcp_", "trader")):
             return connection_action(req)
+        if str(action).startswith("meme_"):
+            return self.memes.act(req)
         if str(action).startswith("wallet_"):
             return self.wallet_action(req)
         try:
@@ -1315,6 +1335,18 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 if path in ("/", "/index.html"):
                     page = render_html(None, refresh_s, token if controls else None)
                     self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8")
+                elif path.rstrip("/") == "/memes":
+                    page = _html_template("memes.html").replace(
+                        '"__CONTROL_TOKEN__"', json.dumps(token if controls else "")
+                    )
+                    self._send(
+                        HTTPStatus.OK, page.encode(), "text/html; charset=utf-8", MEME_HEADERS
+                    )
+                elif path in ("/api/memes/feed", "/api/memes/check", "/api/memes/positions"):
+                    desk, q = runtime.memes, self._query()
+                    kind = path.rsplit("/", 1)[1]
+                    body = desk.positions() if kind == "positions" else getattr(desk, kind)(q)
+                    self._json(HTTPStatus.OK, body)
                 elif path.rstrip("/") in MARKET_PAGES:
                     name, headers = MARKET_PAGES[path.rstrip("/")]
                     page = _html_template(name)

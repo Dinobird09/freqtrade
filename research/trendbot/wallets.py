@@ -841,6 +841,23 @@ def _why(reply: Any, key: str) -> Any:
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
+def _jupiter_swap(url: str, body: dict[str, Any], turbo: bool, http: Http, sleep: Any) -> Any:
+    """Jupiter's swap transaction; ``turbo`` (meme buys) adds a priority fee to land fast and
+    falls back to a normal swap if that option is refused."""
+    if turbo:
+        fee = {
+            "priorityLevelWithMaxLamports": {"maxLamports": 2_000_000, "priorityLevel": "veryHigh"}
+        }
+        swap = _retry(
+            lambda: http(url, {**body, "prioritizationFeeLamports": fee}, None),
+            "Jupiter swap",
+            sleep,
+        )
+        if isinstance(swap, Mapping) and swap.get("swapTransaction"):
+            return swap
+    return _retry(lambda: http(url, body, None), "Jupiter swap", sleep)
+
+
 def prepare(
     state_dir: Path,
     tid: str,
@@ -886,7 +903,9 @@ def prepare(
             "wrapAndUnwrapSol": True,
             "dynamicComputeUnitLimit": True,
         }
-        swap = _retry(lambda: http(f"{base}/swap/v1/swap", body, None), "Jupiter swap", sleep)
+        swap = _jupiter_swap(
+            f"{base}/swap/v1/swap", body, t.get("priority") == "turbo", http, sleep
+        )
         if not isinstance(swap, Mapping) or not swap.get("swapTransaction"):
             raise WalletError("Jupiter did not return a transaction")
         out = {

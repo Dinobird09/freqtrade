@@ -271,6 +271,86 @@ Prices, candles and signals still come from the exchange named in `exchange` (pu
 no key). Before its first trade of a token, the bot checks the token's decimals on chain, so
 a mistyped address is refused instead of traded.
 
+## 4g. Meme desk: new coins, the checklist, quick swaps
+
+Open **🐸 Meme desk** in the dashboard header, or go to http://127.0.0.1:8050/memes. Pick a
+chain at the top: Solana (Phantom), or Base, Ethereum or BNB Chain (MetaMask).
+
+**New coins (left):** the newest pools with at least $1,000 liquidity (change the floor),
+refreshed every 20 seconds. Each coin gets a quick badge:
+
+- **WARN** if it is under 30 minutes old, has thin liquidity, or its liquidity is tiny
+  against its market cap;
+- **FAIL** if it shows many buys and no sells, the honeypot pattern.
+
+Hover a coin for the reasons. Or paste any contract address and press **Check**.
+
+**The check (middle):** a verdict comes first:
+
+- **Avoid:** one of the six checks failed.
+- **Not verified:** a check could not be read. Unknown never counts as safe.
+- **Risky:** there are warnings.
+- **Passes the checks.**
+
+Then the six checks before a buy:
+
+1. **The address matches the project's channel.** The page lists every other token using
+   the same ticker, and links the project's X, Telegram and website. Compare the address
+   yourself, then tick *I checked this address*.
+2. **Mint authority revoked.** On Solana this is read from the token's mint account on chain.
+3. **Freeze authority revoked.** Read the same way.
+4. **Liquidity burned or locked.** From RugCheck on Solana; GoPlus on the other chains.
+5. **No small group holds most of the supply.** The 5 largest wallets, read on chain.
+   Pools, lockers, bonding curves and burn addresses aren't counted. 40% or more fails.
+6. **You can sell.**
+   - On Solana: Jupiter must quote a real sell, and the token must not use Token-2022
+     traps (transfer fees, a permanent delegate, a transfer hook, non-transferable).
+   - On Base, Ethereum and BNB Chain: honeypot.is simulates a buy and a sell, and GoPlus
+     reports the sell tax.
+
+Below that, the three groups in full:
+
+- **Safety & contract:** the six above, plus:
+  - whether the name, symbol and image can still be changed (Metaplex metadata, read on
+    chain);
+  - how much the creator still holds, and how many other tokens they launched;
+  - whether RugCheck already marks the coin as rugged.
+- **Liquidity & volume quality:**
+  - **Steady volume:** 30 days of daily volume must not be one spike.
+  - **Many buyers:** buys per unique wallet, which catches bots washing the same money.
+  - **Turnover:** 24h volume against liquidity.
+  - **Depth:** liquidity against market cap.
+  - **Exit cost:** the price impact of selling your amount.
+- **Attention & narrative:**
+  - **Age:** whether the coin is past the 5-30 minute dump window.
+  - **Trend:** whether attention is growing, steady, peaking or fading.
+  - **Community:** socials and the Telegram member count.
+  - **Paid hype:** DexScreener ads and boosts.
+  - **Mentions:** Reddit posts in the last 24 hours.
+  - **Growth:** holder growth across your checks.
+
+  Influencer posts on X can't be read without X's paid API, so the page links the
+  token's X account for you to read.
+
+The chart is DexScreener's free embedded chart. Every source is free and needs no key.
+
+**Trade (right):**
+
+1. Connect Phantom or MetaMask (top right).
+2. Pick an amount: $10, $25, $50, $100, $250 or your own.
+3. Set the slippage (3% by default) and leave *turbo* on, which adds a priority fee so a
+   Solana buy lands fast.
+4. Press **Buy**. You confirm the swap in your wallet.
+
+If any of the six checks failed or is unknown, **Buy** stays locked until you tick *I accept
+the risk of: …*, which names the failed checks.
+
+Your positions show their live value and profit or loss, with **Sell 25% / 50% / 100%**
+buttons. Under each position, set a stop and a target in percent. You get a spoken alert and
+a browser notification when a level is hit, and also when the pool's liquidity falls by 40%
+or more after you bought, the usual sign of a rug pull. Every sell is still a swap you
+confirm in the wallet.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,

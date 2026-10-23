@@ -351,3 +351,55 @@ def test_market_pages_are_served_without_the_token(state_dir):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_the_meme_desk_page_and_its_api(state_dir):
+    from http.server import ThreadingHTTPServer
+
+    from research.trendbot import memecoins
+    from research.trendbot.dashboard import Controller, FleetRuntime
+
+    from .test_memecoins import MINT, Net, safe_routes
+
+    ctl = Controller(state_dir, None)
+    rt = FleetRuntime(None, {"bot": (state_dir, StrategyConfig(), ctl)})
+    rt._memes = memecoins.Desk(
+        state_dir, lambda: memecoins.Sources(Net(safe_routes()), "https://rpc")
+    )
+    srv = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(None, None, 15, token="secret-tok", runtime=rt)
+    )
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def post(body):
+        req = urllib.request.Request(
+            base + "/api/control",
+            data=json.dumps(body).encode(),
+            headers={"X-Trendbot-Token": "secret-tok", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    try:
+        with urllib.request.urlopen(base + "/memes") as r:
+            body, csp = r.read().decode(), r.headers["Content-Security-Policy"]
+        assert "Meme desk" in body and '"secret-tok"' in body  # the page drives the buttons
+        assert "frame-src https://dexscreener.com" in csp and "connect-src 'self'" in csp
+        with urllib.request.urlopen(f"{base}/api/memes/check?chain=solana&address={MINT}") as r:
+            rep = json.loads(r.read())
+        assert [c["status"] for c in rep["six"]][1:] == ["pass"] * 5
+        with pytest.raises(urllib.error.HTTPError) as bad:
+            urllib.request.urlopen(f"{base}/api/memes/check?chain=solana&address=nope")
+        assert "not a solana token address" in json.loads(bad.value.read())["error"]
+        assert post({"action": "meme_confirm", "chain": "solana", "address": MINT})[0] == 200
+        assert memecoins.is_confirmed(state_dir, "solana", MINT)
+        code, out = post({"action": "meme_buy", "chain": "solana", "address": MINT, "usd": 20})
+        assert code == 400 and "connect Phantom first" in out["message"]
+        with urllib.request.urlopen(base + "/api/memes/positions") as r:
+            assert json.loads(r.read())["positions"] == []
+    finally:
+        srv.shutdown()

@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en" data-theme="jarvis">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chantisimo · meme desk</title>
+<style>
+/* Meme desk: new coins, the checklist before you buy, quick swaps through your wallet. */
+:root {
+  --page: #020b14; --surface-1: rgba(4, 20, 34, 0.84); --border: rgba(0, 229, 255, 0.28);
+  --text-primary: #d6f8ff; --text-secondary: #8fc3d1; --text-muted: #5f8a97; --accent: #00e5ff;
+  --pass: #2ee6a6; --warn: #ffc857; --fail: #ff5c6c; --unknown: #9aa9b5; --glow: 0 0 16px rgba(0, 229, 255, 0.22);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: radial-gradient(ellipse at 50% -10%, #06324a 0%, var(--page) 60%); color: var(--text-primary);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; min-height: 100vh; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+h1 { margin: 0; font-size: 18px; letter-spacing: 0.14em; text-transform: uppercase; color: #7fefff;
+  font-family: "Orbitron", "Rajdhani", ui-monospace, monospace; text-shadow: 0 0 8px rgba(0, 229, 255, 0.55); }
+h2 { margin: 0; font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase; color: #7fefff;
+  font-family: "Orbitron", "Rajdhani", ui-monospace, monospace; }
+h3 { margin: 12px 0 6px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); }
+a { color: var(--accent); }
+.spacer { flex: 1; }
+.muted { color: var(--text-muted); }
+button, select, input { font: inherit; color: var(--text-primary); background: rgba(0, 40, 60, 0.6);
+  border: 1px solid var(--border); border-radius: 5px; padding: 4px 9px; }
+button { cursor: pointer; }
+button:hover:not(:disabled) { box-shadow: var(--glow); border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.primary { background: linear-gradient(180deg, #00b8d4, #007c99); color: #001018; border-color: var(--accent); font-weight: 600; }
+button.buy { background: linear-gradient(180deg, #23c48c, #128a60); color: #00140c; border-color: var(--pass); font-weight: 700; }
+button.sell { color: #ff9aa4; border-color: var(--fail); }
+main { display: grid; gap: 10px; padding: 10px; grid-template-columns: 340px minmax(0, 1fr) 320px; align-items: start; }
+.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 4px; box-shadow: var(--glow); min-width: 0; }
+.panel-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.panel-body { padding: 8px 10px; }
+#feed-list { max-height: calc(100vh - 210px); overflow: auto; }
+.coin { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 10px;
+  border-bottom: 1px solid rgba(0, 229, 255, 0.08); cursor: pointer; }
+.coin:hover, .coin.sel { background: rgba(0, 229, 255, 0.07); }
+.coin.sel { box-shadow: inset 3px 0 0 var(--accent); }
+.coin img, .coin .ph { width: 30px; height: 30px; border-radius: 50%; background: #0a3550; object-fit: cover; }
+.coin .sym { font-weight: 700; }
+.coin .sub { color: var(--text-muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 700; text-transform: uppercase; border: 1px solid; }
+.b-pass { color: var(--pass); border-color: var(--pass); } .b-warn { color: var(--warn); border-color: var(--warn); }
+.b-fail { color: var(--fail); border-color: var(--fail); } .b-unknown { color: var(--unknown); border-color: var(--unknown); }
+.up { color: var(--pass); } .down { color: var(--fail); }
+.verdict { padding: 10px 12px; border-radius: 4px; margin: 8px 0; border: 1px solid; font-size: 14px; }
+.v-passes { border-color: var(--pass); background: rgba(46, 230, 166, 0.08); }
+.v-risky { border-color: var(--warn); background: rgba(255, 200, 87, 0.08); }
+.v-avoid { border-color: var(--fail); background: rgba(255, 92, 108, 0.1); }
+.v-unknown { border-color: var(--unknown); background: rgba(154, 169, 181, 0.08); }
+.verdict b { text-transform: uppercase; letter-spacing: 0.08em; }
+.six { display: grid; gap: 6px; }
+.row { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 8px; padding: 7px 9px; border-radius: 4px; background: rgba(0, 40, 60, 0.35); }
+.row .ic { font-size: 16px; font-weight: 800; text-align: center; }
+.row .t { font-weight: 600; }
+.row .d { color: var(--text-secondary); font-size: 12.5px; }
+.row .src { color: var(--text-muted); font-size: 11px; }
+.s-pass .ic { color: var(--pass); } .s-warn .ic { color: var(--warn); } .s-fail .ic { color: var(--fail); } .s-unknown .ic { color: var(--unknown); }
+details { margin-top: 8px; border: 1px solid rgba(0, 229, 255, 0.14); border-radius: 4px; }
+summary { cursor: pointer; padding: 7px 10px; font-weight: 600; }
+details .six { padding: 0 8px 8px; }
+.kv { display: flex; gap: 16px; flex-wrap: wrap; }
+.kv span b { color: var(--text-primary); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { padding: 3px 6px; text-align: right; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text-muted); font-weight: 500; font-size: 11px; }
+.scroll { overflow-x: auto; }
+#chart { width: 100%; height: 420px; border: 0; border-radius: 4px; background: #000; display: block; }
+.amounts { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.amounts button.on { border-color: var(--accent); box-shadow: var(--glow); }
+.field { display: flex; gap: 6px; align-items: center; margin: 6px 0; flex-wrap: wrap; }
+.field input[type=number], .field input.num { width: 90px; }
+.override { margin: 8px 0; padding: 8px; border: 1px dashed var(--fail); border-radius: 4px; font-size: 12.5px; display: none; }
+.pos { border-top: 1px solid rgba(0, 229, 255, 0.12); padding: 8px 0; }
+.pos .alerts { color: var(--warn); font-weight: 600; }
+.status-line { min-height: 18px; color: var(--text-secondary); font-size: 12.5px; margin-top: 6px; }
+.empty { color: var(--text-muted); padding: 18px 6px; text-align: center; }
+.check-addr { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.check-addr input { flex: 1; min-width: 0; }
+.bars { display: flex; align-items: flex-end; gap: 2px; height: 50px; }
+.bars div { flex: 1; background: rgba(0, 229, 255, 0.45); min-height: 1px; }
+@media (max-width: 1150px) {
+  main { grid-template-columns: minmax(0, 1fr); }
+  #feed-list { max-height: 360px; }
+  #chart { height: 340px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Meme desk</h1>
+  <span class="muted">new coins · the checklist before you buy · swaps you approve in your wallet</span>
+  <span class="spacer"></span>
+  <label class="muted">chain <select id="chain" aria-label="Chain">
+    <option value="solana">Solana (Phantom)</option><option value="base">Base (MetaMask)</option>
+    <option value="ethereum">Ethereum (MetaMask)</option><option value="bsc">BNB Chain (MetaMask)</option>
+  </select></label>
+  <span id="wallet-state" class="muted">no wallet</span>
+  <button type="button" id="connect">Connect wallet</button>
+  <a href="./">← dashboard</a> <a href="market">market terminal</a>
+</header>
+<main>
+  <section class="panel" aria-label="New coins">
+    <div class="panel-head"><h2>New coins</h2><span class="spacer"></span>
+      <label class="muted">liquidity ≥ $<input id="minliq" class="num" type="number" min="0" step="500" value="1000" style="width:80px" aria-label="Minimum liquidity"></label>
+    </div>
+    <form class="check-addr" id="addr-form"><input id="addr" placeholder="paste a contract address to check it" autocomplete="off" spellcheck="false" aria-label="Contract address"><button type="submit" class="primary">Check</button></form>
+    <div class="panel-body muted" id="feed-sub" style="padding-top:4px;padding-bottom:4px"></div>
+    <div id="feed-list" role="list"></div>
+  </section>
+
+  <section class="panel" aria-label="Token check">
+    <div class="panel-head"><h2 id="tok-title">Pick a coin</h2><span class="muted" id="tok-sub"></span><span class="spacer"></span>
+      <button type="button" id="recheck" disabled>Check again</button></div>
+    <div class="panel-body" id="tok-body"><div class="empty">Pick a new coin on the left, or paste a contract address. The checklist reads the contract on chain, the liquidity lock, the holders and whether you can sell, before you buy.</div></div>
+  </section>
+
+  <section class="panel" aria-label="Trade">
+    <div class="panel-head"><h2>Trade</h2><span class="spacer"></span><span class="muted" id="trade-sub"></span></div>
+    <div class="panel-body">
+      <div class="muted" id="trade-for">Pick a coin first.</div>
+      <div class="amounts" id="amounts"></div>
+      <div class="field"><label>or $ <input id="usd" class="num" type="number" min="1" step="1" value="50" aria-label="Dollars to spend"></label>
+        <label>slippage <input id="slip" class="num" type="number" min="0.1" max="50" step="0.5" value="3" style="width:60px" aria-label="Slippage percent">%</label></div>
+      <div class="field"><label><input type="checkbox" id="turbo" checked> turbo (priority fee, lands faster on Solana)</label></div>
+      <div class="override" id="override"><label><input type="checkbox" id="override-ok"> <span id="override-text"></span></label></div>
+      <button type="button" class="buy" id="buy" disabled style="width:100%;padding:9px">Buy</button>
+      <div class="status-line" id="trade-status" role="status" aria-live="polite"></div>
+      <h3>Your meme positions</h3>
+      <div id="positions"><div class="empty">No positions yet.</div></div>
+      <h3>Recent swaps</h3>
+      <div id="recent" class="scroll"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const CONTROL_TOKEN = "__CONTROL_TOKEN__";
+const S = { chain: localStorage.getItem("memes.chain") || "solana", feed: [], sel: null, report: null, wallet: null,
+  amount: 50, busy: false, said: new Set(), feedTimer: null };
+const STATUS_ICON = { pass: "✓", warn: "!", fail: "✕", unknown: "?" };
+const CHAIN_WALLET = { solana: "phantom", base: "metamask", ethereum: "metamask", bsc: "metamask" };
+const CHAIN_HEX = { base: "0x2105", ethereum: "0x1", bsc: "0x38" };
+
+function el(tag, attrs, text) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v !== null && v !== undefined && v !== false) n.setAttribute(k, v === true ? "" : v);
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); return n; }
+function usd(x, d) { if (x === null || x === undefined || !isFinite(x)) return "–"; const a = Math.abs(x);
+  return "$" + (a >= 1e9 ? (x / 1e9).toFixed(2) + "B" : a >= 1e6 ? (x / 1e6).toFixed(2) + "M" : a >= 1e4 ? (x / 1e3).toFixed(1) + "K" : x.toFixed(d ?? 2)); }
+function price(x) { if (!x) return "–"; const d = x >= 1 ? 4 : Math.min(12, 2 - Math.floor(Math.log10(x)) + 2); return "$" + x.toFixed(d); }
+function pct(x) { return x === null || x === undefined ? "–" : `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`; }
+function age(min) { return min === null || min === undefined ? "–" : min < 60 ? `${Math.round(min)}m` : min < 2880 ? `${(min / 60).toFixed(1)}h` : `${Math.round(min / 1440)}d`; }
+function short(a) { return a ? `${a.slice(0, 4)}…${a.slice(-4)}` : "–"; }
+function say(text) { if (window.speechSynthesis) { speechSynthesis.cancel(); setTimeout(() => speechSynthesis.speak(new SpeechSynthesisUtterance(text)), 60); } }
+function status(text) { document.getElementById("trade-status").textContent = text; }
+async function getJSON(url) { const r = await fetch(url, { cache: "no-store" }); const j = await r.json(); if (!r.ok) throw new Error(j.error || j.message || r.status); return j; }
+async function control(body) {
+  if (!CONTROL_TOKEN) { status("✕ Controls are off on this dashboard."); return { ok: false }; }
+  const r = await fetch("api/control", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json", "X-Trendbot-Token": CONTROL_TOKEN }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ ok: false, message: r.statusText }));
+  if (!j.ok) status("✕ " + j.message);
+  return j;
+}
+
+// ------------------------------------------------------------------ wallets (same providers as the dashboard)
+function metamaskProvider() { const e = window.ethereum; if (!e) return null; return (e.providers || []).find((p) => p.isMetaMask) || (e.isMetaMask ? e : null); }
+function phantomProvider() { const p = (window.phantom && window.phantom.solana) || window.solana; return p && p.isPhantom ? p : null; }
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function b58encode(bytes) {
+  const digits = [0];
+  for (const b of bytes) { let carry = b; for (let i = 0; i < digits.length; i++) { carry += digits[i] << 8; digits[i] = carry % 58; carry = (carry / 58) | 0; } while (carry) { digits.push(carry % 58); carry = (carry / 58) | 0; } }
+  let out = ""; for (let i = 0; i < bytes.length && bytes[i] === 0; i++) out += "1";
+  for (let i = digits.length - 1; i >= 0; i--) out += B58[digits[i]];
+  return out;
+}
+function b64decode(s) { return Uint8Array.from(atob(s), (c) => c.charCodeAt(0)); }
+async function waitReceipt(p, hash) {
+  for (let i = 0; i < 90; i++) { const r = await p.request({ method: "eth_getTransactionReceipt", params: [hash] });
+    if (r && r.status) { if (parseInt(r.status, 16) !== 1) throw new Error("the approval failed on chain"); return; }
+    await new Promise((res) => setTimeout(res, 2000)); }
+  throw new Error("the approval did not confirm in 3 minutes");
+}
+async function connect() {
+  const kind = CHAIN_WALLET[S.chain];
+  try {
+    if (kind === "phantom") {
+      const p = phantomProvider();
+      if (!p) { status("✕ Phantom is not installed in this browser (phantom.com), then reload this page."); return; }
+      const r = await p.connect();
+      await control({ action: "meme_connect", provider: "phantom", address: (r.publicKey || p.publicKey).toString() });
+    } else {
+      const p = metamaskProvider();
+      if (!p) { status("✕ MetaMask is not installed in this browser (metamask.io), then reload this page."); return; }
+      const acc = await p.request({ method: "eth_requestAccounts" });
+      await control({ action: "meme_connect", provider: "metamask", address: acc[0], chain_id: await p.request({ method: "eth_chainId" }) });
+    }
+    pollPositions();
+  } catch (e) { status("✕ " + ((e && e.message) || e)); }
+}
+async function sendToWallet(j) {
+  const tx = j.tx;
+  if (tx.kind === "solana") {
+    const p = phantomProvider(); if (!p) throw new Error("Phantom is not available in this browser");
+    if (!p.isConnected) await p.connect();
+    status("Confirm the swap in Phantom…");
+    const res = await p.request({ method: "signAndSendTransaction", params: { message: b58encode(b64decode(tx.tx)) } });
+    return (res && res.signature) || res;
+  }
+  const p = metamaskProvider(); if (!p) throw new Error("MetaMask is not available in this browser");
+  if (parseInt(await p.request({ method: "eth_chainId" }), 16) !== parseInt(tx.chain_id, 16)) {
+    status("Switch the network in MetaMask…");
+    await p.request({ method: "wallet_switchEthereumChain", params: [{ chainId: tx.chain_id }] });
+  }
+  if (tx.approve) {
+    status("Step 1 of 2: allow the swap to spend the token (MetaMask)…");
+    const h = await p.request({ method: "eth_sendTransaction", params: [tx.approve] });
+    status("Waiting for that approval to confirm…"); await waitReceipt(p, h);
+  }
+  status((tx.approve ? "Step 2 of 2: " : "") + "Confirm the swap in MetaMask…");
+  return await p.request({ method: "eth_sendTransaction", params: [tx.swap] });
+}
+async function trade(side, extra) {
+  const r = S.report;
+  if (!r || S.busy) return;
+  S.busy = true; renderTrade();
+  try {
+    status("Getting the best route…");
+    const body = { action: side === "buy" ? "meme_buy" : "meme_sell", chain: r.chain, address: r.address, symbol: r.symbol,
+      price_usd: r.market.price_usd, liquidity_usd: r.market.liquidity_usd, slippage_bps: Math.round(parseFloat(document.getElementById("slip").value || "3") * 100),
+      turbo: document.getElementById("turbo").checked, ...extra };
+    const j = await control(body);
+    if (!j.ok) return;
+    let sig;
+    try { sig = await sendToWallet(j); }
+    catch (e) { const why = String((e && e.message) || e).slice(0, 180); await control({ action: "meme_reject", id: j.id, reason: why }); status("✕ Not sent: " + why); return; }
+    await control({ action: "meme_sent", id: j.id, tx: String(sig) });
+    status(`✓ Sent. Confirming on chain… (${short(String(sig))})`);
+    setTimeout(pollPositions, 1500);
+  } finally { S.busy = false; renderTrade(); }
+}
+
+// ------------------------------------------------------------------ feed
+async function loadFeed() {
+  const floor = parseFloat(document.getElementById("minliq").value || "1000");
+  try {
+    const f = await getJSON(`api/memes/feed?chain=${S.chain}&min_liq=${floor}`);
+    S.feed = f.items || [];
+    const down = Object.entries(f.sources || {}).filter(([, v]) => v !== "ok").map(([k]) => k);
+    document.getElementById("feed-sub").textContent = `${S.feed.length} new pools with ≥ $${floor.toLocaleString()} liquidity · newest first · updated ${new Date(f.updated_ms).toLocaleTimeString()}` + (down.length ? ` · ${down.join(", ")} unreachable` : "");
+  } catch (e) { document.getElementById("feed-sub").textContent = "The feed could not be loaded: " + e.message; }
+  renderFeed();
+}
+function renderFeed() {
+  const host = clear(document.getElementById("feed-list"));
+  if (!S.feed.length) { host.append(el("div", { class: "empty" }, "No new pools yet (or the feed is unreachable). You can still paste a contract address above.")); return; }
+  for (const c of S.feed) {
+    const row = el("div", { class: "coin" + (S.sel === c.address ? " sel" : ""), role: "listitem", tabindex: "0", title: (c.quick.flags || []).join("\n") });
+    row.append(c.icon ? el("img", { src: c.icon, alt: "", loading: "lazy", referrerpolicy: "no-referrer" }) : el("div", { class: "ph" }));
+    const mid = el("div");
+    mid.append(el("div", { class: "sym" }, `${c.symbol || "?"}`), el("div", { class: "sub" },
+      `${age(c.age_min)} · liq ${usd(c.liquidity_usd, 0)} · mcap ${usd(c.market_cap, 0)} · 1h ${pct(c.change.h1)} · ${(c.txns.h1 || {}).buys ?? "–"}/${(c.txns.h1 || {}).sells ?? "–"} buys/sells`));
+    const right = el("div");
+    right.append(el("span", { class: `badge b-${c.quick.verdict}` }, c.quick.verdict === "pass" ? "ok" : c.quick.verdict));
+    row.append(mid, right);
+    row.onclick = () => pick(c.address);
+    row.onkeydown = (e) => { if (e.key === "Enter") pick(c.address); };
+    host.append(row);
+  }
+}
+function pick(address, fresh) {
+  S.sel = address; renderFeed(); runCheck(address, fresh);
+}
+
+// ------------------------------------------------------------------ the check
+async function runCheck(address, fresh) {
+  const body = clear(document.getElementById("tok-body"));
+  body.append(el("div", { class: "empty" }, "Checking the contract, liquidity, holders and a test sell… (about 5-10 seconds)"));
+  document.getElementById("recheck").disabled = true;
+  try {
+    const usdAmt = parseFloat(document.getElementById("usd").value || "50");
+    const r = await getJSON(`api/memes/check?chain=${S.chain}&address=${encodeURIComponent(address)}&usd=${usdAmt}${fresh ? "&fresh=1" : ""}`);
+    if (S.sel !== address) return;
+    S.report = r; renderReport(); renderTrade();
+  } catch (e) { clear(body).append(el("div", { class: "empty" }, "✕ " + e.message)); S.report = null; renderTrade(); }
+  document.getElementById("recheck").disabled = false;
+}
+function checkRow(c) {
+  const row = el("div", { class: `row s-${c.status}` });
+  row.append(el("div", { class: "ic", "aria-label": c.status }, STATUS_ICON[c.status] || "?"));
+  const txt = el("div");
+  txt.append(el("div", { class: "t" }, c.title), el("div", { class: "d" }, c.detail));
+  if (c.source) txt.append(el("div", { class: "src" }, "source: " + c.source));
+  row.append(txt);
+  return row;
+}
+const VERDICT_TEXT = { passes: "Passes the checks", risky: "Risky", avoid: "Avoid", unknown: "Not verified" };
+function renderReport() {
+  const r = S.report, m = r.market || {}, body = clear(document.getElementById("tok-body"));
+  document.getElementById("tok-title").textContent = `${r.symbol || "?"} ${r.name ? "· " + r.name : ""}`;
+  document.getElementById("tok-sub").textContent = `${r.chain} · ${short(r.address)}`;
+  const kv = el("div", { class: "kv" });
+  for (const [k, v] of [["price", price(m.price_usd)], ["mcap", usd(m.market_cap, 0)], ["liquidity", usd(m.liquidity_usd, 0)],
+    ["24h vol", usd((m.volume || {}).h24, 0)], ["1h", pct((m.change || {}).h1)], ["24h", pct((m.change || {}).h24)]]) {
+    const s = el("span", { class: "muted" }, k + " "); s.append(el("b", {}, v)); kv.append(s);
+  }
+  body.append(kv);
+  const v = el("div", { class: `verdict v-${r.verdict}` });
+  v.append(el("b", {}, VERDICT_TEXT[r.verdict] || r.verdict), document.createTextNode(": " + r.verdict_why));
+  body.append(v);
+  body.append(el("h3", {}, "Before you buy: the six checks"));
+  const six = el("div", { class: "six" });
+  for (const c of r.six) {
+    const row = checkRow(c);
+    if (c.id === "contract") {
+      const box = el("div", { class: "d", style: "margin-top:4px" });
+      const lab = el("label");
+      const cb = el("input", { type: "checkbox", checked: r.confirmed || null });
+      cb.onchange = async () => { await control({ action: "meme_confirm", chain: r.chain, address: r.address, yes: cb.checked }); pick(r.address, true); };
+      lab.append(cb, document.createTextNode(" I checked this address on the project's own channel"));
+      box.append(lab);
+      const links = el("div", { class: "src" });
+      for (const s of r.socials || []) { links.append(el("a", { href: s.url, target: "_blank", rel: "noopener noreferrer" }, s.type)); links.append(document.createTextNode(" · ")); }
+      links.append(el("a", { href: r.explorer, target: "_blank", rel: "noopener noreferrer" }, "explorer"));
+      box.append(links);
+      if ((r.copies || []).length) {
+        const cp = el("div", { class: "src" }, `copies of $${r.symbol}: `);
+        for (const c2 of r.copies.slice(0, 5)) { cp.append(el("a", { href: c2.url || "#", target: "_blank", rel: "noopener noreferrer" }, `${short(c2.address)} (${usd(c2.liquidity_usd, 0)})`)); cp.append(document.createTextNode(" ")); }
+        box.append(cp);
+      }
+      row.children[1].append(box);
+    }
+    six.append(row);
+  }
+  body.append(six);
+  for (const g of r.groups || []) {
+    const det = el("details", { open: g.id === "safety" ? true : null });
+    const bad = g.checks.filter((c) => c.status === "fail").length, warn = g.checks.filter((c) => c.status === "warn" || c.status === "unknown").length;
+    det.append(el("summary", {}, `${g.title} · ${g.checks.length} checks${bad ? ` · ${bad} failed` : ""}${warn ? ` · ${warn} to look at` : ""}`));
+    const list = el("div", { class: "six" });
+    for (const c of g.checks) list.append(checkRow(c));
+    det.append(list);
+    body.append(det);
+  }
+  if (r.chart) {
+    body.append(el("h3", {}, "Chart (DexScreener)"));
+    body.append(el("iframe", { id: "chart", src: r.chart, title: "DexScreener chart", referrerpolicy: "no-referrer" }));
+  }
+  if ((r.market.daily || []).length) {
+    body.append(el("h3", {}, `Daily volume, last ${r.market.daily.length} days`));
+    const bars = el("div", { class: "bars", title: "daily volume" });
+    const max = Math.max(...r.market.daily.map((d) => d.v)) || 1;
+    for (const d of r.market.daily) { const b = el("div", { title: `${new Date(d.t).toLocaleDateString()}: ${usd(d.v, 0)}` }); b.style.height = `${Math.max(2, d.v / max * 100)}%`; bars.append(b); }
+    body.append(bars);
+  }
+  const extra = el("div", { class: "kv", style: "margin-top:10px;align-items:flex-start" });
+  if ((r.holders || []).length) {
+    const box = el("div", { style: "flex:1;min-width:220px" });
+    box.append(el("h3", {}, "Largest holders (people)"));
+    const t = el("table"), h = el("tr"); h.append(el("th", {}, "wallet"), el("th", {}, "of supply")); t.append(h);
+    for (const x of r.holders) { const tr = el("tr"); tr.append(el("td", {}, short(x.owner)), el("td", {}, x.pct.toFixed(2) + "%")); t.append(tr); }
+    box.append(t); extra.append(box);
+  }
+  if ((r.slippage || []).length) {
+    const box = el("div", { style: "flex:1;min-width:200px" });
+    box.append(el("h3", {}, "Price impact when you sell"));
+    const t = el("table"), h = el("tr"); h.append(el("th", {}, "selling"), el("th", {}, "moves price")); t.append(h);
+    for (const x of r.slippage) { const tr = el("tr"); tr.append(el("td", {}, usd(x.usd, 0)), el("td", { class: x.pct > 15 ? "down" : "" }, x.pct.toFixed(1) + "%")); t.append(tr); }
+    box.append(t); extra.append(box);
+  }
+  body.append(extra);
+  const down = Object.entries(r.sources || {}).filter(([, s]) => s !== "ok");
+  body.append(el("div", { class: "src muted", style: "margin-top:10px" }, `checked ${new Date(r.checked_ms).toLocaleTimeString()} · sources: ` +
+    Object.entries(r.sources || {}).map(([k, s]) => `${k} ${s === "ok" ? "✓" : "✕"}`).join(", ") + (down.length ? " (unreachable sources make checks unknown, never safe)" : "")));
+}
+
+// ------------------------------------------------------------------ trade panel
+function renderTrade() {
+  const r = S.report, buy = document.getElementById("buy");
+  const amounts = clear(document.getElementById("amounts"));
+  for (const a of [10, 25, 50, 100, 250]) {
+    const b = el("button", { type: "button", class: S.amount === a ? "on" : null }, `$${a}`);
+    b.onclick = () => { S.amount = a; document.getElementById("usd").value = a; renderTrade(); };
+    amounts.append(b);
+  }
+  const ov = document.getElementById("override");
+  if (!r) { document.getElementById("trade-for").textContent = "Pick a coin first."; buy.disabled = true; ov.style.display = "none"; return; }
+  document.getElementById("trade-for").textContent = `${r.symbol} on ${r.chain} with ${CHAIN_WALLET[r.chain] === "phantom" ? "Phantom" : "MetaMask"}`;
+  const failed = r.six.filter((c) => c.status === "fail" || (c.status === "unknown" && c.id !== "contract")).map((c) => c.title);
+  if (failed.length) {
+    ov.style.display = "block";
+    document.getElementById("override-text").textContent = `I accept the risk of: ${failed.join("; ")}`;
+  } else { ov.style.display = "none"; document.getElementById("override-ok").checked = false; }
+  const ok = !failed.length || document.getElementById("override-ok").checked;
+  buy.disabled = S.busy || !ok || !CONTROL_TOKEN;
+  buy.textContent = `Buy ${r.symbol} for $${parseFloat(document.getElementById("usd").value || "0")}`;
+}
+document.getElementById("override-ok").onchange = renderTrade;
+document.getElementById("usd").oninput = () => { S.amount = parseFloat(document.getElementById("usd").value); renderTrade(); };
+document.getElementById("buy").onclick = () => trade("buy", { usd: parseFloat(document.getElementById("usd").value || "0") });
+
+async function pollPositions() {
+  let p;
+  try { p = await getJSON("api/memes/positions"); } catch (e) { return; }
+  const w = p.wallet;
+  document.getElementById("wallet-state").textContent = w ? `${w.provider === "phantom" ? "Phantom" : "MetaMask"} ${short(w.address)}` : "no wallet";
+  document.getElementById("connect").textContent = w ? "Reconnect" : `Connect ${CHAIN_WALLET[S.chain] === "phantom" ? "Phantom" : "MetaMask"}`;
+  const host = clear(document.getElementById("positions"));
+  if (!(p.positions || []).length) host.append(el("div", { class: "empty" }, "No positions yet."));
+  for (const x of p.positions || []) {
+    const d = el("div", { class: "pos" });
+    d.append(el("div", {}, `${x.symbol} · ${x.chain} · ${x.qty.toLocaleString(undefined, { maximumFractionDigits: 2 })} tokens`));
+    const v = el("div", { class: "kv" });
+    for (const [k, val, cls] of [["value", usd(x.value_usd), ""], ["P&L", `${usd(x.pnl_usd)} (${pct(x.pnl_pct)})`, (x.pnl_usd || 0) >= 0 ? "up" : "down"], ["cost", usd(x.cost_usd), ""]]) {
+      const s = el("span", { class: "muted" }, k + " "); s.append(el("b", { class: cls }, val)); v.append(s);
+    }
+    d.append(v);
+    if (x.alerts.length) {
+      d.append(el("div", { class: "alerts" }, "⚠ " + x.alerts.join(" · ")));
+      for (const a of x.alerts) { const key = x.key + a.split(":")[0]; if (!S.said.has(key)) { S.said.add(key); say(`${x.symbol}: ${a}`); if (window.Notification && Notification.permission === "granted") new Notification(`Chantisimo · ${x.symbol}`, { body: a }); } }
+    }
+    const btns = el("div", { class: "amounts" });
+    for (const share of [25, 50, 100]) {
+      const b = el("button", { type: "button", class: "sell" }, `Sell ${share}%`);
+      b.disabled = S.busy || !x.qty;
+      b.onclick = async () => { if (!S.report || S.report.address !== x.address) { S.chain = x.chain; chainSel.value = x.chain; S.sel = x.address; await runCheck(x.address); } trade("sell", { pct: share }); };
+      btns.append(b);
+    }
+    d.append(btns);
+    const f = el("div", { class: "field" });
+    const stop = el("input", { class: "num", type: "number", placeholder: "stop -%", value: x.stop_pct ?? "", "aria-label": "Stop loss percent" });
+    const tgt = el("input", { class: "num", type: "number", placeholder: "target +%", value: x.target_pct ?? "", "aria-label": "Take profit percent" });
+    const save = el("button", { type: "button" }, "Set alerts");
+    save.onclick = () => { control({ action: "meme_exits", key: x.key, stop_pct: stop.value === "" ? null : +stop.value, target_pct: tgt.value === "" ? null : +tgt.value }).then((j) => j.ok && status("✓ " + j.message));
+      if (window.Notification && Notification.permission === "default") Notification.requestPermission(); };
+    f.append(stop, tgt, save);
+    d.append(f);
+    host.append(d);
+  }
+  const rec = clear(document.getElementById("recent"));
+  const rows = (p.recent || []).slice(0, 8);
+  if (rows.length) {
+    const t = el("table"), h = el("tr"); for (const c of ["when", "swap", "result"]) h.append(el("th", {}, c)); t.append(h);
+    for (const x of rows) { const tr = el("tr"); tr.append(el("td", {}, new Date(x.created_ms).toLocaleTimeString()), el("td", {}, `${x.side} ${x.pair}`), el("td", { class: x.status === "filled" ? "up" : x.status === "failed" || x.status === "rejected" ? "down" : "" }, x.status)); t.append(tr); }
+    rec.append(t);
+  }
+  document.getElementById("trade-sub").textContent = (p.tickets || []).length ? `${p.tickets.length} swap(s) in progress` : "";
+}
+
+// ------------------------------------------------------------------ wiring
+const chainSel = document.getElementById("chain");
+chainSel.value = S.chain;
+chainSel.onchange = () => { S.chain = chainSel.value; localStorage.setItem("memes.chain", S.chain); S.sel = null; S.report = null; renderTrade(); loadFeed(); pollPositions(); };
+document.getElementById("minliq").onchange = loadFeed;
+document.getElementById("connect").onclick = connect;
+document.getElementById("recheck").onclick = () => S.sel && pick(S.sel, true);
+document.getElementById("addr-form").onsubmit = (e) => { e.preventDefault(); const a = document.getElementById("addr").value.trim(); if (a) pick(a); };
+renderTrade();
+loadFeed(); setInterval(loadFeed, 20000);
+pollPositions(); setInterval(pollPositions, 3000);
+</script>
+</body>
+</html>
