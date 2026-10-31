@@ -230,6 +230,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
 .brain-grid > * { min-width: 0; }
 @media (max-width: 960px) { .brain-grid { grid-template-columns: minmax(0, 1fr); } }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+@media (max-width: 600px) { input:not([type=checkbox]):not([type=radio]), select { max-width: calc(100vw - 64px); } }
 </style>
 </head>
 <body class="viz-root">
