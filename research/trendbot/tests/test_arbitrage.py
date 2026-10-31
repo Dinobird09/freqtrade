@@ -8,8 +8,10 @@ from research.trendbot import arbitrage as arb
 
 
 def book(**pairs):
-    return {p.replace("_", "/"): {"bid": b, "ask": a, "bid_qty": 10.0, "ask_qty": 10.0}
-            for p, (b, a) in pairs.items()}  # fmt: skip
+    return {
+        p.replace("_", "/"): {"bid": b, "ask": a, "bid_qty": 10.0, "ask_qty": 10.0}
+        for p, (b, a) in pairs.items()
+    }
 
 
 def test_split_symbol():
@@ -84,31 +86,69 @@ def fake_fetch(responses):
 def test_readers_parse_each_exchange_format():
     fetch = fake_fetch(
         {
-            "api.binance.com": [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "100.1",
-                                 "bidQty": "1", "askQty": "2"}],
-            "okx.com": {"data": [{"instId": "BTC-USDT", "bidPx": "101", "askPx": "101.1",
-                                  "bidSz": "1", "askSz": "1"}]},
-            "bybit.com": {"result": {"list": [{"symbol": "ETHUSDT", "bid1Price": "5",
-                                               "ask1Price": "5.01", "bid1Size": "3",
-                                               "ask1Size": "3"}]}},
-            "kucoin.com": {"data": {"ticker": [{"symbol": "SOL-USDT", "buy": "2", "sell": "2.01"}]}},
+            "api.binance.com": [
+                {
+                    "symbol": "BTCUSDT",
+                    "bidPrice": "100",
+                    "askPrice": "100.1",
+                    "bidQty": "1",
+                    "askQty": "2",
+                }
+            ],
+            "okx.com": {
+                "data": [
+                    {
+                        "instId": "BTC-USDT",
+                        "bidPx": "101",
+                        "askPx": "101.1",
+                        "bidSz": "1",
+                        "askSz": "1",
+                    }
+                ]
+            },
+            "bybit.com": {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "ETHUSDT",
+                            "bid1Price": "5",
+                            "ask1Price": "5.01",
+                            "bid1Size": "3",
+                            "ask1Size": "3",
+                        }
+                    ]
+                }
+            },
+            "kucoin.com": {
+                "data": {"ticker": [{"symbol": "SOL-USDT", "buy": "2", "sell": "2.01"}]}
+            },
             "AssetPairs": {"result": {"XXBTZUSD": {"wsname": "XBT/USD"}}},
-            "kraken.com/0/public/Ticker": {"result": {"XXBTZUSD": {"a": ["100.2", "1", "1.5"],
-                                                                   "b": ["100.1", "1", "2.5"]}}},
+            "kraken.com/0/public/Ticker": {
+                "result": {"XXBTZUSD": {"a": ["100.2", "1", "1.5"], "b": ["100.1", "1", "2.5"]}}
+            },
             "coinbase.com/products/BTC-USD/ticker": {"bid": "100.3", "ask": "100.4"},
         }
-    )  # fmt: skip
+    )
     books, errors = arb.books(["binance", "okx", "bybit", "kucoin", "kraken", "coinbase"], fetch)
     assert errors == {}
-    assert books["binance"]["BTC/USDT"] == {"bid": 100.0, "ask": 100.1, "bid_qty": 1.0,
-                                            "ask_qty": 2.0}  # fmt: skip
+    assert books["binance"]["BTC/USDT"] == {
+        "bid": 100.0,
+        "ask": 100.1,
+        "bid_qty": 1.0,
+        "ask_qty": 2.0,
+    }
     assert books["okx"]["BTC/USDT"]["bid"] == 101.0
     assert books["bybit"]["ETH/USDT"]["ask"] == 5.01
     assert books["kucoin"]["SOL/USDT"]["bid"] == 2.0
-    assert books["kraken"]["BTC/USD"] == {"bid": 100.1, "ask": 100.2, "bid_qty": 2.5,
-                                          "ask_qty": 1.5}  # fmt: skip
-    assert books["coinbase"] == {"BTC/USD": {"bid": 100.3, "ask": 100.4, "bid_qty": 0.0,
-                                             "ask_qty": 0.0}}  # fmt: skip
+    assert books["kraken"]["BTC/USD"] == {
+        "bid": 100.1,
+        "ask": 100.2,
+        "bid_qty": 2.5,
+        "ask_qty": 1.5,
+    }
+    assert books["coinbase"] == {
+        "BTC/USD": {"bid": 100.3, "ask": 100.4, "bid_qty": 0.0, "ask_qty": 0.0}
+    }
 
 
 def test_a_blocked_exchange_is_reported_not_fatal():
@@ -133,12 +173,28 @@ def test_crossed_or_empty_books_are_dropped():
 def test_scan_record_and_history(tmp_path):
     fetch = fake_fetch(
         {
-            "api.binance.com": [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "100.01",
-                                 "bidQty": "5", "askQty": "5"}],
-            "okx.com": {"data": [{"instId": "BTC-USDT", "bidPx": "101", "askPx": "101.01",
-                                  "bidSz": "5", "askSz": "5"}]},
+            "api.binance.com": [
+                {
+                    "symbol": "BTCUSDT",
+                    "bidPrice": "100",
+                    "askPrice": "100.01",
+                    "bidQty": "5",
+                    "askQty": "5",
+                }
+            ],
+            "okx.com": {
+                "data": [
+                    {
+                        "instId": "BTC-USDT",
+                        "bidPx": "101",
+                        "askPx": "101.01",
+                        "bidSz": "5",
+                        "askSz": "5",
+                    }
+                ]
+            },
         }
-    )  # fmt: skip
+    )
     res = arb.scan(["binance", "okx"], fetch)
     assert res["spatial"][0]["net_pct"] > 0.5
     assert arb.record(tmp_path, res) == 1
@@ -165,10 +221,23 @@ def test_monitor_caches_between_scans(tmp_path):
 
 def test_cli_prints_a_report(monkeypatch, capsys):
     monkeypatch.setattr(arb, "default_fetch", None)
-    res = {"ts": "t", "exchanges": {"okx": 1}, "errors": {"binance": "blocked"},
-           "spatial": [{"pair": "BTC/USDT", "buy_on": "okx", "buy_at": 1.0, "sell_on": "kraken",
-                        "sell_at": 1.1, "net_pct": 9.0, "suspect": False}],
-           "triangular": {"okx": [{"route": "USDT → A → B → USDT", "net_pct": 0.1}]}}  # fmt: skip
+    res = {
+        "ts": "t",
+        "exchanges": {"okx": 1},
+        "errors": {"binance": "blocked"},
+        "spatial": [
+            {
+                "pair": "BTC/USDT",
+                "buy_on": "okx",
+                "buy_at": 1.0,
+                "sell_on": "kraken",
+                "sell_at": 1.1,
+                "net_pct": 9.0,
+                "suspect": False,
+            }
+        ],
+        "triangular": {"okx": [{"route": "USDT → A → B → USDT", "net_pct": 0.1}]},
+    }
     monkeypatch.setattr(arb, "scan", lambda *a, **k: res)
     assert arb.main([]) == 0
     out = capsys.readouterr().out

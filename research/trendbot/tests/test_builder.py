@@ -1,6 +1,7 @@
 """Strategy builder: the block catalog, public candles, backtests and saving a paper bot."""
 
 import json
+from itertools import pairwise
 
 import pytest
 
@@ -13,8 +14,17 @@ NOW = 1_760_000_000_000 // H * H
 
 
 def kline_rows(n, start, step=H, base=100.0):
-    return [[start + i * step, str(base + i % 7), str(base + i % 7 + 1), str(base + i % 7 - 1),
-             str(base + (i + 1) % 7), "10"] for i in range(n)]  # fmt: skip
+    return [
+        [
+            start + i * step,
+            str(base + i % 7),
+            str(base + i % 7 + 1),
+            str(base + i % 7 - 1),
+            str(base + (i + 1) % 7),
+            "10",
+        ]
+        for i in range(n)
+    ]
 
 
 def fetch_from(responses, calls=None):
@@ -51,11 +61,16 @@ def test_binance_candles_page_and_drop_the_forming_one():
         return kline_rows(n, t)
 
     calls = []
-    cs, src = bd.public_candles("BTC/USDT", "1h", 1500 // 24 + 1, fetch=fetch_from(
-        {"api.binance.com": page}, calls), now_ms=NOW)  # fmt: skip
+    cs, src = bd.public_candles(
+        "BTC/USDT",
+        "1h",
+        1500 // 24 + 1,
+        fetch=fetch_from({"api.binance.com": page}, calls),
+        now_ms=NOW,
+    )
     assert src == "binance" and len(calls) == 2
     assert cs[-1].ts == NOW - H  # closed candles only
-    assert all(b.ts - a.ts == H for a, b in zip(cs, cs[1:]))
+    assert all(b.ts - a.ts == H for a, b in pairwise(cs))
     assert cs[0].ts >= start - 25 * H
 
 
@@ -63,11 +78,13 @@ def test_falls_back_to_coinbase_when_binance_is_blocked():
     def cb(url):
         return [[(NOW - (i + 1) * H) // 1000, 99, 101, 100, 100.5, 3] for i in range(300)]
 
-    fetch = fetch_from({
-        "api.binance.com": bd.FetchError("HTTP Error 451"),
-        "api.binance.us": bd.FetchError("HTTP Error 403"),
-        "api.exchange.coinbase.com/products/BTC-USD/candles": cb,
-    })  # fmt: skip
+    fetch = fetch_from(
+        {
+            "api.binance.com": bd.FetchError("HTTP Error 451"),
+            "api.binance.us": bd.FetchError("HTTP Error 403"),
+            "api.exchange.coinbase.com/products/BTC-USD/candles": cb,
+        }
+    )
     cs, src = bd.public_candles("BTC/USDT", "1h", 10, fetch=fetch, now_ms=NOW)
     assert src == "coinbase" and len(cs) == 300
     assert cs[0].ts < cs[-1].ts and cs[-1].open == 100 and cs[-1].high == 101
@@ -82,13 +99,25 @@ def test_no_source_explains_and_suggests_demo():
 
 
 def test_clean_spec_rules():
-    s = bd.clean_spec({"strategy": "confluence", "required": ["ema200", "bogus"], "counted": [],
-                       "params": {"min_signals": 1}})  # fmt: skip
+    s = bd.clean_spec(
+        {
+            "strategy": "confluence",
+            "required": ["ema200", "bogus"],
+            "counted": [],
+            "params": {"min_signals": 1},
+        }
+    )
     assert s["params"]["required"] == ["ema200"] and s["params"]["use"] == ["ema200"]
     assert s["params"]["min_signals"] == 1
     with pytest.raises(bd.BuilderError, match="only 2 are on the board"):
-        bd.clean_spec({"strategy": "confluence", "required": ["ema200"], "counted": ["vwap"],
-                       "params": {"min_signals": 5}})  # fmt: skip
+        bd.clean_spec(
+            {
+                "strategy": "confluence",
+                "required": ["ema200"],
+                "counted": ["vwap"],
+                "params": {"min_signals": 5},
+            }
+        )
     with pytest.raises(bd.BuilderError, match="unknown strategy"):
         bd.clean_spec({"strategy": "martingale"})
     with pytest.raises(bd.BuilderError, match="pair"):
@@ -98,8 +127,9 @@ def test_clean_spec_rules():
 
 
 def test_backtest_a_lab_strategy_on_demo_data():
-    res = bd.backtest({"strategy": "mean_reversion", "exchange": "demo", "timeframe": "4h",
-                       "days": 400})  # fmt: skip
+    res = bd.backtest(
+        {"strategy": "mean_reversion", "exchange": "demo", "timeframe": "4h", "days": 400}
+    )
     assert res["source"].startswith("demo") and res["candles"] > 500
     assert set(res["stats"]) >= {"trades", "return_pct", "cagr_pct", "max_dd_pct"}
     assert len(res["equity"]) <= 301
@@ -110,9 +140,17 @@ def test_backtest_confluence_with_builder_signals():
     from research.trendbot.confluence import SIGNALS
 
     ids = list(SIGNALS)
-    res = bd.backtest({"strategy": "confluence", "exchange": "demo", "timeframe": "4h",
-                       "days": 900, "required": ids[:1], "counted": ids[1:6],
-                       "params": {"min_signals": 3}})  # fmt: skip
+    res = bd.backtest(
+        {
+            "strategy": "confluence",
+            "exchange": "demo",
+            "timeframe": "4h",
+            "days": 900,
+            "required": ids[:1],
+            "counted": ids[1:6],
+            "params": {"min_signals": 3},
+        }
+    )
     assert res["spec"]["params"]["use"] == ids[:6]
     assert "trades" in res["stats"]
     for t in res["trades"]:
@@ -120,18 +158,35 @@ def test_backtest_confluence_with_builder_signals():
 
 
 def test_backtest_grid_and_dca_engines():
-    g = bd.backtest({"strategy": "grid", "exchange": "demo", "timeframe": "4h", "days": 200,
-                     "params": {"levels": 8, "budget": 1000}})  # fmt: skip
+    g = bd.backtest(
+        {
+            "strategy": "grid",
+            "exchange": "demo",
+            "timeframe": "4h",
+            "days": 200,
+            "params": {"levels": 8, "budget": 1000},
+        }
+    )
     assert isinstance(g["result"], dict) and g["spec"]["strategy"] == "grid"
-    d = bd.backtest({"strategy": "dca", "exchange": "demo", "timeframe": "1d", "days": 400,
-                     "params": {"amount_quote": 50, "every": "7d"}})  # fmt: skip
+    d = bd.backtest(
+        {
+            "strategy": "dca",
+            "exchange": "demo",
+            "timeframe": "1d",
+            "days": 400,
+            "params": {"amount_quote": 50, "every": "7d"},
+        }
+    )
     assert isinstance(d["result"], dict)
     json.dumps([g, d])
 
 
 def test_save_as_paper_bot(tmp_path):
-    out = bd.save_bot({"strategy": "mean_reversion", "pair": "SOL/USDT", "exchange": "coinbase"},
-                      "sol-mr", tmp_path)  # fmt: skip
+    out = bd.save_bot(
+        {"strategy": "mean_reversion", "pair": "SOL/USDT", "exchange": "coinbase"},
+        "sol-mr",
+        tmp_path,
+    )
     raw = json.loads((tmp_path / "sol-mr.json").read_text())
     assert raw["mode"] == "paper" and raw["engine"] == "lab"
     assert raw["lab"]["strategy"] == "mean_reversion" and raw["pairs"] == ["SOL/USDT"]
@@ -145,7 +200,21 @@ def test_save_as_paper_bot(tmp_path):
 
 def test_save_engine_bots(tmp_path):
     for eng in ("grid", "dca"):
-        bd.save_bot({"strategy": eng, "params": {"budget": 500} if eng == "grid" else {}},
-                    f"b-{eng}", tmp_path)  # fmt: skip
+        bd.save_bot(
+            {"strategy": eng, "params": {"budget": 500} if eng == "grid" else {}},
+            f"b-{eng}",
+            tmp_path,
+        )
         raw = json.loads((tmp_path / f"b-{eng}.json").read_text())
         assert raw["engine"] == eng and eng in raw["lab"] and raw["mode"] == "paper"
+
+
+def test_coinbase_4h_is_built_from_1h():
+    def cb(url):
+        return [[(NOW - (i + 1) * H) // 1000, 99, 101 + i % 3, 98, 100, 1] for i in range(300)]
+
+    fetch = fetch_from({"coinbase.com/products/BTC-USD/candles": cb})
+    cs, src = bd.public_candles("BTC/USDT", "4h", 40, "coinbase", fetch, now_ms=NOW)
+    assert src == "coinbase" and len(cs) >= 50
+    assert all(b.ts - a.ts == 4 * H for a, b in pairwise(cs))
+    assert all(c.volume == 4 for c in cs)

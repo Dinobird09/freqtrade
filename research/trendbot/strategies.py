@@ -29,8 +29,20 @@ take part of the position there and trail the rest.
                   value gap. Optional: footprint absorption + a 400% positive delta expansion
                   (needs collected order flow) and Elliott's hard rules as extra filters.
 
+``confluence``    the multi-indicator, multi-timeframe trend system of confluence.py: 1D bias
+                  (EMA200, no whipsaw), 4H structure, then at least five of eleven named
+                  signals on the entry timeframe; stop 1.5 x ATR, half at 2R, the rest at 3R;
+                  at most 3 trades a day and none after 2 losses in a row that day.
+
+``mean_reversion`` statistically stretched prices in a market without a trend: a close below
+                  the lower Bollinger band (20, 2) with RSI(14) < 30 (or a z-score below
+                  ``z_entry``) after ADX < 20 (or with a flat EMA200); exit at the middle
+                  band, stop k x ATR below the entry.
+
 Every strategy keeps the bot's floor of 2:1 reward-to-risk: a setup whose target is closer
-than 2R is skipped.
+than 2R is skipped. A strategy whose params hold ``max_trades_per_day`` or
+``stop_after_losses`` has them enforced by the backtest engine and by the lab bot, and its
+``risk_pct`` param (when present) sets the risk per trade.
 """
 
 from __future__ import annotations
@@ -42,7 +54,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .indicators import ema
+from .indicators import adx, bollinger, ema, rsi_wilder, zscore
 from .models import Candle
 
 
@@ -64,6 +76,10 @@ class Signal:
     trail_atr: float | None = None  # after the partial: trail this far below the best close
     expiry_bars: int = 1
     reason: str = ""
+    # a second target for what is left after the partial (instead of a trail): absolute, or
+    # for next_open entries ``fill + rr2 * (fill - stop)``; the stop moves to break-even first
+    target2: float | None = None
+    rr2: float | None = None
 
     def key(self) -> tuple[Any, ...]:
         r = lambda x: None if x is None else round(x, 10)  # noqa: E731
@@ -444,7 +460,138 @@ def _elliott_ok(phighs: Any, plows: Any, jl: int, jh: int, i: int, r: int) -> bo
     return elliott_valid([x for _, x in pts[-6:]])
 
 
-STRATEGIES: dict[str, type[Strategy]] = {s.name: s for s in (NNFX, SneakyPivot, FibFVG)}
+class Confluence(Strategy):
+    """The confluence system (confluence.py) as a lab strategy: long setups only (spot)."""
+
+    name = "confluence"
+    timeframe = "1h"
+    description = "1D EMA200 bias, 4H structure, >= 5 of 11 signals; 1.5 ATR stop, 2R / 3R targets"
+    defaults = {
+        "required": None,  # None: the fixed entry list (confluence.DEFAULT_REQUIRED)
+        "use": None,  # None: every signal counts toward min_signals
+        "min_signals": 5,
+        "risk_pct": 1.0,
+        "max_trades_per_day": 3,
+        "stop_after_losses": 2,
+        "timeframe": "1h",
+        "stop_atr": 1.5,
+        "tp1_rr": 2.0,
+        "tp2_rr": 3.0,
+        "tp1_share": 0.5,
+    }
+    grid = {"min_signals": [5, 6, 7], "stop_atr": [1.5, 2.0]}
+
+    def __init__(self, **params: Any) -> None:
+        super().__init__(**params)
+        from .confluence import check_params
+
+        check_params(self.p)
+        self.timeframe = str(self.p["timeframe"])
+
+    @property
+    def history_candles(self) -> int:
+        """Candles the live bot fetches: enough for a converged 1D EMA200."""
+        from .confluence import history_needed
+
+        return history_needed(self.timeframe)
+
+    def signals(self, cs: Sequence[Candle], flow: Mapping[int, Any] | None = None) -> list[Signal]:
+        from .confluence import scan
+
+        return scan(cs, self.p)
+
+
+class MeanReversion(Strategy):
+    name = "mean_reversion"
+    timeframe = "4h"
+    description = "close below the lower Bollinger band with RSI < 30 in a range; exit at the mean"
+    defaults = {
+        "bb_n": 20,
+        "bb_k": 2.0,
+        "rsi_n": 14,
+        "rsi_max": 30.0,
+        "z_entry": None,  # e.g. -2.5: a stretch this extreme qualifies without the RSI
+        "trend_filter": "adx",  # "adx" | "ema_slope" | "both"
+        "adx_n": 14,
+        "adx_max": 20.0,
+        "slope_n": 30,
+        "slope_flat_pct": 1.5,  # EMA200 moved less than this over slope_n bars: flat
+        "atr_n": 14,
+        "stop_atr": 1.0,
+    }
+    grid = {"bb_k": [2.0, 2.5], "rsi_max": [25.0, 30.0, 35.0], "stop_atr": [0.75, 1.0]}
+
+    def _ranging(self, i: int, ad: Sequence[float | None], e200: Sequence[float | None]) -> bool:
+        p = self.p
+        # the regime the stretch came FROM: the ADX of the bar before (the stretch bar's own
+        # range would push the ADX up and disqualify every sharp drop)
+        adx_ok = i >= 1 and ad[i - 1] is not None and ad[i - 1] < p["adx_max"]  # type: ignore[operator]
+        j = i - p["slope_n"]
+        flat = (
+            j >= 0
+            and e200[i] is not None
+            and e200[j] is not None
+            and abs(e200[i] / e200[j] - 1) * 100 < p["slope_flat_pct"]  # type: ignore[operator]
+        )
+        mode = p["trend_filter"]
+        if mode == "adx":
+            return adx_ok
+        if mode == "ema_slope":
+            return flat
+        if mode == "both":
+            return adx_ok and flat
+        raise ValueError(f"trend_filter must be adx, ema_slope or both (got {mode!r})")
+
+    def signals(self, cs: Sequence[Candle], flow: Mapping[int, Any] | None = None) -> list[Signal]:
+        p = self.p
+        closes = [c.close for c in cs]
+        mid, _, lower = bollinger(closes, p["bb_n"], p["bb_k"])
+        z = zscore(closes, p["bb_n"])
+        rsi = rsi_wilder(closes, p["rsi_n"])
+        a = atr(cs, p["atr_n"])
+        ad = adx(cs, p["adx_n"])
+        e200 = ema(closes, 200) if p["trend_filter"] != "adx" else [None] * len(cs)
+
+        def stretched(k: int) -> bool:
+            if lower[k] is None or rsi[k] is None:
+                return False
+            band = closes[k] < lower[k] and rsi[k] < p["rsi_max"]  # type: ignore[operator]
+            far = p["z_entry"] is not None and z[k] is not None and z[k] < p["z_entry"]  # type: ignore[operator]
+            return bool(band or far)
+
+        out = []
+        prev = False
+        for i in range(len(cs)):
+            now = stretched(i)
+            fresh, prev = now and not prev, now
+            if not fresh or a[i] is None or not self._ranging(i, ad, e200):
+                continue
+            target, risk = mid[i], p["stop_atr"] * a[i]  # type: ignore[operator]
+            if target is None or target - closes[i] < MIN_RR * risk:
+                continue  # the mean is closer than 2R: no trade
+            out.append(
+                Signal(
+                    i,
+                    cs[i].ts,
+                    "next_open",
+                    None,
+                    closes[i] - risk,
+                    target,
+                    stop_atr=risk,
+                    reason=(
+                        f"close {closes[i]:.6g} below the lower band {lower[i]:.6g}, RSI "
+                        f"{rsi[i]:.0f}, z {z[i]:.2f}, no trend (ADX before "
+                        f"{ad[i - 1] if ad[i - 1] is None else round(ad[i - 1], 1)}); target "
+                        f"the mean {target:.6g}"
+                    ),
+                )
+            )
+        return out
+
+
+STRATEGIES: dict[str, type[Strategy]] = {
+    s.name: s for s in (NNFX, SneakyPivot, FibFVG, Confluence, MeanReversion)
+}
 
 
 # ---------------------------------------------------------------------- backtest engine
@@ -478,15 +625,21 @@ def backtest(  # noqa: C901 - the bar loop: entries, stops, targets, trailing
     *,
     fee: float = 0.001,
     slip_pct: float = 0.05,
-    risk_pct: float = 1.0,
+    risk_pct: float | None = None,
     equity: float = 10_000.0,
     signals: Sequence[Signal] | None = None,
     start_i: int = 0,
     flow: Mapping[int, Any] | None = None,
 ) -> BTResult:
     """One position at a time; stops are checked before targets inside a bar (worst case);
-    entries and exits pay ``fee`` and ``slip_pct``; size = ``risk_pct`` of equity at risk."""
+    entries and exits pay ``fee`` and ``slip_pct``; size = ``risk_pct`` of equity at risk
+    (default: the strategy's ``risk_pct`` param, else 1%). The strategy's day rules
+    (``max_trades_per_day``, ``stop_after_losses``: consecutive losing trades closed that UTC
+    day) skip entries for the rest of the day."""
     sigs = sorted(signals if signals is not None else strategy.signals(cs, flow), key=lambda s: s.i)
+    if risk_pct is None:
+        risk_pct = float(strategy.p.get("risk_pct") or 1.0)
+    rules = DayRules(strategy.p.get("max_trades_per_day"), strategy.p.get("stop_after_losses"))
     slip = slip_pct / 100
     by_i: dict[int, list[Signal]] = {}
     for s in sigs:
@@ -518,6 +671,8 @@ def backtest(  # noqa: C901 - the bar loop: entries, stops, targets, trailing
                 else:
                     continue
                 pending.clear()
+                if rules.blocked(c.ts):
+                    break  # the day's limit: no more entries today
                 if fill <= st or (tgt is not None and tgt - fill < MIN_RR * (fill - st) * 0.999):
                     break  # the fill left no room for 2R: skipped
                 risk_amt = eq * risk_pct / 100
@@ -527,22 +682,32 @@ def backtest(  # noqa: C901 - the bar loop: entries, stops, targets, trailing
                 eq -= qty * fill * fee
                 stop, best, trail = st, c.close, None
                 pos_sig = s
+                tgt2 = s.target2
+                if tgt2 is None and s.rr2 is not None:
+                    tgt2 = fill + s.rr2 * (fill - st)
+                rules.entered(c.ts)
                 break
         # ---- exits
         if pos is not None:
             left = pos.qty - sum(q for _, q, _, _ in pos.exits)
             if c.low <= stop:
                 px = min(c.open, stop) * (1 - slip)
-                pos.exits.append((i, left, px, "SL" if trail is None else "TRAIL"))
+                label = "TRAIL" if trail is not None else "BE" if pos.exits else "SL"
+                pos.exits.append((i, left, px, label))
                 left = 0.0
             elif pos.target is not None and c.high >= pos.target and not pos.exits:
                 px = max(c.open, pos.target) * (1 - slip)
-                part = left * pos_sig.partial if pos_sig.partial and pos_sig.trail_atr else left
+                runs = pos_sig.trail_atr or tgt2 is not None
+                part = left * pos_sig.partial if pos_sig.partial and runs else left
                 pos.exits.append((i, part, px, "TP"))
                 left -= part
                 if left > 1e-12:
                     stop = max(stop, pos.entry)  # the rest can no longer lose
                     trail = pos_sig.trail_atr
+            if left > 1e-12 and pos.exits and tgt2 is not None and c.high >= tgt2:
+                px = max(c.open, tgt2) * (1 - slip)
+                pos.exits.append((i, left, px, "TP2"))
+                left = 0.0
             if left > 1e-12 and trail is not None:
                 best = max(best, c.close)
                 stop = max(stop, best - trail)
@@ -555,6 +720,7 @@ def backtest(  # noqa: C901 - the bar loop: entries, stops, targets, trailing
                 pos.exit = sum(q * px for _, q, px, _ in pos.exits) / pos.qty
                 pos.r = pos.pnl / pos.risk if pos.risk else None
                 trades.append(pos)
+                rules.closed(c.ts, pos.pnl)
                 pos = None
         if pos is None:
             pending.extend(by_i.get(i, []))
@@ -564,7 +730,57 @@ def backtest(  # noqa: C901 - the bar loop: entries, stops, targets, trailing
             realized = sum(q * (px - pos.entry) for _, q, px, _ in pos.exits)
             mtm = eq + realized + left * (c.close - pos.entry)
         curve.append((c.ts, mtm))
-    return BTResult(trades, curve, performance(trades, curve, equity))
+    stats = performance(trades, curve, equity)
+    if rules.active:
+        stats["skipped_by_day_rules"] = rules.skipped
+    return BTResult(trades, curve, stats)
+
+
+class DayRules:
+    """At most ``max_trades`` entries per UTC day; no entry for the rest of a day on which
+    ``stop_after`` trades in a row closed at a loss. ``None`` disables a rule."""
+
+    def __init__(self, max_trades: int | None = None, stop_after: int | None = None) -> None:
+        self.max_trades = int(max_trades) if max_trades else None
+        self.stop_after = int(stop_after) if stop_after else None
+        self.count: dict[int, int] = {}
+        self.streak_day: int | None = None
+        self.streak = 0
+        self.skipped = 0
+
+    @property
+    def active(self) -> bool:
+        return self.max_trades is not None or self.stop_after is not None
+
+    def why_blocked(self, ts: int) -> str | None:
+        day = ts // DAY_MS
+        if self.max_trades is not None and self.count.get(day, 0) >= self.max_trades:
+            return f"the daily maximum of {self.max_trades} trades is reached"
+        if (
+            self.stop_after is not None
+            and self.streak_day == day
+            and self.streak >= self.stop_after
+        ):
+            return f"{self.streak} losses in a row today: no more trades until tomorrow"
+        return None
+
+    def blocked(self, ts: int) -> bool:
+        if self.why_blocked(ts) is None:
+            return False
+        self.skipped += 1
+        return True
+
+    def entered(self, ts: int) -> None:
+        day = ts // DAY_MS
+        self.count[day] = self.count.get(day, 0) + 1
+
+    def closed(self, ts: int, pnl: float) -> None:
+        day = ts // DAY_MS
+        if pnl < 0:
+            self.streak = self.streak + 1 if self.streak_day == day else 1
+            self.streak_day = day
+        else:
+            self.streak, self.streak_day = 0, day
 
 
 def performance(

@@ -137,7 +137,7 @@ def _coinbase(pair: str, tf: str, start: int, end: int, fetch: Fetch) -> list[Ca
     if gran is None:  # Coinbase has no 4h candles: build them from 1h
         from .data import resample_candles
 
-        return resample_candles(_coinbase(pair, "1h", start, end, fetch), TF_MS["4h"])
+        return resample_candles(_coinbase(pair, "1h", start, end, fetch), TF_MS["1h"], TF_MS["4h"])
     pid = pair.replace("/", "-").replace("-USDT", "-USD")
     rows: dict[int, Candle] = {}
     t = start
@@ -167,7 +167,7 @@ def demo_candles(tf: str, days: int, seed: int = 7) -> list[Candle]:
     if tf == "1d":
         from .data import resample_candles
 
-        cs = resample_candles(cs, TF_MS["1d"])
+        cs = resample_candles(cs, TF_MS["4h"], TF_MS["1d"])
     return cs
 
 

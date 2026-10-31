@@ -13,6 +13,11 @@ the capital guard on a bad day). The capital guard, the kill switch lock, pause 
 close from the dashboard and the journal format are the same as the main bot's, so the
 dashboard, the terminal and the fleet work unchanged.
 
+A strategy with day rules (the confluence system: ``max_trades_per_day``,
+``stop_after_losses``) has them enforced here exactly as in the backtest, its ``risk_pct``
+param sets the risk per trade (never above the pair's cap), and a second target (``rr2``)
+sells the rest of the position there after the partial at the first one.
+
 Real money needs incubation: a testnet or live lab bot refuses to start until the strategy
 was approved on the dashboard and has paper-traded for at least 30 days (lab.incubation).
 """
@@ -29,7 +34,7 @@ from .capital import CapitalGuard, CapitalSettings, read_lock, write_lock
 from .data import pair_filename, save_candles_csv, timeframe_to_ms
 from .journal import atomic_write_text, ms_to_iso, read_journal
 from .live_exchange import PaperBroker
-from .models import EXIT_END, EXIT_SL, EXIT_TP, Trade, base_of
+from .models import DAY_MS, EXIT_END, EXIT_SL, EXIT_TP, Trade, base_of
 from .sizing import max_risk_pct
 from .strategies import STRATEGIES
 
@@ -206,7 +211,8 @@ class LabBot:
         last_closed = now // self.tf_ms * self.tf_ms - self.tf_ms
         if self.state.get("last_bar") is not None and self.state["last_bar"] >= last_closed:
             return
-        cs = self.gw.closed_candles(self.pair, 1500) if self.tf == "4h" else self._candles_tf(1500)
+        n = int(getattr(self.strategy, "history_candles", 1500))
+        cs = self.gw.closed_candles(self.pair, n) if self.tf == "4h" else self._candles_tf(n)
         if not cs or cs[-1].ts != last_closed:
             return
         self.state["last_bar"] = last_closed
@@ -218,6 +224,10 @@ class LabBot:
             log.info("SIGNAL %s %s: %s", self.key, ms_to_iso(s.ts), s.reason)
             if risk_scale is None or self.state.get("open"):
                 continue
+            why = self.day_blocked(now)
+            if why:
+                log.info("SKIP %s: %s", self.key, why)
+                continue
             order = {
                 "ts": s.ts,
                 "entry": s.entry,
@@ -228,6 +238,8 @@ class LabBot:
                 "rr": s.rr,
                 "partial": s.partial,
                 "trail_atr": s.trail_atr,
+                "target2": s.target2,
+                "rr2": s.rr2,
                 "reason": s.reason,
                 "expires": last_closed + self.tf_ms * (s.expiry_bars + 1),
             }
@@ -250,10 +262,37 @@ class LabBot:
             if now >= o["expires"]:
                 continue
             if risk_scale is not None and not self.state.get("open") and ask >= o["price"]:
-                self._buy(o, ask, risk_scale)
+                if not self.day_blocked(now):
+                    self._buy(o, ask, risk_scale)
                 continue
             keep.append(o)
         self.state["pending"] = keep
+
+    def day_blocked(self, now: int) -> str | None:
+        """The strategy's day rules: at most ``max_trades_per_day`` entries per UTC day, and
+        none for the rest of the day after ``stop_after_losses`` losing trades in a row."""
+        p = self.strategy.p
+        most, losses = p.get("max_trades_per_day"), p.get("stop_after_losses")
+        day = now // DAY_MS
+        if most:
+            n = sum(1 for t in self.trades if t.entry_ts // DAY_MS == day)
+            o = self.state.get("open")
+            n += 1 if o and o["entry_ts"] // DAY_MS == day else 0
+            if n >= int(most):
+                return f"the daily maximum of {int(most)} trades is reached"
+        if losses:
+            today = sorted(
+                (t for t in self.trades if t.is_closed and t.exit_ts // DAY_MS == day),  # type: ignore[operator]
+                key=lambda t: t.exit_ts or 0,
+            )
+            streak = 0
+            for t in reversed(today):
+                if (t.pnl or 0) >= 0:
+                    break
+                streak += 1
+            if streak >= int(losses):
+                return f"{streak} losses in a row today: no more trades until tomorrow"
+        return None
 
     # -------------------------------------------------------------- orders
     def _buy(self, o: dict[str, Any], ask: float, risk_scale: float) -> None:
@@ -265,7 +304,8 @@ class LabBot:
             log.info("SKIP %s: the price moved and no 2R room is left", self.key)
             return
         eq = self.equity()
-        risk_pct = min(1.0, max_risk_pct(self.pair, self.cfg)) * risk_scale
+        want = float(self.strategy.p.get("risk_pct") or 1.0)
+        risk_pct = min(want, max_risk_pct(self.pair, self.cfg)) * risk_scale
         per_unit = (est - stop) + fee * (est + stop)
         cash = self.gw.free(self.pair.split("/")[1])
         qty = self.gw.round_qty(
@@ -285,6 +325,9 @@ class LabBot:
                 if o.get("target") is not None
                 else fill.price + o["rr"] * (fill.price - stop)
             )
+        target2 = o.get("target2")
+        if target2 is None and o.get("rr2"):
+            target2 = fill.price + o["rr2"] * (fill.price - stop)
         tid = int(self.state["next_id"])
         self.state["next_id"] = tid + 1
         risk_amt = fill.qty * ((fill.price - stop) + fee * (fill.price + stop))
@@ -298,6 +341,7 @@ class LabBot:
             "target": target,
             "partial": o["partial"],
             "trail_atr": o["trail_atr"],
+            "target2": target2,
             "best": fill.price,
             "trailing": False,
             "exits": [],
@@ -327,8 +371,11 @@ class LabBot:
             self._exit_all(bid, EXIT_SL, "stop" if not o["trailing"] else "trailing stop")
             return
         left = o["qty"] - sum(q for q, _ in o["exits"])
+        if o["exits"] and o.get("target2") is not None and bid >= o["target2"]:
+            self._exit_all(bid, EXIT_TP, "second target")
+            return
         if not o["exits"] and o["target"] is not None and bid >= o["target"]:
-            if o["partial"] and o["trail_atr"]:
+            if o["partial"] and (o["trail_atr"] or o.get("target2") is not None):
                 part = self.gw.round_qty(self.pair, left * o["partial"])
                 fill = self.gw.sell(self.pair, part)
                 o["exits"].append([fill.qty, fill.price])
@@ -339,7 +386,7 @@ class LabBot:
                 )
                 o["stop"], o["trailing"] = max(o["stop"], o["entry"]), True
                 log.info(
-                    "PARTIAL %s #%d: %.8g sold at %.8g, the rest trails",
+                    "PARTIAL %s #%d: %.8g sold at %.8g, the rest runs",
                     self.key,
                     o["id"],
                     fill.qty,

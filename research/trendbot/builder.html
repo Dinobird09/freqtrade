@@ -391,6 +391,7 @@ function renderResults(res) {
   for (const [k, v] of Object.entries(r)) if (typeof v === "number") tiles.appendChild(tile(k.replace(/_/g, " "), num(v, Math.abs(v) >= 100 ? 0 : 2)));
   box.appendChild(tiles);
   for (const [k, v] of Object.entries(r)) if (typeof v === "string") box.appendChild(el("p", { class: /warn|left|out/i.test(k) ? "warn" : "muted" }, v));
+  for (const [k, v] of Object.entries(r)) if (Array.isArray(v) && v.length && typeof v[0] === "string") for (const w of v) box.appendChild(el("p", { class: "warn" }, "⚠ " + w));
   for (const [k, v] of Object.entries(r)) if (Array.isArray(v) && v.length && typeof v[0] === "object") {
     box.appendChild(el("h3", null, k.replace(/_/g, " ")));
     const cols = Object.keys(v[0]).slice(0, 8).map(c => [c, c.replace(/_/g, " "), null, (x, row) => /ts|time/.test(c) && typeof x === "number" ? day(x) : typeof x === "number" ? num(x, 4) : x ?? "–"]);

@@ -152,8 +152,11 @@ class FakeRuntime:
         return {"bots": [{"name": "main", "running": True}], "running": 1}
 
     def snapshot(self, name):
-        return {"meta": {"mode": "paper"}, "capital": {"equity": 1000},
-                "open_positions": [{"pair": "BTC/USDT", "entry": 100}]}  # fmt: skip
+        return {
+            "meta": {"mode": "paper"},
+            "capital": {"equity": 1000},
+            "open_positions": [{"pair": "BTC/USDT", "entry": 100}],
+        }
 
     def memory_bank(self):
         recs = [
@@ -169,8 +172,9 @@ def server(tmp_path):
 
 
 def rpc(server, method, params=None, mid=1):
-    code, reply = server.handle(json.dumps(
-        {"jsonrpc": "2.0", "id": mid, "method": method, "params": params or {}}).encode())  # fmt: skip
+    code, reply = server.handle(
+        json.dumps({"jsonrpc": "2.0", "id": mid, "method": method, "params": params or {}}).encode()
+    )
     assert code == 200
     return reply
 
@@ -184,8 +188,11 @@ def test_initialize_and_list(server):
     assert r["serverInfo"]["name"] == "chantisimo" and "tools" in r["capabilities"]
     names = [t["name"] for t in rpc(server, "tools/list")["result"]["tools"]]
     assert names[:4] == ["bot_status", "open_positions", "search_memory", "meme_check"]
-    writes = [t["name"] for t in rpc(server, "tools/list")["result"]["tools"]
-              if not t["annotations"]["readOnlyHint"]]  # fmt: skip
+    writes = [
+        t["name"]
+        for t in rpc(server, "tools/list")["result"]["tools"]
+        if not t["annotations"]["readOnlyHint"]
+    ]
     assert writes == ["propose_trade"]
 
 
@@ -195,10 +202,14 @@ def test_notifications_and_errors(server):
     assert server.handle(b'{"id":1}')[1]["error"]["code"] == -32600
     assert rpc(server, "nope")["error"]["code"] == -32601
     assert rpc(server, "tools/call", {"name": "x"})["error"]["message"] == "unknown tool: x"
-    code, batch = server.handle(json.dumps([
-        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-        {"jsonrpc": "2.0", "method": "notifications/initialized"},
-    ]).encode())  # fmt: skip
+    code, batch = server.handle(
+        json.dumps(
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            ]
+        ).encode()
+    )
     assert code == 200 and batch == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
 
 
@@ -217,9 +228,19 @@ def test_read_tools(server):
 
 
 def test_propose_trade_files_a_suggestion_only(server, tmp_path):
-    res = call(server, "propose_trade",
-               {"pair": "sol-usdt", "side": "long", "entry": 150, "stop": 140,
-                "take_profit": [170, 180], "reason": "5 confluences", "source": "openalice"})  # fmt: skip
+    res = call(
+        server,
+        "propose_trade",
+        {
+            "pair": "sol-usdt",
+            "side": "long",
+            "entry": 150,
+            "stop": 140,
+            "take_profit": [170, 180],
+            "reason": "5 confluences",
+            "source": "openalice",
+        },
+    )
     filed = res["structuredContent"]["filed"]
     assert filed["pair"] == "SOL/USDT" and filed["status"] == "waiting for you"
     assert "no order was placed" in res["structuredContent"]["note"]
@@ -279,8 +300,12 @@ def test_mcp_client_talks_to_the_server_end_to_end(server):
 
 def test_analyze_tool_returns_the_card(server, monkeypatch):
     def fake(pair, exchange, **kw):
-        return {"pair": pair, "source": exchange, "text": "NO TRADE – Insufficient confluence",
-                "result": {"decision": "no_trade", "signals": {"ema200": {"ok": False}}}}  # fmt: skip
+        return {
+            "pair": pair,
+            "source": exchange,
+            "text": "NO TRADE: insufficient confluence",
+            "result": {"decision": "no_trade", "signals": {"ema200": {"ok": False}}},
+        }
 
     monkeypatch.setattr("research.trendbot.builder.trade_card", fake)
     out = call(server, "analyze", {"pair": "sol"})["structuredContent"]

@@ -140,3 +140,195 @@ def compute_features(candles: Sequence[Candle], cfg: StrategyConfig) -> list[Fea
         )
         for i, c in enumerate(candles)
     ]
+
+
+# ---------------------------------------------------------------------- candle indicators
+# Used by the confluence system and the mean-reversion strategy. Same rule as above: every
+# value at index ``i`` uses candles ``0..i`` only.
+def rolling_std(values: Sequence[float], n: int) -> list[float | None]:
+    """Population standard deviation of the last ``n`` values (current included)."""
+    _check_window(n, "n")
+    out: list[float | None] = [None] * len(values)
+    for i in range(n - 1, len(values)):
+        win = values[i - n + 1 : i + 1]
+        m = math.fsum(win) / n
+        out[i] = math.sqrt(math.fsum((x - m) ** 2 for x in win) / n)
+    return out
+
+
+def bollinger(
+    closes: Sequence[float], n: int = 20, k: float = 2.0
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Bollinger bands ``(middle, upper, lower)``: the ``n``-bar SMA +- ``k`` population sd."""
+    sd = rolling_std(closes, n)
+    mid: list[float | None] = [None] * len(closes)
+    up: list[float | None] = [None] * len(closes)
+    lo: list[float | None] = [None] * len(closes)
+    for i in range(n - 1, len(closes)):
+        m = math.fsum(closes[i - n + 1 : i + 1]) / n
+        mid[i], up[i], lo[i] = m, m + k * sd[i], m - k * sd[i]  # type: ignore[operator]
+    return mid, up, lo
+
+
+def zscore(closes: Sequence[float], n: int = 20) -> list[float | None]:
+    """``(close - SMA(n)) / sd(n)``; None while the window is short or flat."""
+    mid, _, _ = bollinger(closes, n, 1.0)
+    sd = rolling_std(closes, n)
+    return [
+        (c - m) / s if m is not None and s else None
+        for c, m, s in zip(closes, mid, sd, strict=True)
+    ]
+
+
+def obv(candles: Sequence[Candle]) -> list[float]:
+    """On-Balance Volume: + volume on an up close, - volume on a down close, 0 at the start."""
+    out = [0.0] * len(candles)
+    for i in range(1, len(candles)):
+        c, p = candles[i].close, candles[i - 1].close
+        out[i] = out[i - 1] + (candles[i].volume if c > p else -candles[i].volume if c < p else 0.0)
+    return out
+
+
+def vwap_session(candles: Sequence[Candle], session_ms: int = 24 * HOUR_MS) -> list[float]:
+    """Session VWAP of the typical price ``(h + l + c) / 3``, reset at each UTC session start."""
+    out: list[float] = []
+    pv = vol = 0.0
+    session = None
+    for c in candles:
+        s = c.ts // session_ms
+        if s != session:
+            session, pv, vol = s, 0.0, 0.0
+        tp = (c.high + c.low + c.close) / 3
+        pv += tp * c.volume
+        vol += c.volume
+        out.append(pv / vol if vol > 0 else tp)
+    return out
+
+
+def vwap_rolling(candles: Sequence[Candle], n: int) -> list[float | None]:
+    """VWAP of the typical price over the last ``n`` candles (current included)."""
+    _check_window(n, "n")
+    out: list[float | None] = [None] * len(candles)
+    pv = vol = 0.0
+    for i, c in enumerate(candles):
+        pv += (c.high + c.low + c.close) / 3 * c.volume
+        vol += c.volume
+        if i >= n:
+            o = candles[i - n]
+            pv -= (o.high + o.low + o.close) / 3 * o.volume
+            vol -= o.volume
+        if i >= n - 1:
+            out[i] = pv / vol if vol > 1e-12 else (c.high + c.low + c.close) / 3
+    return out
+
+
+def _midpoint(candles: Sequence[Candle], i: int, n: int) -> float | None:
+    if i < n - 1:
+        return None
+    win = candles[i - n + 1 : i + 1]
+    return (max(c.high for c in win) + min(c.low for c in win)) / 2
+
+
+def ichimoku(
+    candles: Sequence[Candle],
+    tenkan: int = 9,
+    kijun: int = 26,
+    senkou: int = 52,
+    shift: int = 26,
+) -> dict[str, list[float | None]]:
+    """Ichimoku lines as known at each candle's close.
+
+    ``tenkan`` / ``kijun``: midpoints of the last 9 / 26 highs and lows. ``span_a`` /
+    ``span_b`` are the cloud AS PLOTTED at bar ``i``: (tenkan + kijun) / 2 and the 52-bar
+    midpoint computed ``shift`` bars earlier (the forward displacement), so the cloud at
+    ``i`` never needs a future candle. The Chikou span (a backward shift) is left out: it
+    can only be compared with the past, which the other lines already do.
+    """
+    n = len(candles)
+    tk = [_midpoint(candles, i, tenkan) for i in range(n)]
+    kj = [_midpoint(candles, i, kijun) for i in range(n)]
+    sb_raw = [_midpoint(candles, i, senkou) for i in range(n)]
+    sa_raw = [
+        (a + b) / 2 if a is not None and b is not None else None
+        for a, b in zip(tk, kj, strict=True)
+    ]
+    span_a: list[float | None] = [None] * n
+    span_b: list[float | None] = [None] * n
+    for i in range(shift, n):
+        span_a[i], span_b[i] = sa_raw[i - shift], sb_raw[i - shift]
+    return {"tenkan": tk, "kijun": kj, "span_a": span_a, "span_b": span_b}  # type: ignore[dict-item]
+
+
+def parabolic_sar(
+    candles: Sequence[Candle], step: float = 0.02, max_step: float = 0.2
+) -> tuple[list[float | None], list[int]]:
+    """Wilder's Parabolic SAR and its trend (+1 below price / bullish, -1 above / bearish).
+
+    Starts bullish at bar 0 with SAR = low[0] and the extreme point high[0]. Each bar: SAR +=
+    af * (EP - SAR), clamped to stay beyond the previous two bars' lows (highs when
+    bearish); a bar that trades through the SAR flips the trend, the SAR jumps to the old EP
+    and af resets to ``step``; a new extreme raises af by ``step`` up to ``max_step``.
+    """
+    n = len(candles)
+    sar_out: list[float | None] = [None] * n
+    trend_out = [0] * n
+    if not n:
+        return sar_out, trend_out
+    trend, sar, ep, af = 1, candles[0].low, candles[0].high, step
+    sar_out[0], trend_out[0] = sar, trend
+    for i in range(1, n):
+        c, p1 = candles[i], candles[i - 1]
+        p2 = candles[i - 2] if i >= 2 else p1
+        sar = sar + af * (ep - sar)
+        if trend == 1:
+            sar = min(sar, p1.low, p2.low)
+            if c.low < sar:
+                trend, sar, ep, af = -1, ep, c.low, step
+            elif c.high > ep:
+                ep, af = c.high, min(af + step, max_step)
+        else:
+            sar = max(sar, p1.high, p2.high)
+            if c.high > sar:
+                trend, sar, ep, af = 1, ep, c.high, step
+            elif c.low < ep:
+                ep, af = c.low, min(af + step, max_step)
+        sar_out[i], trend_out[i] = sar, trend
+    return sar_out, trend_out
+
+
+def adx(candles: Sequence[Candle], n: int = 14) -> list[float | None]:
+    """Wilder's Average Directional Index (0-100). First value at index ``2n - 1``."""
+    _check_window(n, "n")
+    size = len(candles)
+    out: list[float | None] = [None] * size
+    if size <= 2 * n - 1:
+        return out
+    tr_s = pdm_s = mdm_s = 0.0
+    dxs: list[float] = []
+    adx_v = 0.0
+    for i in range(1, size):
+        c, p = candles[i], candles[i - 1]
+        tr = max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close))
+        up, down = c.high - p.high, p.low - c.low
+        pdm = up if up > down and up > 0 else 0.0
+        mdm = down if down > up and down > 0 else 0.0
+        if i <= n:
+            tr_s, pdm_s, mdm_s = tr_s + tr, pdm_s + pdm, mdm_s + mdm
+            if i < n:
+                continue
+        else:
+            tr_s = tr_s - tr_s / n + tr
+            pdm_s = pdm_s - pdm_s / n + pdm
+            mdm_s = mdm_s - mdm_s / n + mdm
+        pdi = 100 * pdm_s / tr_s if tr_s else 0.0
+        mdi = 100 * mdm_s / tr_s if tr_s else 0.0
+        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if pdi + mdi else 0.0
+        if len(dxs) < n:
+            dxs.append(dx)
+            if len(dxs) == n:
+                adx_v = math.fsum(dxs) / n
+                out[i] = adx_v
+        else:
+            adx_v = (adx_v * (n - 1) + dx) / n
+            out[i] = adx_v
+    return out

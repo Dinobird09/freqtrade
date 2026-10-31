@@ -4,7 +4,8 @@ the incubation gate before real money.
 The loop (items 91-97), in the spirit of an "auto-research" loop (prepare -> train -> a
 readable ``program.md`` report):
 
-``prepare``    loads the cached candles of every pair (4H, or 15m for 15-minute strategies)
+``prepare``    loads the cached candles of every pair (4H; 1H for the confluence system; 15m
+               for 15-minute strategies)
 ``train``      for every strategy: the current parameters and ``mutations`` random variants
                from its grid are scored by a ROLLING WALK-FORWARD, allocation-based (1% risk
                per trade on a compounding equity): 252 days in-sample pick the best variant,
@@ -218,14 +219,14 @@ def mutations(cls: type[Strategy], n: int, rng: random.Random) -> list[dict[str,
 
 
 def prepare(state_dir: Path) -> dict[str, dict[str, list[Candle]]]:
-    """Candles by timeframe and pair: the cached 4H history plus any 15m cache."""
+    """Candles by timeframe and pair: the cached 4H history plus any 1h / 15m cache."""
     from .data import load_candles_csv
 
-    out: dict[str, dict[str, list[Candle]]] = {"4h": {}, "15m": {}}
-    for tf in out:
-        d = state_dir / "candles"
+    out: dict[str, dict[str, list[Candle]]] = {"4h": {}, "1h": {}, "15m": {}}
+    d = state_dir / "candles"
+    for tf, by_pair in out.items():
         for p in sorted(d.glob(f"*-{tf}.csv")) if d.exists() else []:
-            out[tf][p.name[: -len(f"-{tf}.csv")].replace("_", "/", 1)] = load_candles_csv(p)
+            by_pair[p.name[: -len(f"-{tf}.csv")].replace("_", "/", 1)] = load_candles_csv(p)
     return out
 
 
@@ -311,9 +312,12 @@ def render_program(res: Mapping[str, Any], when: int) -> str:
     lines = [
         "# Strategy lab: last night's research",
         "",
-        f"Run {ms_to_iso(when)}. Rolling walk-forward: {IS_DAYS} days in-sample, {OOS_DAYS} days "
-        "out-of-sample, only out-of-sample results count. Look-ahead detector and crash "
-        "stress test on every survivor. Nothing is switched on without your approval.",
+        (
+            f"Run {ms_to_iso(when)}. Rolling walk-forward: {IS_DAYS} days in-sample, "
+            f"{OOS_DAYS} days out-of-sample, only out-of-sample results count. Look-ahead "
+            "detector and crash stress test on every survivor. Nothing is switched on without "
+            "your approval."
+        ),
         "",
         "| strategy | pair | out-of-sample Sharpe | return | max DD | trades | status |",
         "|---|---|---|---|---|---|---|",

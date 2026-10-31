@@ -202,7 +202,7 @@ def test_bot_takes_an_armed_pair_while_entries_are_paused(tmp_path, world):  # n
 
 
 def test_analyze_prints_the_trade_card(term, monkeypatch):
-    t, _, d = term
+    t, _, _ = term
     seen = []
 
     def fake_card(pair, exchange, **kw):
