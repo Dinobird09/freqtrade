@@ -79,6 +79,7 @@ HELP_ITEMS = (  # one command per line, then what it does: readable on a phone t
     ("execute trade BTC", "take BTC's next signal that passes all nine rules (bot running)"),
     ("close BTC / close all", "market-sell a position (asks you to confirm)"),
     ("why BTC", "the latest decision on BTC and its reason"),
+    ("analyze BTC", "the confluence trade card now (entry, stop, TP1/TP2, R:R) or NO TRADE"),
     ("brain", "what Chantisimo has learned: mistakes, graduation"),
     ("traders / follow <name>", "smart money: other traders ranked; follow = copy their buys"),
     ("pause / resume", "new entries off / on (exits always keep running)"),
@@ -325,6 +326,13 @@ class Terminal:
             "options",
         ):
             return "help", {}
+        m = re.search(
+            r"\b(?:analy[sz]e|trade card)(?: (?:on|for|of))? \$?([a-z0-9]{2,12})"
+            r"(?:[/-]([a-z0-9]{2,8}))?\b",
+            t,
+        )
+        if m and m.group(1) not in ("the", "my", "a", "it", "this", "market"):
+            return "analyze", {"pair": pair, "coin": m.group(1), "quote": m.group(2)}
         strat = next(
             (
                 k
@@ -504,6 +512,34 @@ class Terminal:
         if fn is None:
             return Reply(f"Unknown command {name!r}. Type help.")
         return fn(dict(args), bot)
+
+    def tool_analyze(self, args: dict[str, Any], bot: str) -> Reply:
+        """The confluence system's trade card for one coin (any coin, not only the bot's)."""
+        from . import openalice
+        from .builder import BuilderError, trade_card
+
+        snap = self._snap(bot)
+        quote = self._quote(bot)
+        coin = str(args.get("coin") or "").lower()
+        coin = COIN_NAMES.get(coin, coin.upper())
+        pair = f"{coin}/{str(args.get('quote') or quote).upper()}"
+        known = args.get("pair")  # one of the bot's own pairs, when it is the same coin
+        if known and known.split("/")[0] == coin and not args.get("quote"):
+            pair = known
+        equity = (snap.get("capital") or {}).get("equity")
+        exchange = snap["meta"].get("exchange") or "binance"
+        try:
+            card = trade_card(pair, exchange, state_dir=self._dir(bot), equity=equity)
+        except BuilderError as exc:
+            return Reply(f"Could not analyze {pair}: {exc}")
+        res = card["result"]
+        event = "trades" if res.get("decision") == "trade" else "no_trade"
+        sent = openalice.notify(
+            self._dir(self.rt.names[0]), event, openalice.card_markdown({"text": card["text"]}, bot)
+        )
+        note = f"\n\n({card['pair']}, 1H candles from {card['source']}"
+        note += f"; OpenAlice: {sent})" if sent else ")"
+        return Reply(card["text"] + note)
 
     def tool_help(self, args: dict[str, Any], bot: str) -> Reply:
         return Reply(HELP)

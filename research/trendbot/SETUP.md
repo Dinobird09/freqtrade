@@ -428,6 +428,118 @@ It updates itself every 15 seconds.
 - **Export CSV:** downloads every trade, with lessons, mistakes, notes and tags, as a
   spreadsheet that opens in Excel.
 
+## 4i. OpenAlice: the AI trading workspace, linked to the bot
+
+[OpenAlice](https://github.com/Dinobird09/OpenAlice) is a separate app that runs on your
+computer. It has its own licence (AGPL-3.0), so it is installed on its own and none of its
+code is copied into the bot. The two talk over MCP (the open tool protocol), only on
+127.0.0.1, with nothing leaving your computer.
+
+**Install and start OpenAlice** (follow its README; on Windows it ships an installer). Then:
+
+1. In OpenAlice open **Settings → MCP** and turn the MCP server on (port 3001).
+2. In the dashboard, open the **OpenAlice** card and press **Check**. It says whether OpenAlice
+   answers and lists its tools.
+3. Copy the **workspace id** of the OpenAlice workspace you want the bot to write to (it is in
+   the workspace's address) and paste it into the card. Press **Send test**: a message
+   appears in that workspace's Inbox.
+4. Choose what the bot sends:
+   - **trade cards** (on by default);
+   - **NO TRADE verdicts** (off by default);
+   - **alerts** (bot stopped, errors, health warnings; on by default).
+
+**Let OpenAlice's agent ask Chantisimo.** The dashboard also serves Chantisimo's own MCP server
+at `http://127.0.0.1:8050/mcp`. Its tools:
+
+| tool | what it does |
+| --- | --- |
+| `bot_status` | every bot, its mode, equity, open trades |
+| `open_positions` | entry, stop, target, live price, unrealized P&L |
+| `search_memory` | searches the Memory bank (text, pair, win/loss) |
+| `analyze` | the confluence trade card for any coin, or NO TRADE |
+| `meme_check` | the meme desk's six-point check on a token |
+| `scorecard` | bot health against the benchmarks |
+| `propose_trade` | files a suggestion that waits for **you** on the dashboard; it never places an order |
+
+1. On the OpenAlice card press **Connect OpenAlice to Chantisimo**. It shows a `.mcp.json`
+   block and the token.
+2. Save the block as `.mcp.json` in the OpenAlice workspace folder.
+3. Set the environment variable `TRENDBOT_MCP_SERVER_TOKEN` to the token. On Windows:
+   `setx TRENDBOT_MCP_SERVER_TOKEN "<token>"`. Then restart OpenAlice.
+
+The token is made once and kept in the bot's `.env`. Every call without it is refused.
+
+## 4j. Arbitrage monitor
+
+The **Arbitrage** card watches price gaps using the exchanges' free public prices (no keys).
+Every gap is shown **after taker fees on each leg**. It covers Binance, OKX, Bybit, KuCoin,
+Kraken and Coinbase.
+
+- **Spatial:** buy where a coin is cheapest, sell where it is dearest. You need money already
+  on both exchanges: moving coins takes minutes and costs a withdrawal fee, which is not
+  subtracted. A gap above 15% is marked ⚠: that is almost always two different tokens that
+  share a ticker.
+- **Triangular:** three trades on one exchange that end in the coin you started with, e.g.
+  USDT → BTC → ETH → USDT. **Size** is the most the top of each order book can take.
+
+Gaps that pay at least 0.05% after fees are logged in `arbitrage.jsonl`. **How often** shows
+how often each route paid and its best gap. The monitor only watches; it does not place
+arbitrage orders.
+
+From the command line: `trendbot.pyz arbitrage` (add `--json` for the raw data).
+
+## 4k. Strategy builder (drag and drop)
+
+Open **🧱 Strategy builder** in the dashboard header (http://127.0.0.1:8050/builder). On a phone,
+tap a block instead of dragging it.
+
+1. **Strategy:** drag in one block:
+   - **Confluence** (trend following);
+   - **Mean reversion**;
+   - **Grid trading**;
+   - **DCA**;
+   - or one of the lab strategies (NNFX, Sneaky Pivot, Fib + FVG).
+2. **Signals** (Confluence only): drop signals into **Must pass** (every one must be true) or
+   **Also counts**. Signals left in the list don't count. **Use the default set** restores
+   the system's own rule.
+3. **Numbers:**
+   - how many signals must line up;
+   - risk per trade (up to 2%);
+   - max trades a day;
+   - stop for the day after N losses;
+   - stop distance in ATR;
+   - TP1 and TP2 in R.
+
+   Grid has price range, lines and budget. DCA has the amount, how often, and an extra buy on
+   dips.
+4. **Backtest:** candles come free from Binance, falling back to Binance US and then Coinbase.
+   Choose **demo market** to work offline. The results show:
+   - return, return per year, win rate, average R, profit factor, worst drop and Sharpe;
+   - the equity curve and every trade;
+   - a check against the benchmarks: 5–200% a year, about 1% a month for calm bots and
+     10–15% for volatile ones, fee under 0.1%, drop under 25%, and 30+ trades.
+5. **Save as paper bot:** writes a normal bot settings file next to your other bots, always in
+   **paper** mode. Add it to your fleet file to run it alongside the others. Switching it to
+   real money is a separate, deliberate step.
+
+### Asking for a trade card
+
+In the terminal type `analyze BTC` (or `analyze sol`, `trade card for pepe`, `analyze eth/btc`).
+Chantisimo reads the 1D bias, the 4H structure and the 1H signals, plus a 5-minute execution
+check, then prints:
+
+- the trade type;
+- entry, stop loss, TP1 and TP2;
+- the risk:reward ratio;
+- the timeframes used;
+- the confluence factors;
+- the market bias;
+- a confidence score.
+
+If the conditions don't line up it prints
+`NO TRADE – Insufficient confluence or misaligned market conditions.` with the reasons. The
+card also goes to your OpenAlice Inbox if that is switched on.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,

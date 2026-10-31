@@ -21,6 +21,9 @@ COMMANDS = {
     "lab": "lab",
     "fetch_data": "fetch",
     "voice": "voice",
+    "arbitrage": "arbitrage",
+    "openalice": "openalice",
+    "builder": "analyze",
 }
 
 

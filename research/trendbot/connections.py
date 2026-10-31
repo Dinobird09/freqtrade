@@ -43,6 +43,13 @@ PRESETS = {
         "url": "https://mcp.tradingview.com/mcp",
         "note": "TradingView MCP. If it asks you to sign in, paste the access token.",
     },
+    "openalice": {
+        "url": "http://127.0.0.1:3001/mcp",
+        "note": (
+            "OpenAlice on this computer (turn on MCP in OpenAlice settings first; no token). "
+            "Its Inbox lives at http://127.0.0.1:3001/mcp/<workspace id>."
+        ),
+    },
 }
 MCP_PROTOCOL = "2025-06-18"
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")

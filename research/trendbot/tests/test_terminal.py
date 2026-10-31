@@ -199,3 +199,27 @@ def test_bot_takes_an_armed_pair_while_entries_are_paused(tmp_path, world):  # n
     trades = read_journal(bot.journal_path)
     assert len(trades) == 1 and trades[0].pair == "ETH/USDT"  # one armed trade, then disarmed
     assert "ETH/USDT" not in (read_control(bot.dir).get("armed_pairs") or {})
+
+
+def test_analyze_prints_the_trade_card(term, monkeypatch):
+    t, _, d = term
+    seen = []
+
+    def fake_card(pair, exchange, **kw):
+        seen.append((pair, exchange, kw.get("equity")))
+        if pair == "NOPE/USDT":
+            from research.trendbot.builder import BuilderError
+
+            raise BuilderError("no candles")
+        return {"pair": pair, "source": "binance", "text": "Trade Type: Long\nEntry Price: 1",
+                "result": {"decision": "trade"}}  # fmt: skip
+
+    monkeypatch.setattr("research.trendbot.builder.trade_card", fake_card)
+    out = t.handle("analyze BTC")["text"]
+    assert out.startswith("Trade Type: Long") and "BTC/USDT, 1H candles from binance" in out
+    assert t.handle("analyse solana")["text"].count("SOL/USDT") == 1
+    assert "PEPE/USDT" in t.handle("trade card for pepe")["text"]
+    assert "ETH/BTC" in t.handle("analyze eth/btc")["text"]
+    assert "Could not analyze NOPE/USDT: no candles" in t.handle("analyze nope")["text"]
+    assert [s[1] for s in seen] == ["binance"] * 5
+    assert "analyze BTC" in t.handle("help")["text"]

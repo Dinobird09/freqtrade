@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en" data-theme="jarvis">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chantisimo · strategy builder</title>
+<style>
+/* Strategy builder: drag blocks in, set the numbers, backtest, save as a paper bot. */
+:root {
+  --page: #020b14; --surface-1: rgba(4, 20, 34, 0.84); --surface-2: rgba(0, 40, 60, 0.55); --border: rgba(0, 229, 255, 0.28);
+  --text-primary: #d6f8ff; --text-secondary: #8fc3d1; --text-muted: #5f8a97; --accent: #00e5ff;
+  --win: #2ee6a6; --loss: #ff5c6c; --open: #ffc857; --req: #ffc857; --glow: 0 0 16px rgba(0, 229, 255, 0.22);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: radial-gradient(ellipse at 50% -10%, #06324a 0%, var(--page) 60%); color: var(--text-primary);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; min-height: 100vh; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+h1 { margin: 0; font-size: 18px; letter-spacing: 0.14em; text-transform: uppercase; color: #7fefff;
+  font-family: "Orbitron", "Rajdhani", ui-monospace, monospace; text-shadow: 0 0 8px rgba(0, 229, 255, 0.55); }
+h2 { margin: 0; font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase; color: #7fefff; font-family: "Orbitron", "Rajdhani", ui-monospace, monospace; }
+h3 { margin: 10px 0 4px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); }
+a { color: var(--accent); }
+.spacer { flex: 1; }
+.muted { color: var(--text-muted); }
+button, select, input { font: inherit; color: var(--text-primary); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 4px 9px; }
+input[type=range] { padding: 0; accent-color: var(--accent); }
+button { cursor: pointer; }
+button:hover:not(:disabled) { box-shadow: var(--glow); border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: wait; }
+button.primary { background: linear-gradient(180deg, #00b8d4, #007c99); color: #001018; border-color: var(--accent); font-weight: 600; }
+.wrap { padding: 10px; display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 10px; align-items: start; }
+.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 4px; box-shadow: var(--glow); min-width: 0; }
+.panel-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.panel-body { padding: 8px 10px; }
+.col { display: grid; gap: 10px; min-width: 0; }
+.palette { position: sticky; top: 10px; max-height: calc(100vh - 20px); overflow: auto; }
+.block { display: block; width: 100%; text-align: left; margin: 0 0 6px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface-2); cursor: grab; user-select: none; touch-action: manipulation; }
+.block b { display: block; font-size: 12.5px; }
+.block span { display: block; color: var(--text-muted); font-size: 11.5px; line-height: 1.3; }
+.block.strategy b::before { content: "▣ "; color: var(--accent); }
+.block.signal b::before { content: "◆ "; color: var(--accent); }
+.block.used { opacity: 0.45; }
+.block:focus-visible, .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.zone { min-height: 64px; border: 1.5px dashed var(--border); border-radius: 6px; padding: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; }
+.zone.over { border-color: var(--accent); background: rgba(0, 229, 255, 0.07); }
+.zone.req { border-color: rgba(255, 200, 87, 0.45); }
+.zone .hint { color: var(--text-muted); font-size: 12px; align-self: center; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 9px; border-radius: 14px; border: 1px solid var(--accent);
+  background: rgba(0, 229, 255, 0.1); cursor: grab; }
+.zone.req .chip { border-color: var(--req); background: rgba(255, 200, 87, 0.1); }
+.chip button { padding: 0 6px; border-radius: 10px; font-size: 11px; background: transparent; }
+.slot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.slot .name { font-size: 16px; font-weight: 700; color: #7fefff; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px 14px; }
+label.f { display: grid; gap: 3px; font-size: 12px; color: var(--text-secondary); }
+label.f output { color: var(--text-primary); font-weight: 600; }
+label.f input:not([type=range]), label.f select { width: 100%; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+.tile { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 6px 9px; }
+.tile .label { color: #7fefff; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; }
+.tile .value { font-size: 18px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.win { color: var(--win); } .loss { color: var(--loss); } .warn { color: var(--open); }
+svg { display: block; width: 100%; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { padding: 3px 7px; text-align: right; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text-muted); font-weight: 500; font-size: 11px; position: sticky; top: 0; background: #041a2a; }
+.scroll { max-height: 320px; overflow: auto; }
+.bench { display: grid; gap: 4px; }
+.bench div { display: flex; gap: 8px; align-items: baseline; }
+.bench .mark { width: 18px; text-align: center; font-weight: 700; }
+.msg { padding: 6px 10px; border-radius: 4px; margin-top: 6px; }
+.msg.err { border: 1px solid var(--loss); color: var(--loss); }
+.msg.ok { border: 1px solid var(--win); color: var(--win); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.empty { color: var(--text-muted); padding: 18px 8px; text-align: center; }
+@media (max-width: 900px) {
+  .wrap { grid-template-columns: minmax(0, 1fr); }
+  .palette { position: static; max-height: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Strategy builder</h1>
+  <span class="muted">drag blocks in (or tap them), set the numbers, backtest, save as a paper bot</span>
+  <span class="spacer"></span>
+  <a href="./">← dashboard</a> <a href="market">market terminal</a> <a href="memory">memory bank</a>
+</header>
+<div class="wrap">
+  <aside class="panel palette" aria-label="Blocks">
+    <div class="panel-head"><h2>Blocks</h2></div>
+    <div class="panel-body">
+      <h3>Strategy (pick one)</h3>
+      <div id="pal-strategies"></div>
+      <h3 id="pal-signals-title">Signals</h3>
+      <div id="pal-signals"></div>
+    </div>
+  </aside>
+  <main class="col">
+    <section class="panel" aria-label="Strategy">
+      <div class="panel-head"><h2>1 · Strategy</h2></div>
+      <div class="panel-body">
+        <div class="zone" id="z-strategy" data-zone="strategy" aria-label="Strategy slot"><span class="hint">Drop a strategy block here</span></div>
+        <p class="muted" id="strategy-desc"></p>
+      </div>
+    </section>
+    <section class="panel" id="sig-panel" aria-label="Signals">
+      <div class="panel-head"><h2>2 · Signals</h2><span class="spacer"></span><button id="reset-sig" type="button">Use the default set</button></div>
+      <div class="panel-body">
+        <h3>Must pass (every one)</h3>
+        <div class="zone req" id="z-required" data-zone="required" aria-label="Signals that must pass"><span class="hint">Drop signals that must all be true</span></div>
+        <h3>Also counts</h3>
+        <div class="zone" id="z-counted" data-zone="counted" aria-label="Signals that count"><span class="hint">Drop signals that count toward the total</span></div>
+        <p class="muted" id="sig-rule"></p>
+      </div>
+    </section>
+    <section class="panel" aria-label="Settings">
+      <div class="panel-head"><h2>3 · Numbers</h2></div>
+      <div class="panel-body">
+        <div class="grid2" id="params"></div>
+        <h3>Market and money</h3>
+        <div class="grid2">
+          <label class="f">Pair <input id="pair" value="BTC/USDT" autocomplete="off"></label>
+          <label class="f">Candles from <select id="exchange"></select></label>
+          <label class="f">Timeframe <select id="timeframe"></select></label>
+          <label class="f">History (days) <input id="days" type="number" min="7" max="1500" value="365"></label>
+          <label class="f">Starting money <input id="equity" type="number" min="10" value="10000"></label>
+          <label class="f">Fee per trade % <input id="fee" type="number" min="0" max="1" step="0.01" value="0.1"></label>
+        </div>
+        <div class="actions" style="margin-top:10px">
+          <button class="primary" id="run" type="button">▶ Backtest</button>
+          <span class="spacer"></span>
+          <input id="botname" placeholder="bot name, e.g. btc-confluence" aria-label="Bot name">
+          <button id="save" type="button">💾 Save as paper bot</button>
+        </div>
+        <div id="msg" aria-live="polite"></div>
+      </div>
+    </section>
+    <section class="panel" aria-label="Results">
+      <div class="panel-head"><h2>4 · Results</h2><span class="spacer"></span><span class="muted" id="res-sub"></span></div>
+      <div class="panel-body" id="results"><div class="empty">Press Backtest to see how this strategy would have done.</div></div>
+    </section>
+  </main>
+</div>
+<script>
+"use strict";
+const CONTROL_TOKEN = "__CONTROL_TOKEN__";
+const SVGNS = "http://www.w3.org/2000/svg";
+const NAMES = { confluence: "Confluence (trend following)", mean_reversion: "Mean reversion", grid: "Grid trading", dca: "DCA (dollar-cost averaging)",
+  nnfx: "NNFX trend", sneaky_pivot: "Sneaky pivot", fib_fvg: "Fib + fair-value gap" };
+const S = { cat: null, strategy: null, required: [], counted: [], params: {}, last: null, drag: null };
+function el(tag, attrs, text) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v !== null && v !== undefined && v !== false) n.setAttribute(k, v === true ? "" : v);
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function sv(tag, attrs) { const n = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v); return n; }
+function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); return n; }
+function num(x, d = 2) { return x === null || x === undefined || !isFinite(x) ? "–" : Number(x).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }); }
+function title(id) { return NAMES[id] || id.replace(/_/g, " ").replace(/^./, c => c.toUpperCase()); }
+function sigName(id) { return id.replace(/_/g, " ").replace(/\bema200\b/i, "200 EMA").replace(/^./, c => c.toUpperCase()); }
+function say(text, ok) { const m = clear(document.getElementById("msg")); if (text) m.appendChild(el("div", { class: "msg " + (ok ? "ok" : "err") }, text)); }
+async function control(action, body) {
+  if (!CONTROL_TOKEN) return { ok: false, message: "the dashboard was started read-only" };
+  const r = await fetch("api/control", { method: "POST", headers: { "Content-Type": "application/json", "X-Trendbot-Token": CONTROL_TOKEN },
+    body: JSON.stringify({ action, ...body }) });
+  try { return await r.json(); } catch (e) { return { ok: false, message: "HTTP " + r.status }; }
+}
+
+// ------------------------------------------------------------------ palette and drop zones
+function strategyBlock(s) {
+  const b = el("button", { class: "block strategy", type: "button", draggable: "true", "data-kind": "strategy", "data-id": s.id,
+    "aria-label": "Use " + title(s.id) });
+  b.appendChild(el("b", null, title(s.id)));
+  b.appendChild(el("span", null, s.description));
+  b.addEventListener("click", () => setStrategy(s.id));
+  return b;
+}
+function signalBlock(sig) {
+  const b = el("button", { class: "block signal", type: "button", draggable: "true", "data-kind": "signal", "data-id": sig.id,
+    "aria-label": "Add " + sigName(sig.id) });
+  b.appendChild(el("b", null, sigName(sig.id)));
+  b.appendChild(el("span", null, sig.description));
+  b.addEventListener("click", () => addSignal(sig.id, "counted"));
+  return b;
+}
+function wireDrag(root) {
+  root.addEventListener("dragstart", e => {
+    const t = e.target.closest("[data-kind]");
+    if (!t) return;
+    S.drag = { kind: t.dataset.kind, id: t.dataset.id };
+    e.dataTransfer.setData("text/plain", t.dataset.id);
+    e.dataTransfer.effectAllowed = "move";
+  });
+}
+function wireZone(z) {
+  z.addEventListener("dragover", e => {
+    if (!S.drag) return;
+    const ok = (z.dataset.zone === "strategy") === (S.drag.kind === "strategy");
+    if (ok) { e.preventDefault(); z.classList.add("over"); }
+  });
+  z.addEventListener("dragleave", () => z.classList.remove("over"));
+  z.addEventListener("drop", e => {
+    e.preventDefault(); z.classList.remove("over");
+    const d = S.drag; S.drag = null;
+    if (!d) return;
+    if (d.kind === "strategy") setStrategy(d.id); else addSignal(d.id, z.dataset.zone);
+  });
+}
+function addSignal(id, zone) {
+  if (S.strategy !== "confluence") setStrategy("confluence");
+  S.required = S.required.filter(x => x !== id);
+  S.counted = S.counted.filter(x => x !== id);
+  (zone === "required" ? S.required : S.counted).push(id);
+  renderSignals();
+}
+function removeSignal(id) { S.required = S.required.filter(x => x !== id); S.counted = S.counted.filter(x => x !== id); renderSignals(); }
+function chip(id, zone) {
+  const c = el("span", { class: "chip", draggable: "true", "data-kind": "signal", "data-id": id, tabindex: "0" });
+  c.appendChild(el("span", null, sigName(id)));
+  const mv = el("button", { type: "button", title: zone === "required" ? "Move to also counts" : "Make it a must", "aria-label": "Move " + sigName(id) },
+    zone === "required" ? "↓" : "↑");
+  mv.addEventListener("click", () => addSignal(id, zone === "required" ? "counted" : "required"));
+  const rm = el("button", { type: "button", title: "Remove", "aria-label": "Remove " + sigName(id) }, "×");
+  rm.addEventListener("click", () => removeSignal(id));
+  c.append(mv, rm);
+  return c;
+}
+function renderSignals() {
+  for (const [zid, list, hint] of [["z-required", S.required, "Drop signals that must all be true"], ["z-counted", S.counted, "Drop signals that count toward the total"]]) {
+    const z = clear(document.getElementById(zid));
+    if (!list.length) z.appendChild(el("span", { class: "hint" }, hint));
+    for (const id of list) z.appendChild(chip(id, zid === "z-required" ? "required" : "counted"));
+  }
+  const used = new Set([...S.required, ...S.counted]);
+  for (const b of document.querySelectorAll("#pal-signals .block")) b.classList.toggle("used", used.has(b.dataset.id));
+  const pool = used.size || (S.cat ? S.cat.signals.length : 0);
+  const min = Number(S.params.min_signals || 5);
+  const rule = document.getElementById("sig-rule");
+  rule.textContent = `Rule: every "must pass" signal (${S.required.length}) and at least ${min} of the ${pool} signals on the board line up, ` +
+    "with the 1D 200 EMA bias and 4H structure agreeing. Stop 1.5× ATR by default; TP1 2R, TP2 3R.";
+  rule.className = min > pool ? "warn" : "muted";
+}
+function setStrategy(id) {
+  S.strategy = id;
+  const s = S.cat.strategies.find(x => x.id === id);
+  const z = clear(document.getElementById("z-strategy"));
+  const slot = el("div", { class: "slot" });
+  slot.appendChild(el("span", { class: "name" }, title(id)));
+  slot.appendChild(el("span", { class: "muted" }, s.kind === "engine" ? "engine" : "entry / stop strategy"));
+  z.appendChild(slot);
+  document.getElementById("strategy-desc").textContent = s.description;
+  document.getElementById("sig-panel").hidden = id !== "confluence";
+  document.getElementById("timeframe").value = s.timeframe in TF ? s.timeframe : "1h";
+  for (const b of document.querySelectorAll("#pal-strategies .block")) b.classList.toggle("used", b.dataset.id === id);
+  S.params = JSON.parse(JSON.stringify(s.defaults || {}));
+  delete S.params.required; delete S.params.use; delete S.params.timeframe;
+  renderParams();
+  renderSignals();
+}
+const TF = { "15m": 1, "1h": 1, "4h": 1, "1d": 1 };
+
+// ------------------------------------------------------------------ numbers
+const GRID_FIELDS = [["lower", "Lowest grid price (blank = the past range)"], ["upper", "Highest grid price"], ["levels", "Grid lines"], ["budget", "Money for the grid"],
+  ["stop_below", "Stop everything below (optional)"], ["take_above", "Take profit above (optional)"]];
+const DCA_FIELDS = [["amount_quote", "Buy this much each time"], ["buy_the_dip", "Extra buy when x% below average cost"], ["take_profit_pct", "Sell all at +x% (optional)"]];
+function numberField(key, label, value, step) {
+  const l = el("label", { class: "f" }, label);
+  const i = el("input", { type: "number", step: step || "any", value: value === null || value === undefined ? "" : value, "data-key": key });
+  i.addEventListener("input", () => { S.params[key] = i.value === "" ? null : Number(i.value); if (key === "min_signals") renderSignals(); });
+  l.appendChild(i);
+  return l;
+}
+function renderParams() {
+  const box = clear(document.getElementById("params"));
+  if (S.strategy === "confluence") {
+    for (const k of S.cat.knobs) {
+      const v = S.params[k.id] ?? k.min;
+      const l = el("label", { class: "f" });
+      const o = el("output", null, v);
+      l.append(document.createTextNode(k.label + " "), o);
+      const r = el("input", { type: "range", min: k.min, max: k.max, step: k.step, value: v, "aria-label": k.label });
+      r.addEventListener("input", () => { S.params[k.id] = Number(r.value); o.textContent = r.value; if (k.id === "min_signals") renderSignals(); });
+      l.appendChild(r);
+      box.appendChild(l);
+    }
+  } else if (S.strategy === "grid") {
+    for (const [k, label] of GRID_FIELDS) box.appendChild(numberField(k, label, S.params[k]));
+  } else if (S.strategy === "dca") {
+    for (const [k, label] of DCA_FIELDS) box.appendChild(numberField(k, label, S.params[k]));
+    const l = el("label", { class: "f" }, "How often");
+    const sel = el("select", { "aria-label": "How often" });
+    for (const [v, t] of [["1d", "every day"], ["7d", "every week"], ["14d", "every two weeks"], ["30d", "every month"]]) sel.appendChild(el("option", { value: v, selected: S.params.every === v }, t));
+    sel.addEventListener("change", () => { S.params.every = sel.value; });
+    l.appendChild(sel);
+    box.appendChild(l);
+  } else {
+    for (const [k, v] of Object.entries(S.params)) if (typeof v === "number") box.appendChild(numberField(k, k.replace(/_/g, " "), v));
+    if (!box.firstChild) box.appendChild(el("span", { class: "muted" }, "This strategy has no numbers to set."));
+  }
+}
+
+// ------------------------------------------------------------------ run and save
+function spec() {
+  return { strategy: S.strategy, params: S.params, required: S.required, counted: S.counted,
+    pair: document.getElementById("pair").value.trim(), exchange: document.getElementById("exchange").value,
+    timeframe: document.getElementById("timeframe").value, days: Number(document.getElementById("days").value || 365),
+    equity: Number(document.getElementById("equity").value || 10000), fee_pct: Number(document.getElementById("fee").value) };
+}
+async function run() {
+  const b = document.getElementById("run");
+  b.disabled = true; b.textContent = "⏳ Backtesting…"; say("");
+  try {
+    const r = await control("builder_backtest", { spec: spec() });
+    if (!r.ok) { say(r.message || "the backtest failed"); return; }
+    S.last = r.result; renderResults(r.result);
+  } catch (e) { say("could not reach the dashboard: " + e.message); }
+  finally { b.disabled = false; b.textContent = "▶ Backtest"; }
+}
+async function saveBot() {
+  const name = document.getElementById("botname").value.trim();
+  if (!name) { say("give the bot a name first"); return; }
+  const r = await control("builder_save", { spec: spec(), name });
+  say(r.ok ? `Saved ${r.path} in paper mode. ${r.fleet ? "It is in your fleet: press Start on the dashboard." : "Start it with: trendbot.pyz bot --settings " + r.path}` : r.message, r.ok);
+}
+
+// ------------------------------------------------------------------ results
+function tile(label, value, cls) { const t = el("div", { class: "tile" }); t.append(el("div", { class: "label" }, label), el("div", { class: "value " + (cls || "") }, value)); return t; }
+function curve(points) {
+  const W = 800, H = 180, P = 4;
+  const s = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Equity over the backtest" });
+  if (points.length < 2) return s;
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const X = x => P + (x - x0) / ((x1 - x0) || 1) * (W - 2 * P), Y = y => H - P - (y - y0) / ((y1 - y0) || 1) * (H - 2 * P);
+  const d = points.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(" ");
+  const up = ys[ys.length - 1] >= ys[0];
+  s.appendChild(sv("path", { d: d + ` L${X(x1)} ${H - P} L${X(x0)} ${H - P} Z`, fill: up ? "rgba(46,230,166,0.10)" : "rgba(255,92,108,0.10)" }));
+  s.appendChild(sv("path", { d, fill: "none", stroke: up ? "#2ee6a6" : "#ff5c6c", "stroke-width": 2 }));
+  return s;
+}
+function bench(stats, fee) {
+  // the benchmark table: annual 5-200%, commission < 0.1%, drawdown sane, enough trades
+  const rows = [];
+  const cagr = stats.cagr_pct;
+  if (cagr !== undefined && cagr !== null) rows.push([cagr > 5 && cagr < 200, `Yearly return ${num(cagr)}% (target above 5%, below 200% — higher is usually over-fitting)`]);
+  if (stats.cagr_pct !== undefined) rows.push([cagr / 12 >= 1, `About ${num((Math.pow(1 + cagr / 100, 1 / 12) - 1) * 100)}% a month (low-volatility bots aim for ~1%, high-volatility 10–15%)`]);
+  rows.push([fee < 0.1, `Fee ${num(fee, 3)}% per trade (target below 0.1%; maker orders are cheaper)`]);
+  if (stats.max_dd_pct !== undefined) rows.push([stats.max_dd_pct < 25, `Worst drop ${num(stats.max_dd_pct)}% (keep it under 25%)`]);
+  if (stats.trades !== undefined) rows.push([stats.trades >= 30, `${stats.trades} trades (30+ to trust the numbers)`]);
+  const box = el("div", { class: "bench" });
+  for (const [ok, text] of rows) { const d = el("div"); d.append(el("span", { class: "mark " + (ok ? "win" : "warn") }, ok ? "✓" : "!"), el("span", null, text)); box.appendChild(d); }
+  return box;
+}
+function table(rows, cols) {
+  const w = el("div", { class: "scroll" }), t = el("table"), h = el("tr");
+  for (const c of cols) h.appendChild(el("th", null, c[1]));
+  t.appendChild(el("thead")).appendChild(h);
+  const b = t.appendChild(el("tbody"));
+  for (const r of rows) { const tr = el("tr"); for (const c of cols) tr.appendChild(el("td", { class: c[2] ? c[2](r) : null }, c[3] ? c[3](r[c[0]], r) : r[c[0]] ?? "–")); b.appendChild(tr); }
+  w.appendChild(t);
+  return w;
+}
+const day = ms => ms ? new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "–";
+function renderResults(res) {
+  const box = clear(document.getElementById("results"));
+  document.getElementById("res-sub").textContent = `${res.spec.pair} · ${res.spec.timeframe} · ${res.candles} candles from ${res.source} · ${day(res.from)} → ${day(res.to)}`;
+  if (res.stats) {
+    const st = res.stats, tiles = el("div", { class: "tiles" });
+    tiles.append(tile("Return", num(st.return_pct) + "%", st.return_pct >= 0 ? "win" : "loss"), tile("Per year", num(st.cagr_pct) + "%"),
+      tile("Trades", st.trades), tile("Win rate", st.win_rate === null ? "–" : num(st.win_rate * 100, 1) + "%"),
+      tile("Average R", num(st.avg_r)), tile("Profit factor", num(st.profit_factor)), tile("Worst drop", num(st.max_dd_pct) + "%", "loss"), tile("Sharpe", num(st.sharpe)));
+    box.appendChild(tiles);
+    box.appendChild(el("h3", null, "Money over time"));
+    box.appendChild(curve(res.equity || []));
+    box.appendChild(el("h3", null, "Against the benchmarks"));
+    box.appendChild(bench(st, res.spec.fee_pct));
+    box.appendChild(el("h3", null, "Trades"));
+    if (!(res.trades || []).length) box.appendChild(el("div", { class: "empty" }, "No trades: the rule never lined up. Try fewer must-pass signals or a lower count."));
+    else box.appendChild(table(res.trades.slice().reverse(), [["entry_ts", "Opened", null, day], ["exit_ts", "Closed", null, day], ["entry", "Entry", null, v => num(v, 4)],
+      ["stop", "Stop", null, v => num(v, 4)], ["exit", "Exit", null, v => num(v, 4)], ["pnl", "PnL", r => r.pnl >= 0 ? "win" : "loss", v => num(v)],
+      ["r", "R", r => (r.r || 0) >= 0 ? "win" : "loss", v => num(v)], ["reason", "Why it closed"]]));
+    return;
+  }
+  const r = res.result || {}, tiles = el("div", { class: "tiles" });
+  for (const [k, v] of Object.entries(r)) if (typeof v === "number") tiles.appendChild(tile(k.replace(/_/g, " "), num(v, Math.abs(v) >= 100 ? 0 : 2)));
+  box.appendChild(tiles);
+  for (const [k, v] of Object.entries(r)) if (typeof v === "string") box.appendChild(el("p", { class: /warn|left|out/i.test(k) ? "warn" : "muted" }, v));
+  for (const [k, v] of Object.entries(r)) if (Array.isArray(v) && v.length && typeof v[0] === "object") {
+    box.appendChild(el("h3", null, k.replace(/_/g, " ")));
+    const cols = Object.keys(v[0]).slice(0, 8).map(c => [c, c.replace(/_/g, " "), null, (x, row) => /ts|time/.test(c) && typeof x === "number" ? day(x) : typeof x === "number" ? num(x, 4) : x ?? "–"]);
+    box.appendChild(table(v.slice(-200).reverse(), cols));
+  }
+}
+
+// ------------------------------------------------------------------ start
+async function boot() {
+  const r = await fetch("api/builder/catalog", { cache: "no-store" });
+  S.cat = await r.json();
+  const ps = document.getElementById("pal-strategies"), pg = document.getElementById("pal-signals");
+  for (const s of S.cat.strategies) ps.appendChild(strategyBlock(s));
+  for (const g of S.cat.signals) pg.appendChild(signalBlock(g));
+  document.getElementById("pal-signals-title").textContent = `Signals (${S.cat.signals.length}, for Confluence)`;
+  const ex = document.getElementById("exchange");
+  for (const e of S.cat.exchanges) ex.appendChild(el("option", { value: e }, e === "demo" ? "demo market (offline)" : e));
+  const tf = document.getElementById("timeframe");
+  for (const t of S.cat.timeframes) tf.appendChild(el("option", { value: t }, t));
+  wireDrag(document.body);
+  for (const z of document.querySelectorAll(".zone")) wireZone(z);
+  document.getElementById("run").addEventListener("click", run);
+  document.getElementById("save").addEventListener("click", saveBot);
+  document.getElementById("reset-sig").addEventListener("click", () => { S.required = [...S.cat.default_required]; S.counted = S.cat.signals.map(s => s.id).filter(id => !S.required.includes(id)); renderSignals(); });
+  setStrategy("confluence");
+  document.getElementById("reset-sig").click();
+  if (!CONTROL_TOKEN) { for (const id of ["run", "save"]) document.getElementById(id).disabled = true; say("The dashboard was started read-only: Backtest and Save are off."); }
+}
+boot().catch(e => say("could not load the blocks: " + e.message));
+</script>
+</body>
+</html>

@@ -11,6 +11,9 @@ Commands::
     lab        the strategy lab's research, now        (lab)
     fetch      download candles                        (fetch_data)
     voice      set up offline voice commands (Brave)   (voice)
+    analyze    the confluence trade card for a pair    (builder)
+    arbitrage  price gaps across / inside exchanges    (arbitrage)
+    openalice  check the OpenAlice link, send a test   (openalice)
 """
 
 from __future__ import annotations
