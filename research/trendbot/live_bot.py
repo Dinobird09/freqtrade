@@ -585,6 +585,12 @@ class TrendBot:
             self._jobs[job] = spawn_job(job, self.settings_path, self.dir)
             last[job] = int(time.time() * 1000)
             log.info("scheduled job %s started (pid %d)", job, self._jobs[job].pid)
+        if self.s.brain.get("agents", "inform") != "off":  # TradingAgents' daily run (opt-in)
+            from .agents_link import maybe_auto
+
+            msg = maybe_auto(self.s.pairs)
+            if msg:
+                log.info(msg)
 
     # ------------------------------------------------------------------ exits
     # ------------------------------------------------------------------ copy trading

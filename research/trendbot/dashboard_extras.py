@@ -154,6 +154,7 @@ def mcp_tools(runtime: Any) -> list[Any]:
             {"bot": {"type": "string"}},
         )
     ]
+    extra.append(agents_tool(runtime))
     return default_tools(runtime, extra)
 
 
@@ -170,3 +171,85 @@ def mcp_authorized(header: str) -> bool:
     want = _TOKEN[0]
     got = header[7:].strip() if header.lower().startswith("bearer ") else ""
     return bool(got) and hmac.compare_digest(got, want)
+
+
+# ------------------------------------------------------------------ TradingAgents
+AGENT_FIELDS = (
+    "python", "provider", "deep_model", "quick_model", "backend_url", "debate_rounds",
+    "auto_daily", "auto_hour_utc",
+)  # fmt: skip
+
+
+def agents_view(runtime: Any) -> dict[str, Any]:
+    from . import agents_link as al
+
+    st = al.status()
+    modes = {}
+    for n in runtime.names:
+        s = runtime._bot_settings(n) if hasattr(runtime, "_bot_settings") else None
+        modes[n] = (getattr(s, "brain", None) or {}).get("agents", "inform") if s else "inform"
+    st["bot_modes"] = modes
+    for r in st["results"]:
+        r.pop("decision", None)  # the full text is in the report page
+        r["has_report"] = bool(r.get("report_html"))
+    return st
+
+
+def agents_action(runtime: Any, req: Mapping[str, Any]) -> Answer:
+    from . import agents_link as al
+
+    a = str(req.get("action"))
+    try:
+        if a == "agents_save":
+            changes = {k: req[k] for k in AGENT_FIELDS if k in req}
+            if "debate_rounds" in changes:
+                changes["debate_rounds"] = int(changes["debate_rounds"])
+            if "auto_hour_utc" in changes:
+                changes["auto_hour_utc"] = max(0, min(23, int(changes["auto_hour_utc"])))
+            if "auto_daily" in changes:
+                changes["auto_daily"] = bool(changes["auto_daily"])
+            al.configure(None, **changes)
+            return 200, {"ok": True, "message": "TradingAgents settings saved"}
+        if a == "agents_key":
+            msg = al.set_api_key(str(req.get("provider") or al.load()["provider"]), req.get("key"))
+            return 200, {"ok": True, "message": msg}
+        if a == "agents_run":
+            coins = [c for c in str(req.get("coins") or "").replace(",", " ").split() if c]
+            return 200, {"ok": True, "message": al.start(coins)}
+    except (al.AgentsError, ValueError, OSError) as exc:
+        return 400, {"ok": False, "message": str(exc)}
+    return 400, {"ok": False, "message": f"unknown action {a!r}"}
+
+
+def agents_report(rid: str) -> bytes | None:
+    """The saved HTML report of one run (only files inside the TradingAgents folder)."""
+    from . import agents_link as al
+
+    root = al.data_dir().resolve()
+    for r in al.results():
+        if r.get("id") == rid and r.get("report_html"):
+            p = Path(r["report_html"]).resolve()
+            if root in p.parents and p.is_file():
+                return p.read_bytes()
+    return None
+
+
+def agents_tool(runtime: Any) -> Any:
+    from .mcp_server import Tool
+
+    def verdicts(a: Mapping[str, Any]) -> dict[str, Any]:
+        from . import agents_link as al
+
+        coin = al.coin_of(str(a.get("coin") or "")) if a.get("coin") else None
+        rows = [r for r in al.results(None, 100) if not coin or r.get("coin") == coin][:10]
+        keep = ("coin", "date", "rating", "bias", "summary", "trader_plan", "error")
+        return {"verdicts": [{k: r.get(k) for k in keep if r.get(k)} for r in rows]}
+
+    return Tool(
+        "agents_verdicts",
+        "TradingAgents' latest verdicts (Buy / Overweight / Hold / Underweight / Sell, with the "
+        "portfolio manager's summary) on a coin or all coins. Read-only: runs are started by "
+        "the human, since each costs AI calls.",
+        verdicts,
+        {"coin": {"type": "string"}},
+    )

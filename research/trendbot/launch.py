@@ -24,6 +24,7 @@ COMMANDS = {
     "arbitrage": "arbitrage",
     "openalice": "openalice",
     "builder": "analyze",
+    "agents_link": "agents",
 }
 
 

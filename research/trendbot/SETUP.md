@@ -582,6 +582,67 @@ webhook) and paste its https address into the bot's settings:
 Add `"events": ["bot_error", "network_down", "kill_switch"]` to send only those. A failing
 webhook never stops the bot.
 
+## 4m. TradingAgents: an AI research team for Chantisimo
+
+[TradingAgents](https://github.com/Dinobird09/tradingagents) (Apache-2.0) runs a team of AI
+agents on one coin:
+
+1. Market, sentiment and news analysts work in parallel.
+2. A bull and a bear researcher debate their reports.
+3. A trader proposes a trade.
+4. The risk team and portfolio manager give the final rating: **Buy, Overweight, Hold,
+   Underweight or Sell**, with their reasons.
+
+Chantisimo uses that verdict. A run takes a few minutes and makes a few dozen calls to an
+AI provider, which you pay for. With **ollama** you can run free models on your own
+computer instead.
+
+**Install it once, in its own folder** (it needs heavy libraries the bot does not):
+
+```bat
+cd C:\
+git clone https://github.com/Dinobird09/tradingagents TradingAgents
+cd TradingAgents
+py -m venv .venv
+.venv\Scripts\python -m pip install .
+```
+
+No `git`? On the GitHub page press **Code → Download ZIP**, unzip it to `C:\TradingAgents`,
+and run the last three lines there. If `git` or Python isn't in Iru Self Service, raise a ticket
+with Freddy in Slack.
+
+**Connect it** on the dashboard's **TradingAgents** card → **Set up**:
+
+1. **TradingAgents' python**: `C:\TradingAgents\.venv\Scripts\python.exe`.
+2. **AI provider** and, if you like, the models (empty = TradingAgents' defaults).
+3. **API key**: paste your provider's key and press **Save key**. It is written to the bot's
+   `.env` on your computer and never shown again. Ollama needs no key; enter its server URL.
+4. **Save**. Then type a coin (e.g. `BTC ETH`) and press **Ask the agents**.
+
+Verdicts appear in the card after a few minutes, each with **full report ↗**. In the terminal,
+`agents BTC` starts a run and `agents` lists the verdicts. `analyze BTC` adds the latest
+verdict under the trade card. Tick **every day at … UTC** to run the bots' coins
+automatically once a day.
+
+**How Chantisimo uses it** (per bot, in its settings file):
+
+```json
+"brain": {"agents": "inform"}
+```
+
+- `"inform"` (the default):
+  - every entry records what the agents said;
+  - every closed trade's reflection says whether they were right;
+  - the brain card shows their hit rate.
+- `"veto"`: as inform, and the bot also skips a long while the latest verdict on that coin
+  (at most 36 hours old; change it with `"agents_max_age_hours"`) is Underweight or Sell. This
+  works for trend bots and for lab bots (confluence, mean reversion).
+- `"off"`: ignore the verdicts.
+
+Only verdicts that existed before a decision are used. A run that fails, or gives no readable
+rating, never counts as a Hold. OpenAlice's agent can read the verdicts through the
+`agents_verdicts` tool, but it can't start runs: you start them, because each costs AI calls.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,
@@ -1052,6 +1113,8 @@ python trendbot.pyz lab --settings bot.json             # the strategy research,
 python trendbot.pyz analyze BTC                         # the confluence trade card, or NO TRADE
 python trendbot.pyz arbitrage                           # price gaps after fees
 python trendbot.pyz openalice --test                    # check the OpenAlice link
+python trendbot.pyz agents run BTC/USDT                 # TradingAgents' verdict on BTC
+python trendbot.pyz agents status                       # its settings and latest verdicts
 ```
 
 The dashboard's Start button and the background jobs re-launch the same file. Rebuild it

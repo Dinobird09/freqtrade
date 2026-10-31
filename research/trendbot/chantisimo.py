@@ -90,6 +90,14 @@ class BrainSettings:
     graduation: bool = True
     mistake_z: float = 1.0  # how unusual (in winners' std units) a condition must be
     thoughts_keep: int = 2000  # lines kept in chantisimo_thoughts.jsonl
+    # TradingAgents (agents_link.py): "off", "inform" (record its verdict, keep score) or
+    # "veto" (also skip a long while its latest verdict on the coin is Underweight / Sell)
+    agents: str = "inform"
+    agents_max_age_hours: float = 36.0
+
+    def __post_init__(self) -> None:
+        if self.agents not in ("off", "inform", "veto"):
+            raise ValueError('brain.agents must be "off", "inform" or "veto"')
 
 
 @dataclass
@@ -426,6 +434,9 @@ class Chantisimo:
                 else "against what it recalled"
             )
             lesson += f". Recall said avg {pred['avg_r']:+.2f}R over {pred['n']} trades: {surprise}"
+        agents = _agents_verdict(pred.get("agents"), r)
+        if agents:
+            lesson += f". {agents['text']}"
         rec = {
             "kind": "reflection",
             "trade_id": t.trade_id,
@@ -437,9 +448,20 @@ class Chantisimo:
             "mistakes": mistakes,
             "predicted": {k: pred.get(k) for k in ("n", "wins", "avg_r")} if pred else None,
             "lesson": lesson,
+            "agents": agents,
         }
         self._append(rec)
         return rec
+
+    def agents_score(self) -> dict[str, Any]:
+        """How often TradingAgents' verdict at entry matched the trade (calls only)."""
+        from .agents_link import scorecard
+
+        refl = read_thoughts(self.dir, n=self.s.thoughts_keep, kind="reflection")
+        return {
+            "mode": self.s.agents,
+            **scorecard([r for r in refl if (r.get("agents") or {}).get("right") is not None]),
+        }
 
     # -------------------------------------------------------------- files
     def _append(self, rec: dict[str, Any]) -> None:
@@ -486,6 +508,7 @@ class Chantisimo:
             "active_rules": [
                 {"id": r.id, "text": r.text, "n": r.n, "avg_r": r.avg_r} for r in active
             ],
+            "agents": self.agents_score(),
         }
         self.dir.mkdir(parents=True, exist_ok=True)
         _atomic(self.dir / "chantisimo.json", json.dumps(state, indent=1, default=str))
@@ -494,12 +517,41 @@ class Chantisimo:
         return state
 
 
+def _agents_verdict(v: Mapping[str, Any] | None, r: float) -> dict[str, Any] | None:
+    """Was TradingAgents' call at entry right? (a long trade: bullish + win, bearish + loss)"""
+    if not v or not v.get("rating"):
+        return None
+    b = v.get("bias")
+    right = None if b not in ("bullish", "bearish") else (b == "bullish") == (r > 0)
+    said = f"TradingAgents had rated it {v['rating']} ({v.get('date')})"
+    text = said + (": right" if right else ": wrong" if right is False else ": no call")
+    return {"rating": v["rating"], "date": v.get("date"), "bias": b, "right": right, "text": text}
+
+
 def _rule_covers(rule: Any, mistake: str) -> bool:
     feature, op = getattr(rule, "feature", None), getattr(rule, "op", None)
     for (key, sign), text in MISTAKE_TEXT.items():
         if text == mistake and key == feature:
             return (sign > 0) == (op == "above")
     return False
+
+
+AGENTS_RULE = "TA_agents"
+AGENT_KEYS = ("id", "coin", "date", "rating", "bias", "summary")
+
+
+def agents_gate(
+    pair: str, now_ms: int, s: BrainSettings
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """TradingAgents' latest verdict on the coin, known before ``now_ms`` (never raises)."""
+    if s.agents == "off":
+        return True, "", None
+    try:
+        from .agents_link import gate
+
+        return gate(pair, now_ms, s.agents, s.agents_max_age_hours)
+    except Exception:  # a broken results file must never stop the brain
+        return True, "", None
 
 
 class BrainFilter:
@@ -526,6 +578,11 @@ class BrainFilter:
             bad = blocked_pairs(self.brain.dir, now_ms=now).get(pair)
             if bad:
                 ok, why, guard_rule = False, f"data check failed: {bad}", DATA_RULE
+        agents_ok, agents_why, verdict = agents_gate(pair, now, self.brain.s)
+        if verdict is not None:
+            mem["agents"] = {k: verdict.get(k) for k in AGENT_KEYS}
+        if ok and not agents_ok:
+            ok, why, guard_rule = False, agents_why, AGENTS_RULE
         prob: float | None = None
         if ok and self.inner is not None:
             ok, prob, why = self.inner(pair, row, check)
@@ -541,6 +598,7 @@ class BrainFilter:
                 "reason": why,
                 "recall": {k: mem.get(k) for k in ("n", "wins", "avg_r", "by_source")},
                 "recall_text": mem["text"],
+                "agents": agents_why or None,
             }
         )
         return ok, prob, why

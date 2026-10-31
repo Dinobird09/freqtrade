@@ -230,7 +230,7 @@ class LabBot:
             log.info("SIGNAL %s %s: %s", self.key, ms_to_iso(s.ts), s.reason)
             if risk_scale is None or self.state.get("open"):
                 continue
-            why = self.day_blocked(now)
+            why = self.day_blocked(now) or self.agents_blocked(now)
             if why:
                 log.info("SKIP %s: %s", self.key, why)
                 continue
@@ -273,6 +273,17 @@ class LabBot:
                 continue
             keep.append(o)
         self.state["pending"] = keep
+
+    def agents_blocked(self, now: int) -> str | None:
+        """Chantisimo's TradingAgents veto ("brain": {"agents": "veto"}), as in the trend bot."""
+        from .chantisimo import BrainSettings, agents_gate
+
+        try:
+            brain = BrainSettings(**self.s.brain)
+        except (TypeError, ValueError):
+            return None
+        ok, why, _ = agents_gate(self.pair, now, brain)
+        return None if ok else why
 
     def day_blocked(self, now: int) -> str | None:
         """The strategy's day rules: at most ``max_trades_per_day`` entries per UTC day, and

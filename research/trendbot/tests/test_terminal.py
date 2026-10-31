@@ -223,3 +223,34 @@ def test_analyze_prints_the_trade_card(term, monkeypatch):
     assert "Could not analyze NOPE/USDT: no candles" in t.handle("analyze nope")["text"]
     assert [s[1] for s in seen] == ["binance"] * 5
     assert "analyze BTC" in t.handle("help")["text"]
+
+
+def test_agents_commands(term, monkeypatch):
+    from research.trendbot import agents_link as al
+
+    t, _, _ = term
+    started = []
+
+    def fake_start(coins, base=None):
+        started.append(coins)
+        if coins == ["NOPE"]:
+            raise al.AgentsError("not set up")
+        return f"TradingAgents started on {coins[0]}"
+
+    monkeypatch.setattr(al, "start", fake_start)
+    monkeypatch.setattr(
+        al,
+        "status",
+        lambda base=None: {
+            "running": [{"coin": "ETH"}],
+            "results": [
+                {"date": "2026-10-31", "coin": "BTC", "rating": "Sell", "summary": "fading"}
+            ],
+        },
+    )
+    assert "started on BTC" in t.handle("agents BTC")["text"]
+    assert "started on SOL" in t.handle("ask the agents about solana")["text"]
+    assert "TradingAgents: not set up" in t.handle("agents nope")["text"]
+    out = t.handle("agents")
+    assert "running now: ETH" in out["text"] and out["table"]["rows"][0][2] == "Sell"
+    assert started == [["BTC"], ["SOL"], ["NOPE"]]

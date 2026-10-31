@@ -484,6 +484,32 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
       <div class="scroll" id="oa-proposals"></div>
     </div>
 
+    <div class="card span-12" id="agents-card">
+      <div class="card-head"><h2>TradingAgents: the AI research team</h2><span class="muted" id="ag-sub">analysts, a bull / bear debate, a trader and a risk team rate a coin; Chantisimo uses the verdict</span>
+        <span class="spacer"></span>
+        <input id="ag-coins" size="12" placeholder="BTC ETH" aria-label="Coins to ask about">
+        <button type="button" class="small" id="ag-run" title="Each run takes a few minutes and costs a few AI calls">Ask the agents</button>
+        <button type="button" class="small" id="ag-refresh">Refresh</button></div>
+      <div id="ag-status" class="muted" style="font-size:12.5px"></div>
+      <details id="ag-setup" style="margin-top:6px"><summary class="secondary" style="cursor:pointer">Set up</summary>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px">
+          <label>TradingAgents' python <input id="ag-python" size="44" placeholder="C:\TradingAgents\.venv\Scripts\python.exe" autocomplete="off"></label>
+          <label>AI provider <select id="ag-provider"></select></label>
+          <label>deep model <input id="ag-deep" size="16" placeholder="default" autocomplete="off"></label>
+          <label>quick model <input id="ag-quick" size="16" placeholder="default" autocomplete="off"></label>
+          <label>server URL <input id="ag-url" size="24" placeholder="only for ollama / local" autocomplete="off"></label>
+          <label>debate rounds <input id="ag-rounds" type="number" min="1" max="5" style="width:4em"></label>
+          <label><input type="checkbox" id="ag-auto"> every day at</label><label><input id="ag-hour" type="number" min="0" max="23" style="width:4em"> UTC for the bots' coins</label>
+          <button type="button" class="small" id="ag-save">Save</button>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px">
+          <label>API key for the provider <input id="ag-key" type="password" size="40" autocomplete="off" placeholder="kept in .env on this computer"></label>
+          <button type="button" class="small" id="ag-key-save">Save key</button>
+        </div>
+      </details>
+      <div class="scroll" id="ag-results" style="margin-top:6px"></div>
+    </div>
+
     <div class="card span-12" id="arb-card">
       <div class="card-head"><h2>Arbitrage monitor</h2><span class="muted" id="arb-sub">price gaps after taker fees, from public prices (no keys); watch-only</span>
         <span class="spacer"></span>
@@ -1419,6 +1445,7 @@ function renderBrain(s) {
     const src = Object.entries(m.by_source || {}).map(([k, v]) => `${v} ${k}`).join(", ") || "none";
     mem.append(el("span", {}, `Remembers ${m.trades} closed trades (${src}) · ${m.wins} won · avg ${signed(m.avg_r, 2, "R")}` +
       (b.teachers && b.teachers.length ? ` · learns from paper bots: ${m.teachers.join(", ") || b.teachers.join(", ")}` : " · no paper teachers configured (brain.learn_from)")));
+    if (b.agents && b.agents.mode !== "off") mem.append(el("div", { class: "secondary" }, `TradingAgents (${b.agents.mode}): ${b.agents.text}` + (b.agents.hit_rate != null ? ` (${Math.round(b.agents.hit_rate * 100)}%)` : "")));
   }
   const grad = clear(document.getElementById("brain-grad"));
   if ((b.graduation || []).some((g) => g.why !== "no graduation needed")) {
@@ -2399,6 +2426,58 @@ function initArbitrage() {
   let timer = null;
   document.getElementById("arb-auto").onchange = (e) => { clearInterval(timer); timer = e.target.checked ? setInterval(() => scanArbitrage(false), 30000) : null; if (e.target.checked) scanArbitrage(false); };
 }
+// ------------------------------------------------------------------ TradingAgents
+const RATING_KIND = { Buy: "good", Overweight: "good", Hold: "neutral", Underweight: "warning", Sell: "serious" };
+async function loadAgents() {
+  let v;
+  try { v = await getJSON("api/agents"); } catch (e) { document.getElementById("ag-status").textContent = "the dashboard did not answer"; return; }
+  const s = v.settings || {}, out = clear(document.getElementById("ag-status"));
+  const prov = document.getElementById("ag-provider");
+  if (!prov.options.length) for (const p of v.providers || []) prov.append(el("option", { value: p }, p));
+  if (document.activeElement === null || !document.getElementById("ag-setup").contains(document.activeElement)) {
+    document.getElementById("ag-python").value = s.python || ""; prov.value = s.provider || "openai";
+    document.getElementById("ag-deep").value = s.deep_model || ""; document.getElementById("ag-quick").value = s.quick_model || "";
+    document.getElementById("ag-url").value = s.backend_url || ""; document.getElementById("ag-rounds").value = s.debate_rounds || 1;
+    document.getElementById("ag-auto").checked = !!s.auto_daily; document.getElementById("ag-hour").value = s.auto_hour_utc ?? 1;
+  }
+  const ready = v.python_found && v.key_set;
+  out.append(status(ready ? "good" : "warning", ready ? "ready" : "set up needed"),
+    document.createTextNode(` python ${v.python_found ? "found" : s.python ? "not found at " + s.python : "not set"} · ${s.provider} key ${v.key_env ? (v.key_set ? "saved" : "missing (" + v.key_env + ")") : "not needed"}`));
+  const modes = Object.entries(v.bot_modes || {}).map(([b, m]) => `${b}: ${m}`).join(", ");
+  out.append(el("div", { class: "secondary" }, `Chantisimo's use per bot (brain.agents): ${modes}. "veto" skips longs the agents rate Underweight or Sell.`));
+  if ((v.running || []).length) out.append(el("div", {}, "running now: " + v.running.map((j) => j.coin).join(", ") + " (a few minutes)"));
+  if (!ready) document.getElementById("ag-setup").open = true;
+  const host = clear(document.getElementById("ag-results")), rows = v.results || [];
+  if (!rows.length) { host.append(el("div", { class: "empty" }, "No verdicts yet. Type a coin and press Ask the agents.")); return; }
+  host.append(tableView([
+    { label: "date", get: (r) => r.date },
+    { label: "coin", get: (r) => el("strong", {}, r.coin) },
+    { label: "verdict", get: (r) => r.ok ? status(RATING_KIND[r.rating] || "neutral", r.rating) : status("serious", "failed") },
+    { label: "what the portfolio manager said", get: (r) => el("span", { class: "secondary" }, r.summary || r.error || "–") },
+    { label: "", get: (r) => r.has_report ? el("a", { href: "agents/report?id=" + encodeURIComponent(r.id), target: "_blank", rel: "noopener" }, "full report ↗") : "" }], rows));
+}
+function initAgents() {
+  document.getElementById("ag-refresh").onclick = loadAgents;
+  document.getElementById("ag-run").onclick = async () => {
+    const coins = document.getElementById("ag-coins").value.trim();
+    if (!coins) { toast("Type a coin first, e.g. BTC"); return; }
+    await control({ action: "agents_run", coins }); setTimeout(loadAgents, 1500);
+  };
+  document.getElementById("ag-save").onclick = async () => {
+    await control({ action: "agents_save", python: document.getElementById("ag-python").value.trim(), provider: document.getElementById("ag-provider").value,
+      deep_model: document.getElementById("ag-deep").value.trim(), quick_model: document.getElementById("ag-quick").value.trim(),
+      backend_url: document.getElementById("ag-url").value.trim(), debate_rounds: Number(document.getElementById("ag-rounds").value || 1),
+      auto_daily: document.getElementById("ag-auto").checked, auto_hour_utc: Number(document.getElementById("ag-hour").value || 1) });
+    loadAgents();
+  };
+  document.getElementById("ag-key-save").onclick = async () => {
+    const k = document.getElementById("ag-key");
+    await control({ action: "agents_key", provider: document.getElementById("ag-provider").value, key: k.value.trim() });
+    k.value = ""; loadAgents();
+  };
+  for (const id of ["ag-run", "ag-save", "ag-key-save"]) document.getElementById(id).disabled = !controlsOn();
+  loadAgents(); setInterval(loadAgents, 30000);
+}
 const THEMES = ["jarvis", "auto", "light", "dark"];
 function applyTheme(name) {
   state.theme = THEMES.includes(name) ? name : "jarvis";
@@ -2415,8 +2494,8 @@ document.getElementById("theme").addEventListener("click", () => {
 let resizeTimer = null;
 window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => renderAll(true), 150); });
 
-if (EMBEDDED) { state.snap = EMBEDDED; renderAll(); for (const id of ["conn-card", "openalice-card", "arb-card"]) document.getElementById(id).style.display = "none"; }
-else { refresh(); setInterval(refresh, Math.max(1, REFRESH_S) * 1000); initOpenAlice(); initArbitrage(); }
+if (EMBEDDED) { state.snap = EMBEDDED; renderAll(); for (const id of ["conn-card", "openalice-card", "arb-card", "agents-card"]) document.getElementById(id).style.display = "none"; }
+else { refresh(); setInterval(refresh, Math.max(1, REFRESH_S) * 1000); initOpenAlice(); initArbitrage(); initAgents(); }
 </script>
 </body>
 </html>

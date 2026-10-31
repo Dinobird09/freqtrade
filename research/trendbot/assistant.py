@@ -80,6 +80,10 @@ HELP_ITEMS = (  # one command per line, then what it does: readable on a phone t
     ("close BTC / close all", "market-sell a position (asks you to confirm)"),
     ("why BTC", "the latest decision on BTC and its reason"),
     ("analyze BTC", "the confluence trade card now (entry, stop, TP1/TP2, R:R) or NO TRADE"),
+    (
+        "agents BTC / agents",
+        "TradingAgents' AI research team on BTC (a few minutes) / latest verdicts",
+    ),
     ("brain", "what Chantisimo has learned: mistakes, graduation"),
     ("traders / follow <name>", "smart money: other traders ranked; follow = copy their buys"),
     ("pause / resume", "new entries off / on (exits always keep running)"),
@@ -326,6 +330,13 @@ class Terminal:
             "options",
         ):
             return "help", {}
+        m = re.match(
+            r"^(?:ask )?(?:the )?(?:trading ?)?agents?(?: (?:on|about|for))?"
+            r"(?: ([a-z0-9/$-]{2,16}))?$",
+            t,
+        )
+        if m:
+            return "agents", {"coin": (m.group(1) or "").lstrip("$")}
         m = re.search(
             r"\b(?:analy[sz]e|trade card)(?: (?:on|for|of))? \$?([a-z0-9]{2,12})"
             r"(?:[/-]([a-z0-9]{2,8}))?\b",
@@ -534,12 +545,46 @@ class Terminal:
             return Reply(f"Could not analyze {pair}: {exc}")
         res = card["result"]
         event = "trades" if res.get("decision") == "trade" else "no_trade"
-        sent = openalice.notify(
-            None, event, openalice.card_markdown({"text": card["text"]}, bot)
-        )
+        sent = openalice.notify(None, event, openalice.card_markdown({"text": card["text"]}, bot))
+        from .agents_link import latest
+
+        v = latest(card["pair"], max_age_hours=72)
+        if v:
+            card["text"] += (
+                f"\nTradingAgents ({v['date']}): {v['rating']}: {v.get('summary', '')[:300]}"
+            )
         note = f"\n\n({card['pair']}, 1H candles from {card['source']}"
         note += f"; OpenAlice: {sent})" if sent else ")"
         return Reply(card["text"] + note)
+
+    def tool_agents(self, args: dict[str, Any], bot: str) -> Reply:
+        """TradingAgents: start a run on a coin, or show the latest verdicts."""
+        from . import agents_link as al
+
+        coin = str(args.get("coin") or "").upper().replace("-", "/").split("/")[0]
+        coin = COIN_NAMES.get(coin.lower(), coin)
+        if coin:
+            try:
+                return Reply(al.start([coin]) + ". Type agents to see the verdicts.")
+            except al.AgentsError as exc:
+                return Reply(f"TradingAgents: {exc}")
+        st = al.status()
+        rows = [
+            [
+                v["date"],
+                v["coin"],
+                v.get("rating") or "failed",
+                (v.get("summary") or v.get("error") or "")[:140],
+            ]
+            for v in st["results"][:10]
+        ]
+        busy = ", ".join(j["coin"] for j in st["running"])
+        text = (
+            f"TradingAgents verdicts (running now: {busy})." if busy else "TradingAgents verdicts."
+        )
+        if not rows:
+            text = "No TradingAgents verdicts yet: type agents BTC to ask the team about a coin."
+        return Reply(text, _table(["date", "coin", "rating", "summary"], rows) if rows else None)
 
     def tool_help(self, args: dict[str, Any], bot: str) -> Reply:
         return Reply(HELP)

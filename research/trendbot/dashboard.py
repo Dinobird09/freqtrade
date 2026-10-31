@@ -467,6 +467,7 @@ def _brain_view(d: Path) -> dict[str, Any]:
         "teachers": (raw.get("settings") or {}).get("learn_from", []),
         "thoughts": read_thoughts(d, 40, "thought"),
         "reflections": read_thoughts(d, 25, "reflection"),
+        "agents": raw.get("agents"),
     }
 
 
@@ -1239,6 +1240,7 @@ class FleetRuntime:
             (("wallet_",), self.wallet_action),
             (("builder_",), lambda r: extras.builder_action(self, r)),
             (("openalice_", "proposal_"), lambda r: extras.openalice_action(self, r)),
+            (("agents_",), lambda r: extras.agents_action(self, r)),
         )
         for prefixes, handler in routes:  # the cards that keep their own buttons
             if str(action).startswith(prefixes):
@@ -1458,6 +1460,8 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
 
     terminal = Terminal(runtime)
 
+    from . import dashboard_extras as extras
+
     def _catalog(q: Mapping[str, str]) -> Any:
         from .builder import catalog
 
@@ -1487,6 +1491,7 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
         "/api/builder/catalog": _catalog,
         "/api/arbitrage": lambda q: runtime.arbitrage.view(q),
         "/api/openalice": _openalice,
+        "/api/agents": lambda q: extras.agents_view(runtime),
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -1548,6 +1553,15 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                     self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8", headers)
                 elif path in json_routes:
                     self._json(HTTPStatus.OK, json_routes[path](self._query()))
+                elif path == "/agents/report":  # AI-written HTML: sandboxed, no scripts
+                    page = extras.agents_report(self._query().get("id", ""))
+                    sandbox = {"X-Frame-Options": "DENY",
+                               "Content-Security-Policy": "sandbox; default-src 'none'; "
+                               "style-src 'unsafe-inline'; img-src data:"}  # fmt: skip
+                    if page is None:
+                        self._send(HTTPStatus.NOT_FOUND, b"no such report", "text/plain")
+                    else:
+                        self._send(HTTPStatus.OK, page, "text/html; charset=utf-8", sandbox)
                 elif path == "/mcp":  # streamable HTTP without server push: POST only
                     self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"POST only", "text/plain",
                                {"Allow": "POST"})  # fmt: skip

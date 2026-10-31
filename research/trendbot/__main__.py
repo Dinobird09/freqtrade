@@ -14,6 +14,7 @@ Commands::
     analyze    the confluence trade card for a pair    (builder)
     arbitrage  price gaps across / inside exchanges    (arbitrage)
     openalice  check the OpenAlice link, send a test   (openalice)
+    agents     TradingAgents' AI research team on a coin (agents_link)
 """
 
 from __future__ import annotations

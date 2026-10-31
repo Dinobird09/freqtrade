@@ -197,3 +197,95 @@ def test_arbitrage_endpoint(site, monkeypatch):
     rt.arbitrage.fetch = fetch
     out = json.loads(get(base + "/api/arbitrage?exchanges=binance,okx")[1])
     assert out["spatial"][0]["buy_on"] == "binance" and out["logged"] >= 1
+
+
+def test_tradingagents_card_report_and_mcp(site, monkeypatch):
+    from research.trendbot import agents_link as al
+
+    base, _, tmp = site
+    monkeypatch.setenv("TRENDBOT_ENV_FILE", str(tmp / ".env"))
+    view = json.loads(get(base + "/api/agents")[1])
+    assert view["python_found"] is False and view["bot_modes"] == {"main": "inform"}
+    code, j = control(
+        base,
+        {
+            "action": "agents_save",
+            "provider": "anthropic",
+            "debate_rounds": "2",
+            "auto_daily": 1,
+            "auto_hour_utc": 30,
+        },
+    )
+    assert code == 200, j
+    cfg = al.load()
+    assert (
+        cfg["provider"] == "anthropic" and cfg["debate_rounds"] == 2 and cfg["auto_hour_utc"] == 23
+    )
+    code, j = control(base, {"action": "agents_key", "key": "sk-ant-secret-value"})
+    assert j["ok"] and "ANTHROPIC_API_KEY" in j["message"]
+    body = get(base + "/api/agents")[1]
+    assert "sk-ant-secret-value" not in body and json.loads(body)["key_set"] is True
+    code, j = control(base, {"action": "agents_run", "coins": "BTC"})
+    assert code == 400 and "not set up" in j["message"]
+
+    report_dir = al.data_dir() / "reports" / "BTC-x"
+    report_dir.mkdir(parents=True)
+    page = report_dir / "complete_report.html"
+    page.write_text("<h1>Sell</h1><script>alert(1)</script>")
+    al._append(
+        None,
+        {
+            "id": "BTC-1",
+            "coin": "BTC",
+            "date": "2026-10-31",
+            "ok": True,
+            "rating": "Sell",
+            "bias": "bearish",
+            "finished_ms": 1,
+            "summary": "fading",
+            "report_html": str(page),
+            "decision": "long text",
+        },
+    )
+    al._append(
+        None,
+        {
+            "id": "EVIL-1",
+            "coin": "EVIL",
+            "ok": True,
+            "rating": "Buy",
+            "finished_ms": 1,
+            "report_html": str(tmp / "bots" / "main.json"),
+        },
+    )
+    rows = json.loads(get(base + "/api/agents")[1])["results"]
+    assert rows[1]["has_report"] and "decision" not in rows[1]
+    code, html, headers = get(base + "/agents/report?id=BTC-1")
+    assert "<h1>Sell</h1>" in html and headers["Content-Security-Policy"].startswith("sandbox")
+    assert "script-src" not in headers["Content-Security-Policy"]
+    for rid in ("EVIL-1", "nope"):  # only files inside the TradingAgents folder
+        with pytest.raises(urllib.error.HTTPError) as e:
+            get(base + "/agents/report?id=" + rid)
+        assert e.value.code == 404
+
+    auth = {"Authorization": "Bearer " + MCP_TOKEN}
+    _, j = post(
+        base + "/mcp",
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "agents_verdicts", "arguments": {"coin": "btc"}},
+        },
+        auth,
+    )
+    v = j["result"]["structuredContent"]["verdicts"]
+    assert v == [
+        {
+            "coin": "BTC",
+            "date": "2026-10-31",
+            "rating": "Sell",
+            "bias": "bearish",
+            "summary": "fading",
+        }
+    ]
