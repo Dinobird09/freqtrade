@@ -540,6 +540,48 @@ If the conditions don't line up it prints
 `NO TRADE – Insufficient confluence or misaligned market conditions.` with the reasons. The
 card also goes to your OpenAlice Inbox if that is switched on.
 
+## 4l. Bot health, benchmarks and alerts
+
+The **Bot health** card scores each bot against these benchmarks:
+
+| measure | target |
+| --- | --- |
+| P&L | more than 5% and less than 200% a year (above 200% is usually luck or over-fitting); about 1% a month for low-volatility bots, 10–15% for high-volatility ones |
+| uptime | at least 3 months live; 12+ months is excellent |
+| turnover | 10x a day minimum, 30–40x excellent (this applies to grid / market-making bots; a 4H trend bot trades far less and is marked "expected") |
+| matched orders | 60%+ for a pro bot, 2%+ at the base level |
+| maker share | 100% maker is best (cheaper fees) |
+| commission | under 0.1% per trade |
+
+The card also shows:
+
+- the monthly P&L table and the return per year;
+- the bot's volatility category: low-volatility, balanced or high-volatility;
+- the last 10 alerts.
+
+In a fleet, the Bots table shows each bot's category, and a line under it says whether your
+bots are spread across low, balanced and high volatility.
+
+**Alerts.** Every bot writes `alerts.jsonl` with these events:
+
+- started, stopped, error;
+- network down and network restored;
+- kill switch and capital freeze;
+- trade opened and trade closed;
+- a bot that stopped answering.
+
+Alerts also go to your OpenAlice Inbox when that is switched on.
+
+To get alerts on your phone (Slack, Telegram, email), make a Zapier "Catch Hook" Zap (or an n8n
+webhook) and paste its https address into the bot's settings:
+
+```json
+"alerts": {"webhook_url": "https://hooks.zapier.com/hooks/catch/...", "network_down_minutes": 5}
+```
+
+Add `"events": ["bot_error", "network_down", "kill_switch"]` to send only those. A failing
+webhook never stops the bot.
+
 ## 5. Keeping it running 24/7
 
 The bot trades 4H candles, so it has to be running at each 4H close. On your own machine,
@@ -828,6 +870,55 @@ per stopped-out trade plus the learned rules. It checks them before every entry 
 learned rules and Chantisimo's recall), so a mistake that keeps costing money is not
 repeated.
 
+## 6h. Strategy styles: trend following, mean reversion, grid, DCA
+
+Each bot runs one style, set in its settings file. The strategy builder (4k) writes these
+for you.
+
+- **Trend following, the confluence system** (`"engine": "lab"`,
+  `"lab": {"strategy": "confluence", "params": {...}}`):
+  - it only trades with the 1D 200 EMA trend and makes no trade when price is sideways around
+    it;
+  - the 4H structure must agree (higher highs and higher lows);
+  - Fear & Greed is used when collected: 25 or less is a chance, 26–45 accumulation, 65–84
+    caution, 85 or more avoid longs;
+  - at least 5 of 11 signals must line up: 200 EMA, Ichimoku cloud, RSI 55–70, MACD cross with
+    a growing histogram, OBV, rising volume, VWAP, Fib 0.382–0.618, Parabolic SAR flip,
+    Tenkan/Kijun cross, rising ATR;
+  - entry is on a pullback to VWAP, the EMA or a Fib zone;
+  - the stop is 1.5x ATR, TP1 is 2R (half closes) and TP2 is 3R;
+  - risk is 1% a trade (at most 2%), with at most 3 trades a day and a stop for the day after
+    2 losses in a row.
+
+  Spot bots take long setups only; short setups appear on trade cards marked as such.
+- **Mean reversion** (`"strategy": "mean_reversion"`): buys a statistically stretched dip
+  (below the lower Bollinger band with RSI under 30) only when the market is not trending.
+  It exits at the average, with a stop 1x ATR below the entry.
+- **Grid trading** (`"engine": "grid"`, `"lab": {"grid": {"lower": 55000, "upper": 70000,
+  "levels": 20, "budget": 1000}}`): it buys one unit each time price steps down a line and
+  sells it one line higher. It works best in sideways markets. Add `stop_below` /
+  `take_above` to leave the grid. The backtest warns how long price spent outside the range.
+- **DCA** (`"engine": "dca"`, `"lab": {"dca": {"amount_quote": 50, "every": "7d",
+  "buy_the_dip": 10, "take_profit_pct": 40}}`): it buys a fixed amount on a schedule, buys
+  extra when price is 10% under your average cost, and can sell everything at a profit target.
+  The backtest compares it with buying everything on day one.
+
+**Diversify:** run several bots of different styles and volatility (for example a DCA bot, a
+grid bot and a trend bot) on different coins. The fleet line on the dashboard tells you when
+they are all in the same category.
+
+### What the bot cannot do for you
+
+- **Independent security audits, customer support and guaranteed 99.9% hosting** are services,
+  not code. The bot runs on your own computer, so it is only up while that computer is on and
+  online.
+  - For always-on hosting, check the code into GitHub and message Freddy in Slack. The approved
+    homes are Google Cloud for anything real and Cloudflare for small tools.
+- **The bot never holds your wallet keys.** MetaMask and Phantom sign every trade, and you
+  approve it there.
+- **The arbitrage monitor only watches.** Real arbitrage is a speed race against firms with
+  servers inside the exchanges.
+
 ## 7. Running up to 10 bots (fleet)
 
 `setup` also creates `fleet.json` and a `bots/` folder with three example bots: two paper bots
@@ -940,7 +1031,7 @@ it to **Claude Code**, if you also want Claude to read TradingView while you wor
 
 ## 8a. One file instead of a folder
 
-The bot is 57 small modules (about 31,000 lines) because each one has a single job and its
+The bot is 72 small modules (about 41,000 lines) because each one has a single job and its
 own tests. That keeps it maintainable, and Python loads them for you. You never run more
 than one command, and you don't need to merge them.
 
@@ -958,6 +1049,9 @@ python trendbot.pyz bot run --settings bot.json
 python trendbot.pyz dashboard --settings bot.json      # or --fleet fleet.json
 python trendbot.pyz jobs retrain --settings bot.json    # collect / retrain / traders / verify / lab
 python trendbot.pyz lab --settings bot.json             # the strategy research, now
+python trendbot.pyz analyze BTC                         # the confluence trade card, or NO TRADE
+python trendbot.pyz arbitrage                           # price gaps after fees
+python trendbot.pyz openalice --test                    # check the OpenAlice link
 ```
 
 The dashboard's Start button and the background jobs re-launch the same file. Rebuild it

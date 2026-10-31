@@ -314,3 +314,25 @@ def test_analyze_tool_returns_the_card(server, monkeypatch):
     out = call(server, "analyze", {"pair": "eth/btc", "details": True, "exchange": "coinbase"})
     s = out["structuredContent"]
     assert s["pair"] == "ETH/BTC" and s["source"] == "coinbase" and "signals" in s["result"]
+
+
+def test_bot_alerts_reach_the_openalice_inbox(tmp_path, alice, monkeypatch):
+    from research.trendbot.scorecard import Alerter
+
+    monkeypatch.setenv("TRENDBOT_CONNECTIONS_FILE", str(tmp_path / "connections.json"))
+    a = Alerter({}, tmp_path / "bot1")
+    a.emit("bot_started", "not sent: OpenAlice not set up yet")
+    assert a.flush(3.0) and alice.pushed == []
+
+    oa.configure(None, url=alice.url, workspace="ws9")  # one settings file per install
+    assert (tmp_path / "openalice.json").exists()
+    a = Alerter({}, tmp_path / "bot1")
+    a.emit("network_down", "no exchange reply for 5 minutes")
+    assert a.flush(3.0)
+    assert alice.pushed == [("ws9", "**⚠ network down** · bot1\n\nno exchange reply for 5 minutes")]
+
+    oa.configure(None, send={"alerts": False})
+    a = Alerter({}, tmp_path / "bot1")
+    a.emit("bot_error", "x")
+    assert a.flush(3.0) and len(alice.pushed) == 1
+    assert Alerter({}, tmp_path / "b", openalice=False).openalice is False

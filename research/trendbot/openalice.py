@@ -13,8 +13,8 @@ protocol, on 127.0.0.1 only:
   ``.mcp.json`` block to paste into an OpenAlice workspace folder so its agent can read the
   bot's status, positions, trade memory and trade cards.
 
-Settings live in ``openalice.json`` in the dashboard's first bot folder. Nothing here needs an
-API key: OpenAlice's MCP server only answers this computer.
+Settings live in ``openalice.json`` next to ``connections.json`` (one per install). Nothing
+here needs an API key: OpenAlice's MCP server only answers this computer.
 """
 
 from __future__ import annotations
@@ -48,11 +48,16 @@ def _client(url: str) -> McpClient:
     return McpClient(url, timeout=8.0)
 
 
-def settings_path(state_dir: str | Path) -> Path:
+def settings_path(state_dir: str | Path | None) -> Path:
+    """One file per install, next to connections.json (``state_dir`` overrides, for tests)."""
+    if state_dir is None:
+        from .connections import connections_path
+
+        return connections_path().with_name(SETTINGS_FILE)
     return Path(state_dir) / SETTINGS_FILE
 
 
-def load(state_dir: str | Path) -> dict[str, Any]:
+def load(state_dir: str | Path | None) -> dict[str, Any]:
     p = settings_path(state_dir)
     try:
         raw = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
@@ -63,7 +68,7 @@ def load(state_dir: str | Path) -> dict[str, Any]:
     return out
 
 
-def _save(state_dir: str | Path, data: Mapping[str, Any]) -> None:
+def _save(state_dir: str | Path | None, data: Mapping[str, Any]) -> None:
     from .journal import atomic_write_text
 
     p = settings_path(state_dir)
@@ -88,7 +93,7 @@ def _check_workspace(ws: str) -> str:
 
 
 def configure(
-    state_dir: str | Path,
+    state_dir: str | Path | None,
     url: str | None = None,
     workspace: str | None = None,
     send: Mapping[str, Any] | None = None,
@@ -112,14 +117,14 @@ def inbox_url(cfg: Mapping[str, Any]) -> str | None:
     return f"{_check_url(cfg.get('url') or DEFAULT_MCP)}/{ws}" if ws else None
 
 
-def _remember(state_dir: str | Path, **last: Any) -> None:
+def _remember(state_dir: str | Path | None, **last: Any) -> None:
     with _lock:
         cfg = load(state_dir)
         cfg["last"] = {**(cfg.get("last") or {}), **last}
         _save(state_dir, cfg)
 
 
-def status(state_dir: str | Path, client: ClientFactory = _client) -> dict[str, Any]:
+def status(state_dir: str | Path | None, client: ClientFactory = _client) -> dict[str, Any]:
     """Is OpenAlice running with MCP on? Which tools does it offer? (Sends nothing.)"""
     cfg = load(state_dir)
     out: dict[str, Any] = {
@@ -166,7 +171,9 @@ def status(state_dir: str | Path, client: ClientFactory = _client) -> dict[str, 
     return out
 
 
-def push_inbox(state_dir: str | Path, body: str, client: ClientFactory = _client) -> dict[str, Any]:
+def push_inbox(
+    state_dir: str | Path | None, body: str, client: ClientFactory = _client
+) -> dict[str, Any]:
     """Post one Markdown message to the chosen workspace's Inbox (raises when it can't)."""
     cfg = load(state_dir)
     url = inbox_url(cfg)
@@ -190,7 +197,7 @@ def push_inbox(state_dir: str | Path, body: str, client: ClientFactory = _client
 
 
 def notify(
-    state_dir: str | Path, event: str, body: str, client: ClientFactory = _client
+    state_dir: str | Path | None, event: str, body: str, client: ClientFactory = _client
 ) -> str | None:
     """Send ``body`` when that kind of message is switched on; never raises (the bot goes on).
 
@@ -248,7 +255,7 @@ def openalice_mcp_json(dashboard: str = "http://127.0.0.1:8050") -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="trendbot openalice", description="the OpenAlice link")
-    p.add_argument("--state-dir", default="trendbot_state", help="the (first) bot's folder")
+    p.add_argument("--state-dir", help=argparse.SUPPRESS)  # tests: another settings folder
     p.add_argument("--workspace", help="save the OpenAlice workspace id for the Inbox")
     p.add_argument("--url", help=f"OpenAlice's MCP address (default {DEFAULT_MCP})")
     p.add_argument("--test", action="store_true", help="send a test message to the Inbox")

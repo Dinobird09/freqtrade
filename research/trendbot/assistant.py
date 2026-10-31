@@ -535,7 +535,7 @@ class Terminal:
         res = card["result"]
         event = "trades" if res.get("decision") == "trade" else "no_trade"
         sent = openalice.notify(
-            self._dir(self.rt.names[0]), event, openalice.card_markdown({"text": card["text"]}, bot)
+            None, event, openalice.card_markdown({"text": card["text"]}, bot)
         )
         note = f"\n\n({card['pair']}, 1H candles from {card['source']}"
         note += f"; OpenAlice: {sent})" if sent else ")"

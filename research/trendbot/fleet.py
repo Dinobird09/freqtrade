@@ -220,4 +220,7 @@ def summary_row(name: str, snap: Mapping[str, Any]) -> dict[str, Any]:
         "avg_r": st.get("avg_r"),
         "open_positions": len(snap.get("open_positions") or []),
         "pairs": sorted((snap.get("pairs") or {}).keys()),
+        # Bot health (scorecard.py): low-volatility / balanced / high-volatility, and grades
+        "category": (snap.get("health") or {}).get("category"),
+        "health": (snap.get("health") or {}).get("summary"),
     }

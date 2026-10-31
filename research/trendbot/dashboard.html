@@ -246,6 +246,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
     <a class="navlink" id="market-link" href="market" title="Live charts from the exchanges' public feeds (no keys)">📈 Market terminal</a>
     <a class="navlink" id="memes-link" href="memes" title="New meme coins, the safety checklist, quick swaps with Phantom or MetaMask">🐸 Meme desk</a>
     <a class="navlink" id="memory-link" href="memory" title="Every trade with its story: why, what happened, what was learned">🧠 Memory bank</a>
+    <a class="navlink" id="builder-link" href="builder" title="Drag-and-drop strategy builder: pick signals, backtest, save as a paper bot">🧱 Strategy builder</a>
     <button type="button" id="theme" title="Theme">Theme: jarvis</button>
   </header>
 
@@ -255,6 +256,7 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
       <button type="button" id="btn-pause-all">&#10074;&#10074; Pause all entries</button>
       <button type="button" id="btn-stop-all">&#9632; Stop all</button></div>
     <div class="scroll" id="fleet"></div>
+    <div class="muted" id="fleet-div" style="font-size:12px;margin-top:6px"></div>
   </section>
 
   <dialog id="approval" aria-labelledby="approval-title">
@@ -397,6 +399,16 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
       <div class="scroll" id="open"></div>
     </div>
 
+    <div class="card span-12" id="health-card">
+      <div class="card-head"><h2>Bot health</h2><span class="muted" id="health-sub"></span></div>
+      <div class="muted" style="font-size:12px">This bot against the usual trading-bot benchmarks: P&amp;L, uptime, turnover, matched orders, makers vs takers, fees. Grey means not enough data yet: it never counts as passing.</div>
+      <div id="health"></div>
+      <div class="brain-grid">
+        <div><div class="subhead">Monthly P&amp;L</div><div id="health-months"></div></div>
+        <div><div class="subhead">Last alerts</div><div id="health-alerts"></div></div>
+      </div>
+    </div>
+
     <div class="card span-7">
       <div class="card-head"><h2>R per closed trade</h2><span class="muted" id="r-sub"></span>
         <span class="spacer"></span><button type="button" data-table="r">Table</button></div>
@@ -450,6 +462,40 @@ dialog.modal pre { max-height: 260px; overflow: auto; background: var(--page); p
         <span class="spacer"></span><button type="button" id="btn-scan">Scan now</button></div>
       <div class="muted" style="font-size:12px">Today's movers: up 10%+ since 00:00 UTC, volume 5x its 50-day average, a news / social / unlock catalyst, and under 10 million tokens circulating. Watch-only: add a pair to a bot to trade it (the nine rules still apply).</div>
       <div class="scroll" id="scanner"></div>
+    </div>
+
+    <div class="card span-12" id="openalice-card">
+      <div class="card-head"><h2>OpenAlice</h2><span class="muted" id="oa-sub">the AI trading workspace on this computer, linked over MCP</span>
+        <span class="spacer"></span>
+        <a class="navlink" href="http://127.0.0.1:47331" target="_blank" rel="noopener" title="OpenAlice's own window">Open OpenAlice ↗</a>
+        <button type="button" class="small" id="oa-check">Check</button>
+        <button type="button" class="small" id="oa-test">Send test</button>
+        <button type="button" class="small" id="oa-connect" title="Let OpenAlice's agent ask Chantisimo: status, positions, memory, trade cards">Connect OpenAlice to Chantisimo</button></div>
+      <div id="oa-status" class="muted" style="font-size:12.5px"></div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px">
+        <label>Workspace id <input id="oa-ws" size="22" placeholder="from the workspace's address" autocomplete="off"></label>
+        <label><input type="checkbox" id="oa-trades"> trade cards</label>
+        <label><input type="checkbox" id="oa-notrade"> NO TRADE verdicts</label>
+        <label><input type="checkbox" id="oa-alerts"> alerts</label>
+        <button type="button" class="small" id="oa-save">Save</button>
+      </div>
+      <pre id="oa-connect-out" class="muted" style="display:none;white-space:pre-wrap;font-size:12px;margin:8px 0 0"></pre>
+      <div class="subhead" style="margin-top:8px">Trade suggestions waiting for you</div>
+      <div class="scroll" id="oa-proposals"></div>
+    </div>
+
+    <div class="card span-12" id="arb-card">
+      <div class="card-head"><h2>Arbitrage monitor</h2><span class="muted" id="arb-sub">price gaps after taker fees, from public prices (no keys); watch-only</span>
+        <span class="spacer"></span>
+        <label class="muted"><input type="checkbox" id="arb-auto"> every 30 s</label>
+        <button type="button" class="small" id="arb-scan">Scan gaps</button></div>
+      <div class="muted" id="arb-errors" style="font-size:12px"></div>
+      <div class="subhead">Spatial: buy on one exchange, sell on another</div>
+      <div class="scroll" id="arb-spatial"><div class="empty">Press Scan gaps.</div></div>
+      <div class="subhead" style="margin-top:8px">Triangular: three trades on one exchange</div>
+      <div class="scroll" id="arb-tri"></div>
+      <div class="subhead" style="margin-top:8px">How often a gap paid (from arbitrage.jsonl)</div>
+      <div class="scroll" id="arb-hist"></div>
     </div>
 
     <div class="card span-12" id="verify-card">
@@ -1096,7 +1142,7 @@ function renderAll(force) {
     [renderControls, [s.bot && { ...s.bot, heartbeat_age_s: Math.round((s.bot.heartbeat_age_s || 0) / 5) }, s.control, s.meta.mode, s.meta.configured_mode, s.open_positions.length]],
     [renderRules, [s.learning]], [renderLedger, [s.ledger]], [renderLayers, [s.layers, s.bot && s.bot.jobs_running]],
     [renderMarket, [s.market, s.layers && s.layers.collect_status]], [renderDex, [s.market]],
-    [renderWallet, [s.wallet]],
+    [renderWallet, [s.wallet]], [renderHealth, [s.health]],
     [renderBrain, [s.brain]], [renderLab, [s.lab]], [renderScanner, [s.scanner]], [renderRegime, [s.regime, s.correlations]], [renderTraders, [s.traders]], [renderMcpData, [s.market && s.market.mcp]], [renderVerify, [s.verify]],
   ];
   state.drawn = state.drawn || new Map();
@@ -1207,6 +1253,7 @@ function renderFleet() {
     { label: "bot", get: (r) => el("strong", {}, r.name) },
     { label: "status", get: (r) => r.error ? status("serious", "error") : r.running ? status("good", r.paused ? "running · entries paused" : "running") : status("critical", "stopped") },
     { label: "mode", get: (r) => r.mode || "–" }, { label: "exchange", get: (r) => r.exchange || "–" },
+    { label: "category", get: (r) => el("span", { title: r.health || "" }, r.category || "–") },
     { label: "equity", num: true, get: (r) => money(r.equity) },
     { label: "return", num: true, get: (r) => signed(r.return_pct, 2, "%") },
     { label: "trades", num: true, get: (r) => r.closed_trades ?? "–" },
@@ -1221,6 +1268,8 @@ function renderFleet() {
   const rows = t.querySelectorAll("tbody tr");
   f.bots.forEach((b, i) => { if (b.name === state.bot) rows[i].classList.add("selected"); });
   host.append(t);
+  const dv = f.diversification;
+  document.getElementById("fleet-div").textContent = dv ? "Diversification: " + dv.line + (dv.hint ? ". Hint: " + dv.hint : "") : "";
 }
 function controlButton(label, cls, body, confirmText) {
   const b = el("button", { type: "button", class: cls }, label);
@@ -1628,6 +1677,39 @@ function verifyHasData(v) {  // dashboard.verify_has_data: "pass" with nothing c
   return (v.agents || []).some((a) => a.status !== "skip" &&
     !(a.agent === "ledger" && Object.values(a.pairs || {}).every((r) => String(r.detail || "").includes(" 0 closed"))));
 }
+// ------------------------------------------------------------------ bot health (scorecard.py)
+const HEALTH_KIND = { good: "good", warn: "warning", bad: "critical", nodata: "neutral" };
+const HEALTH_WORD = { good: "good", warn: "watch", bad: "bad", nodata: "not enough data yet" };
+function renderHealth(s) {
+  const h = s.health || {}, host = clear(document.getElementById("health"));
+  const months = clear(document.getElementById("health-months")), alerts = clear(document.getElementById("health-alerts"));
+  document.getElementById("health-sub").textContent = h.error ? "unavailable: " + h.error : (h.summary || "");
+  if (!(h.metrics || []).length) host.append(el("div", { class: "empty" }, "No health data yet: it fills in while the bot runs."));
+  else host.append(wrapScroll(tableView([
+    { label: "metric", get: (m) => el("strong", {}, m.label) },
+    { label: "value", num: true, get: (m) => m.display },
+    { label: "ideal", get: (m) => el("span", { class: "secondary" }, m.ideal) },
+    { label: "status", nowrap: true, get: (m) => status(HEALTH_KIND[m.status] || "neutral", HEALTH_WORD[m.status] || m.status) },
+    { label: "comment", get: (m) => el("span", { class: "secondary" }, m.comment) }], h.metrics)));
+  const years = (h.annual || []).map((a) => `${a.year}${a.partial ? " (part)" : ""} ${signed(a.return_pct, 2, "%")}`).join(" · ");
+  months.append(el("div", { class: "muted", style: "font-size:12px" },
+    "annualised (CAGR) " + (h.cagr_pct == null ? "not enough data yet" : signed(h.cagr_pct, 2, "%")) + (years ? " · per year: " + years : "")));
+  const rows = (h.monthly || []).slice().reverse();
+  if (!rows.length) months.append(el("div", { class: "empty" }, "No months yet."));
+  else months.append(wrapScroll(tableView([
+    { label: "month", nowrap: true, get: (r) => r.month + (r.current ? " (this month)" : "") },
+    { label: "P&L", num: true, get: (r) => signed(r.pnl, 2) },
+    { label: "return", num: true, get: (r) => signed(r.return_pct, 2, "%") }], rows)));
+  const al = h.alerts || [];
+  if (!al.length) alerts.append(el("div", { class: "empty" }, "No alerts yet."));
+  else alerts.append(wrapScroll(tableView([
+    { label: "time (UTC)", nowrap: true, get: (a) => dt(a.ts) },
+    { label: "event", get: (a) => el("span", { class: "pill" }, a.event) },
+    { label: "message", get: (a) => el("span", { class: "secondary" }, a.message) }], al)));
+  alerts.append(el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
+    'Every alert is kept in alerts.jsonl. For Slack, Telegram or email, set "alerts": {"webhook_url": "https://hooks.zapier.com/..."} in bot.json (a Zapier or n8n webhook) and send them on from that flow.'));
+}
+
 function renderVerify(s) {
   const v = s.verify || {}, host = clear(document.getElementById("verify"));
   const checked = verifyHasData(v);
@@ -2229,6 +2311,94 @@ for (const b of document.querySelectorAll("button[data-table]")) {
     renderAll(true);
   });
 }
+// ------------------------------------------------------------------ OpenAlice + arbitrage (fetched on demand)
+async function getJSON(url) { const r = await fetch(url, { cache: "no-store" }); return r.json(); }
+async function loadOpenAlice() {
+  const out = document.getElementById("oa-status");
+  out.textContent = "checking…";
+  let v;
+  try { v = await getJSON("api/openalice"); } catch (e) { out.textContent = "the dashboard did not answer"; return; }
+  const st = v.status || {};
+  document.getElementById("oa-ws").value = st.workspace || "";
+  document.getElementById("oa-trades").checked = !!(st.send || {}).trades;
+  document.getElementById("oa-notrade").checked = !!(st.send || {}).no_trade;
+  document.getElementById("oa-alerts").checked = !!(st.send || {}).alerts;
+  clear(out);
+  if (st.reachable) out.append(status("good", "connected"), document.createTextNode(` ${st.url} · ${(st.tools || []).length} tools · Inbox: ${st.inbox_ready ? "ready" : (st.inbox_hint || "not set")}`));
+  else out.append(status("serious", "not reachable"), document.createTextNode(` ${st.url}: ${st.hint || st.error || ""}`));
+  if (st.last && st.last.error) out.append(el("div", { class: "secondary" }, "last send failed: " + st.last.error));
+  const host = clear(document.getElementById("oa-proposals")), rows = (v.proposals || []).filter((p) => p.status === "waiting for you");
+  if (!rows.length) { host.append(el("div", { class: "empty" }, "None. OpenAlice's agent can file one with the propose_trade tool; it never places an order.")); return; }
+  host.append(tableView([
+    { label: "when", get: (r) => r.ts },
+    { label: "pair", get: (r) => el("strong", {}, r.pair) },
+    { label: "side", get: (r) => r.side },
+    { label: "entry", num: true, get: (r) => px(r.entry) },
+    { label: "stop", num: true, get: (r) => px(r.stop) },
+    { label: "targets", get: (r) => (r.take_profit || []).map(px).join(" / ") || "–" },
+    { label: "why", get: (r) => el("span", { class: "secondary" }, r.reason || "–") },
+    { label: "", get: (r) => { const b = el("button", { type: "button", class: "small" }, "Dismiss"); b.disabled = !controlsOn(); b.onclick = async () => { await control({ action: "proposal_dismiss", id: r.id }); loadOpenAlice(); }; return b; } }], rows));
+}
+async function connectOpenAlice() {
+  const j = await control({ action: "openalice_connect" });
+  if (!j || !j.ok) return;
+  const pre = document.getElementById("oa-connect-out");
+  pre.style.display = "block";
+  pre.textContent = `1. Save this as .mcp.json in the OpenAlice workspace folder:\n\n${j.mcp_json}\n\n` +
+    `2. Set the variable ${j.token_env} (Windows: setx ${j.token_env} "${j.token}"), then restart OpenAlice.\n` +
+    `   The token is also kept in ${j.env_file}. Anyone with it can read this bot's status, so keep it to yourself.`;
+}
+function initOpenAlice() {
+  document.getElementById("oa-check").onclick = loadOpenAlice;
+  document.getElementById("oa-test").onclick = async () => { await control({ action: "openalice_test" }); loadOpenAlice(); };
+  document.getElementById("oa-connect").onclick = connectOpenAlice;
+  document.getElementById("oa-save").onclick = async () => {
+    await control({ action: "openalice_save", workspace: document.getElementById("oa-ws").value.trim(),
+      send: { trades: document.getElementById("oa-trades").checked, no_trade: document.getElementById("oa-notrade").checked, alerts: document.getElementById("oa-alerts").checked } });
+    loadOpenAlice();
+  };
+  for (const id of ["oa-test", "oa-connect", "oa-save"]) document.getElementById(id).disabled = !controlsOn();
+  loadOpenAlice();
+}
+const pct = (x) => (x >= 0 ? "+" : "") + nf(3).format(x) + "%";
+async function scanArbitrage(fresh) {
+  const sub = document.getElementById("arb-sub"), btn = document.getElementById("arb-scan");
+  btn.disabled = true; sub.textContent = "reading order books…";
+  let r;
+  try { r = await getJSON("api/arbitrage" + (fresh ? "?fresh=1" : "")); } catch (e) { sub.textContent = "the dashboard did not answer"; btn.disabled = false; return; }
+  btn.disabled = false;
+  if (r.error) { sub.textContent = r.error; return; }
+  sub.textContent = `${r.ts} · ${Object.entries(r.exchanges || {}).map(([k, v]) => `${k} ${v}`).join(", ")} markets · taker fees ${Object.entries(r.fees_pct || {}).map(([k, v]) => `${k} ${v}%`).join(", ")}`;
+  document.getElementById("arb-errors").textContent = Object.entries(r.errors || {}).map(([k, v]) => `${k}: not read (${v})`).join(" · ");
+  const sp = clear(document.getElementById("arb-spatial"));
+  sp.append(tableView([
+    { label: "pair", get: (x) => el("strong", {}, x.pair) },
+    { label: "buy on", get: (x) => x.buy_on }, { label: "at", num: true, get: (x) => px(x.buy_at) },
+    { label: "sell on", get: (x) => x.sell_on }, { label: "at", num: true, get: (x) => px(x.sell_at) },
+    { label: "gap", num: true, get: (x) => pct(x.gross_pct) }, { label: "fees", num: true, get: (x) => x.fees_pct + "%" },
+    { label: "after fees", num: true, get: (x) => status(x.suspect ? "warning" : x.net_pct > 0 ? "good" : "neutral", pct(x.net_pct)) },
+    { label: "size", num: true, get: (x) => x.size_quote == null ? "?" : money(x.size_quote) },
+    { label: "note", get: (x) => el("span", { class: "secondary" }, x.note) }], (r.spatial || []).slice(0, 15)));
+  const rows = [];
+  for (const [ex, list] of Object.entries(r.triangular || {})) for (const t of list.slice(0, 4)) rows.push({ ex, ...t });
+  rows.sort((a, b) => b.net_pct - a.net_pct);
+  const tri = clear(document.getElementById("arb-tri"));
+  if (!rows.length) tri.append(el("div", { class: "empty" }, "No loop close to paying right now."));
+  else tri.append(tableView([{ label: "exchange", get: (x) => x.ex }, { label: "route", get: (x) => x.route },
+    { label: "markets", get: (x) => el("span", { class: "secondary" }, x.markets.join(" · ")) },
+    { label: "after fees", num: true, get: (x) => status(x.net_pct > 0 ? "good" : "neutral", pct(x.net_pct)) },
+    { label: "size", num: true, get: (x) => x.size_start == null ? "?" : money(x.size_start) }], rows.slice(0, 12)));
+  const h = clear(document.getElementById("arb-hist")), routes = (r.history || {}).routes || [];
+  if (!routes.length) h.append(el("div", { class: "empty" }, "No gap has paid 0.05%+ after fees yet."));
+  else h.append(tableView([{ label: "route", get: (x) => x.route }, { label: "kind", get: (x) => x.kind },
+    { label: "times", num: true, get: (x) => x.seen }, { label: "average", num: true, get: (x) => pct(x.avg_pct) },
+    { label: "best", num: true, get: (x) => pct(x.best_pct) }, { label: "last", get: (x) => x.last }], routes.slice(0, 15)));
+}
+function initArbitrage() {
+  document.getElementById("arb-scan").onclick = () => scanArbitrage(true);
+  let timer = null;
+  document.getElementById("arb-auto").onchange = (e) => { clearInterval(timer); timer = e.target.checked ? setInterval(() => scanArbitrage(false), 30000) : null; if (e.target.checked) scanArbitrage(false); };
+}
 const THEMES = ["jarvis", "auto", "light", "dark"];
 function applyTheme(name) {
   state.theme = THEMES.includes(name) ? name : "jarvis";
@@ -2245,8 +2415,8 @@ document.getElementById("theme").addEventListener("click", () => {
 let resizeTimer = null;
 window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => renderAll(true), 150); });
 
-if (EMBEDDED) { state.snap = EMBEDDED; renderAll(); document.getElementById("conn-card").style.display = "none"; }
-else { refresh(); setInterval(refresh, Math.max(1, REFRESH_S) * 1000); }
+if (EMBEDDED) { state.snap = EMBEDDED; renderAll(); for (const id of ["conn-card", "openalice-card", "arb-card"]) document.getElementById(id).style.display = "none"; }
+else { refresh(); setInterval(refresh, Math.max(1, REFRESH_S) * 1000); initOpenAlice(); initArbitrage(); }
 </script>
 </body>
 </html>

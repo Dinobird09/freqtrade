@@ -384,6 +384,12 @@ class _EngineBot:
         from .live_bot import write_heartbeat
 
         write_heartbeat(self.dir, self.s, status, self.gw.now_ms(), error)
+        try:  # the orders since the last beat -> orders.jsonl (the health scorecard reads it)
+            from .scorecard import drain_order_log
+
+            drain_order_log(self.gw, self.dir)
+        except OSError:
+            pass
 
     def _fatal(self, message: str) -> None:
         for last in (self._save, lambda: self._heartbeat("error", message)):

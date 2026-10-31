@@ -23,6 +23,11 @@ State lives in ``state_dir`` and survives restarts:
     state.json      starting equity, R6 reservations, entry fees, last candle per pair,
                     paper balances
     candles/        the 4H candles the bot evaluated (for audits / testnet evidence)
+    orders.jsonl    every order placed (fills, partial fills, cancels, rejects), for the
+                    Bot health scorecard (scorecard.py)
+    uptime.json     run sessions (availability), updated with the heartbeat
+    alerts.jsonl    every monitoring alert (also POSTed to the Zapier / n8n webhook in
+                    bot.json "alerts", if set)
     bot.log         log
 Kill the process at any time (SIGINT / SIGTERM stop after the current step); on restart the
 open positions are rebuilt from the journal and managed again.
@@ -69,6 +74,7 @@ from .live_exchange import (
 from .models import EXIT_END, EXIT_SL, EXIT_TP, Candle, Trade, base_of
 from .news import NewsCalendar, load_events
 from .retrain import due
+from .scorecard import Alerter, AlertSettings, UptimeTracker, drain_order_log
 
 
 log = logging.getLogger("trendbot.bot")
@@ -126,7 +132,7 @@ class BotSettings:
     sentiment: dict[str, Any] = field(default_factory=dict)  # sentiment.collect settings
     orderflow: dict[str, Any] = field(default_factory=dict)  # orderflow.collect settings
     dex: dict[str, Any] = field(default_factory=dict)  # {"enabled": false, ...} dex_scan settings
-    engine: str = "trendbot"  # "trendbot" (the nine rules) or "lab" (a strategy-lab strategy)
+    engine: str = "trendbot"  # "trendbot" (nine rules), "lab" (a lab strategy), "grid" or "dca"
     lab: dict[str, Any] = field(default_factory=dict)  # {"strategy": "nnfx", "params": {...}}
     brain: dict[str, Any] = field(default_factory=dict)  # chantisimo.BrainSettings fields
     # live feed for the dashboard: {"enabled": true, "price_seconds": 1, "candle_seconds": 5}
@@ -139,6 +145,11 @@ class BotSettings:
     scanner: dict[str, Any] = field(default_factory=dict)  # scanner.ScannerSettings (watchlist)
     # mode "wallet": {"provider": "phantom"|"metamask", "chain": "solana"|"base"|..., ...}
     wallet: dict[str, Any] = field(default_factory=dict)
+    # monitoring (scorecard.AlertSettings): {"webhook_url": "https://hooks.zapier.com/...",
+    # "events": ["bot_error", "network_down", ...]}. Company-approved automation only: a Zapier
+    # Catch Hook or an n8n Webhook (https); Slack / Telegram / email are steps in that flow.
+    # Every alert is also written to alerts.jsonl (the dashboard's Bot health card).
+    alerts: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -153,6 +164,7 @@ class BotSettings:
             from .wallets import WalletSettings
 
             WalletSettings(**self.wallet).check_pairs(self.pairs)
+        AlertSettings(**self.alerts)  # an http:// or unknown event: refused at load time
         if self.poll_seconds <= 0 or self.history_candles < 1200:
             raise ValueError(
                 "poll_seconds must be > 0 and history_candles >= 1200 (EMA200 needs ~1000 "
@@ -224,6 +236,15 @@ class TrendBot:
         self.settings_path: Path | None = None  # set by main(); needed to spawn jobs
         self._jobs: dict[str, Any] = {}
         self._entry_fill: Fill | None = None  # the buy enter() got, until it is booked
+        self.alerts = Alerter(
+            AlertSettings(**settings.alerts),
+            self.dir,
+            mode=settings.mode,
+            exchange=settings.exchange,
+        )
+        self.uptime = UptimeTracker(self.dir, settings.poll_seconds)
+        self._net = {"started": 0, "loop_ok": None, "loop_err": None, "down": False}
+        self._error_alerted = False
         if hasattr(gateway, "on_wait"):  # a wallet ticket waits for you: stay "running"
             gateway.on_wait = lambda: self._heartbeat("running")
 
@@ -330,6 +351,7 @@ class TrendBot:
 
     def _save(self) -> None:
         sess = self._sess()
+        self._drain_orders()
         save_journal(sess.journal_trades(), self.journal_path)
         self._save_state()
         self.book.write(sess.journal_trades(), self.state.get("trade_context", {}))
@@ -345,6 +367,13 @@ class TrendBot:
         if isinstance(self.gw, PaperBroker):
             self.state["paper_balances"] = self.gw.state()
         atomic_write_text(self.state_path, json.dumps(self.state, indent=1, sort_keys=True))
+
+    def _drain_orders(self) -> None:
+        """The gateway's new orders -> orders.jsonl (a locked file: written next time)."""
+        try:
+            drain_order_log(self.gw, self.dir)
+        except OSError as exc:
+            log.debug("orders.jsonl not written now: %s", exc)
 
     def _sess(self) -> LiveSession:
         if self.session is None:
@@ -386,18 +415,68 @@ class TrendBot:
     def run(self, max_steps: int | None = None) -> None:
         guard = LoopGuard(self.s.exchange, self.s.poll_seconds, self._fatal)
         steps = 0
+        self._net["started"] = self._now()
+        self.alerts.emit(
+            "bot_started",
+            f"started on {self.s.exchange} ({self.s.mode}): {', '.join(self.s.pairs)}",
+        )
         while not self.stop_requested and (max_steps is None or steps < max_steps):
             try:
                 self.step()
                 delay = guard.ok()
+                self._watch(None, guard.failures)
             except Exception as exc:  # the loop must outlive outages: open positions need it
                 delay = guard.failed(exc)
+                self._watch(exc, guard.failures)
             steps += 1
             if not self.stop_requested and (max_steps is None or steps < max_steps):
                 self.sleep(delay)
         self._save()
         self._heartbeat("stopped")
+        self.alerts.emit("bot_stopped", f"stopped on {self.s.exchange} ({self.s.mode})")
+        self.alerts.flush()
         log.info("stopped")
+
+    def _now(self) -> int:
+        try:
+            return int(self.gw.now_ms())
+        except Exception:  # the clock of a broken gateway: the PC's
+            return int(time.time() * 1000)
+
+    def _watch(self, exc: Exception | None, failures: int) -> None:
+        """Monitoring after each step: network_down / network_restored, and bot_error once
+        ``alerts.error_steps`` steps in a row failed. Never raises."""
+        try:
+            now, net, s = self._now(), self._net, self.alerts.s
+            if exc is None:
+                net["loop_ok"] = now
+                self._error_alerted = False
+            elif isinstance(exc, transient_errors()):
+                net["loop_err"] = now
+            if hasattr(self.gw, "last_error_ms"):  # the gateway knows its last good call
+                ok, err = self.gw.last_ok_ms, self.gw.last_error_ms
+            else:
+                ok, err = net["loop_ok"], net["loop_err"]
+            ok = ok if ok is not None else net["started"]
+            failing = err is not None and err >= ok
+            if failing and not net["down"] and now - ok > s.network_down_minutes * 60_000:
+                net["down"] = True
+                self.alerts.emit(
+                    "network_down",
+                    f"no successful {self.s.exchange} call for {(now - ok) / 60_000:.0f} min: "
+                    "check the internet connection (open positions are not watched)",
+                )
+            elif net["down"] and not failing:
+                net["down"] = False
+                self.alerts.emit("network_restored", f"{self.s.exchange} is reachable again")
+            if exc is not None and failures >= s.error_steps and not self._error_alerted:
+                self._error_alerted = True
+                self.alerts.emit(
+                    "bot_error",
+                    f"{failures} steps in a row failed; last: {type(exc).__name__}: {exc}"[:500],
+                )
+        except Exception as watch_exc:  # monitoring must never stop the bot
+            log.debug("monitoring check failed: %s", watch_exc)
 
     def step(self) -> None:
         """One iteration: operator requests, exits, then entries on newly closed candles."""
@@ -413,6 +492,7 @@ class TrendBot:
         self.manage_exits()
         if not self.stop_requested:
             self.process_closed_candles()
+        self._drain_orders()
         self._heartbeat("running")
 
     # ------------------------------------------------------------------ operator controls
@@ -445,15 +525,26 @@ class TrendBot:
                 self.exit_position(t, EXIT_END, self.gw.bid(p))
 
     def _heartbeat(self, status: str, error: str | None = None) -> None:
-        write_heartbeat(self.dir, self.s, status, self.gw.now_ms(), error)
+        now = self.gw.now_ms()
+        write_heartbeat(self.dir, self.s, status, now, error)
+        try:  # uptime.json: rewritten at most every 30 s while running
+            if status == "running":
+                self.uptime.beat(now)
+            else:
+                self.uptime.stop(now)
+        except Exception as exc:  # availability statistics must never stop the bot
+            log.debug("uptime not recorded: %s", exc)
 
     def _fatal(self, message: str) -> None:
-        """Last words before a fatal error stops the bot: state and an "error" heartbeat."""
+        """Last words before a fatal error stops the bot: state, an "error" heartbeat and
+        a bot_error alert."""
         for last in (self._save, lambda: self._heartbeat("error", message)):
             try:
                 last()
             except Exception as exc:
                 log.warning("could not write the final state: %s", exc)
+        self.alerts.emit("bot_error", f"stopped by a fatal error: {message}"[:500])
+        self.alerts.flush()
 
     # ------------------------------------------------------------------ learning
     def _relearn(self) -> None:
@@ -657,9 +748,17 @@ class TrendBot:
             peak = float(self.state["capital"].get("peak_equity") or eq)
             path = write_lock(self.dir, v.kill, now, self.mark_to_market(), peak)
             log.critical("wrote %s: delete it by hand to allow a restart", path)
+            self.alerts.emit(
+                "kill_switch",
+                f"KILL SWITCH: {v.kill}; sold everything and stopped. Delete "
+                f"{path.name} by hand to allow a restart",
+            )
             self.stop_requested = True
         elif v.flatten:
             log.warning("CAPITAL: %s; selling every open position, entries frozen", v.flatten)
+            self.alerts.emit(
+                "capital_freeze", f"{v.flatten}: sold every open position, entries frozen"
+            )
             self.flatten()
         st = self.state["capital"]
         sig = (
@@ -753,6 +852,13 @@ class TrendBot:
         )
         for _, msg in sess.breaker_log[-3:]:
             log.info("breaker: %s", msg)
+        self.alerts.emit(
+            "trade_closed",
+            f"sold {t.pair} #{t.trade_id} ({reason}) at {fill.price:.8g}: "
+            f"{closed.r_multiple or 0:+.2f}R, pnl {closed.pnl or 0:+.2f} {self.s.quote}",
+            pair=t.pair,
+            trade_id=t.trade_id,
+        )
         self.layer_book.observe(t.pair, t.features, closed.r_multiple or 0.0, closed.exit_ts)
         ctx = self.state.get("trade_context", {}).get(str(t.trade_id), {})
         reflection = self.brain.reflect(closed, ctx.get("brain_recall"))
@@ -972,6 +1078,13 @@ class TrendBot:
             trade.stop,
             trade.target,
             trade.risk_pct,
+        )
+        self.alerts.emit(
+            "trade_opened",
+            f"bought {pair} #{trade.trade_id}: {trade.qty:.8g} at {trade.entry_price:.8g}, "
+            f"stop {trade.stop:.8g}, target {trade.target:.8g}, risk {trade.risk_pct:.2f}%",
+            pair=pair,
+            trade_id=trade.trade_id,
         )
         self._save()
         return trade
@@ -1338,6 +1451,20 @@ def _main(args: argparse.Namespace, settings: BotSettings, gateway: Any) -> int:
         gw = gateway if gateway is not None else build_gateway(settings, cfg)
     except ValueError as exc:  # e.g. a .env saved as UTF-16
         raise SystemExit(str(exc)) from None
+    if settings.engine in ("grid", "dca"):
+        from .engines import make_bot
+
+        eng = make_bot(settings, gw)
+        eng.settings_path = Path(args.settings).resolve()
+        eng.start()
+        if args.command == "flatten":
+            eng.flatten()
+            return 0
+        if args.command == "run":
+            signal.signal(signal.SIGINT, lambda *_: setattr(eng, "stop_requested", True))
+            signal.signal(signal.SIGTERM, lambda *_: setattr(eng, "stop_requested", True))
+            eng.run(max_steps=args.steps)
+        return 0
     if settings.engine == "lab":
         from .lab_bot import LabBot
 

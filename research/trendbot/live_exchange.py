@@ -9,6 +9,8 @@ Both expose exactly what :mod:`live_bot` needs::
     round_qty(pair, qty)     -> qty rounded DOWN to the exchange's amount precision
     min_order(pair)          -> (min amount, min cost) from the market limits
     now_ms()                 -> exchange clock
+    order_log                -> every order placed, as orders.jsonl rows (see record_order);
+                                the bot drains it each step (scorecard.drain_order_log)
 
 ``ccxt`` is imported lazily so the rest of the package stays stdlib-only. API keys are
 read from the environment (``TRENDBOT_API_KEY``, ``TRENDBOT_API_SECRET``, optional
@@ -38,6 +40,7 @@ ENV_SECRET = "TRENDBOT_API_SECRET"  # noqa: S105 - env var name, not a secret
 ENV_PASSWORD = "TRENDBOT_API_PASSWORD"  # noqa: S105 - env var name, not a secret
 TIMEFRAME = "4h"
 CLOCK_REFRESH_MS = 15 * 60_000  # re-measure the exchange clock offset this often
+ORDER_LOG_MAX = 1000  # orders kept in memory until the bot writes them to orders.jsonl
 
 
 def _ccxt_errors(*names: str) -> tuple[type[BaseException], ...]:
@@ -147,6 +150,60 @@ def quote_of(pair: str) -> str:
     return pair.split("/", 1)[1].split(":", 1)[0].upper()
 
 
+def record_order(
+    book: list[dict[str, Any]],
+    pair: str,
+    side: str,
+    kind: str,
+    qty_requested: float,
+    *,
+    ts: int,
+    status: str,
+    liquidity: str,
+    qty_filled: float = 0.0,
+    price: float | None = None,
+    fee_quote: float | None = None,
+    order_id: str = "",
+) -> dict[str, Any]:
+    """Append one orders.jsonl row to a gateway's ``order_log`` (the oldest rows are dropped
+    beyond ORDER_LOG_MAX, when nothing drains the list).
+
+    kind: market | limit | post-only | swap; status: filled | partial | cancelled |
+    rejected | unknown; liquidity: maker | taker | unknown.
+    """
+    filled = max(float(qty_filled or 0.0), 0.0)
+    px = float(price) if price and filled > 0 else None
+    row = {
+        "ts": int(ts),
+        "pair": pair,
+        "side": side,
+        "type": kind,
+        "qty_requested": float(qty_requested),
+        "qty_filled": filled,
+        "price": px,
+        "notional": filled * px if px else 0.0,
+        "fee_quote": fee_quote if filled > 0 else 0.0,
+        "liquidity": liquidity,
+        "status": status,
+        "order_id": str(order_id or ""),
+    }
+    book.append(row)
+    if len(book) > ORDER_LOG_MAX:
+        del book[: len(book) - ORDER_LOG_MAX]
+    return row
+
+
+def order_status(order: dict[str, Any], qty: float) -> str:
+    """filled / partial / cancelled / rejected / unknown from a ccxt order structure."""
+    filled = float(order.get("filled") or 0.0)
+    st = order.get("status")
+    if filled > 0:
+        return "filled" if filled >= qty * 0.999 else "partial"
+    if st in ("canceled", "cancelled", "expired"):
+        return "cancelled"
+    return "rejected" if st == "rejected" else "unknown"
+
+
 def with_retries(
     fn: Callable[[], Any],
     what: str,
@@ -227,6 +284,9 @@ class CcxtGateway:
         self._clock_offset = 0  # exchange time minus local time, ms
         self._clock_checked: int | None = None
         self._orders = 0
+        self.order_log: list[dict[str, Any]] = []  # orders.jsonl rows, drained by the bot
+        self.last_ok_ms: int | None = None  # the last exchange call that worked (local ms)
+        self.last_error_ms: int | None = None  # the last one that failed after its retries
         self._call(self.ex.load_markets, "load_markets")
 
     @classmethod
@@ -261,7 +321,13 @@ class CcxtGateway:
 
     # ------------------------------------------------------------------ helpers
     def _call(self, fn: Callable[[], Any], what: str) -> Any:
-        return with_retries(fn, what, self._transient, sleep=self.sleep)
+        try:
+            out = with_retries(fn, what, self._transient, sleep=self.sleep)
+        except self._transient:
+            self.last_error_ms = self._local_ms() + self._clock_offset
+            raise
+        self.last_ok_ms = self._local_ms() + self._clock_offset
+        return out
 
     def _local_ms(self) -> int:
         clock = getattr(self.ex, "milliseconds", None)
@@ -486,19 +552,64 @@ class CcxtGateway:
         options = getattr(self.ex, "options", None) or {}
         return self.ask(pair) if options.get("createMarketBuyOrderRequiresPrice") else None
 
+    def _log(
+        self,
+        pair: str,
+        side: str,
+        kind: str,
+        qty: float,
+        status: str,
+        liquidity: str,
+        fill: Fill | None = None,
+        executed: float | None = None,
+        order_id: str = "",
+    ) -> None:
+        """One orders.jsonl row; ``executed`` is the gross filled amount (a fee taken in the
+        base coin makes ``fill.qty`` a little smaller)."""
+        record_order(
+            self.order_log,
+            pair,
+            side,
+            kind,
+            qty,
+            ts=fill.ts if fill is not None else self._local_ms() + self._clock_offset,
+            status=status,
+            liquidity=liquidity,
+            qty_filled=executed if executed is not None else (fill.qty if fill else 0.0),
+            price=fill.price if fill is not None else None,
+            fee_quote=fill.fee_quote if fill is not None else None,
+            order_id=fill.order_id if fill is not None and fill.order_id else order_id,
+        )
+
+    def _failed(self, pair: str, side: str, kind: str, qty: float, placed: bool, exc: Exception):
+        """An order that raised: refused before it existed, or placed with an unknown end."""
+        unknown = placed or isinstance(exc, (OrderError, *self._transient))
+        self._log(pair, side, kind, qty, "unknown" if unknown else "rejected", "unknown")
+
     def _market_order(self, pair: str, side: str, qty: float) -> Fill:
         before = self._free_or_none(base_of(pair))
         cid = self._client_id(side)
         price = self._market_buy_price(pair) if side == "buy" else None
+        order: dict[str, Any] | None = None
         try:
-            order = self._create(pair, "market", side, qty, price, self._id_params(cid))
-        except self._transient as exc:
-            found = self._unknown_outcome(pair, side, qty, cid, before, exc)
-            if isinstance(found, Fill):
-                return found
-            order = found
-        fill = fill_from_order(self._await(order, pair), pair, side, self.now_ms())
-        return self._cap_bought(fill, pair, before) if side == "buy" else fill
+            try:
+                order = self._create(pair, "market", side, qty, price, self._id_params(cid))
+            except self._transient as exc:
+                found = self._unknown_outcome(pair, side, qty, cid, before, exc)
+                if isinstance(found, Fill):
+                    self._log(pair, side, "market", qty, "filled", "taker", found)
+                    return found
+                order = found
+            order = self._await(order, pair)
+            fill = fill_from_order(order, pair, side, self.now_ms())
+            fill = self._cap_bought(fill, pair, before) if side == "buy" else fill
+        except Exception as exc:
+            self._failed(pair, side, "market", qty, order is not None, exc)
+            raise
+        executed = float(order.get("filled") or 0.0)
+        status = order_status(order, qty)
+        self._log(pair, side, "market", qty, status, "taker", fill, executed, str(order.get("id")))
+        return fill
 
     def buy(self, pair: str, qty: float) -> Fill:
         return self._market_order(pair, "buy", qty)
@@ -518,12 +629,38 @@ class CcxtGateway:
         try:
             order = self.ex.create_order(pair, "limit", "buy", qty, price, params)
         except self._invalid:  # it would have taken liquidity (or was refused): plain market order
+            self._log(pair, "buy", "post-only", qty, "rejected", "maker", order_id=cid)
             return self.buy(pair, qty)
         except self._transient as exc:
-            found = self._unknown_outcome(pair, "buy", qty, cid, before, exc)
-            if isinstance(found, Fill):
+            try:
+                found = self._unknown_outcome(pair, "buy", qty, cid, before, exc)
+            except Exception as lost:
+                self._failed(pair, "buy", "post-only", qty, True, lost)
+                raise
+            if isinstance(found, Fill):  # a post-only order can only fill as a maker
+                self._log(pair, "buy", "post-only", qty, "filled", "maker", found)
                 return found
             order = found
+        oid = order.get("id")
+        try:
+            order = self._wait_or_cancel(order, pair, wait_s)
+            maker = fill_from_order(order, pair, "buy", self.now_ms())
+            maker = self._cap_bought(maker, pair, before)
+        except Exception as exc:
+            self._failed(pair, "buy", "post-only", qty, True, exc)
+            raise
+        executed = float(order.get("filled") or 0.0)
+        status = order_status(order, qty)
+        self._log(pair, "buy", "post-only", qty, status, "maker", maker, executed, str(oid))
+        rest = self.round_qty(pair, qty - float(order.get("filled") or 0.0))
+        min_amount, min_cost = self.min_order(pair)
+        if rest <= 0 or rest < min_amount or rest * price < min_cost:
+            return maker
+        taker = self.buy(pair, rest)
+        return combine_fills(maker, taker)
+
+    def _wait_or_cancel(self, order: dict[str, Any], pair: str, wait_s: float) -> dict[str, Any]:
+        """The resting order after ``wait_s`` seconds, cancelled if it is still open."""
         oid = order.get("id")
         done = ("closed", "canceled", "expired", "rejected")
         for _ in range(max(1, int(wait_s))):
@@ -537,13 +674,7 @@ class CcxtGateway:
             except Exception as exc:  # it may have filled meanwhile: the fetch below tells
                 log.warning("cancel of %s failed: %s", oid, exc)
             order = self._call(lambda: self.ex.fetch_order(oid, pair), f"fetch_order {oid}")
-        maker = self._cap_bought(fill_from_order(order, pair, "buy", self.now_ms()), pair, before)
-        rest = self.round_qty(pair, qty - float(order.get("filled") or 0.0))
-        min_amount, min_cost = self.min_order(pair)
-        if rest <= 0 or rest < min_amount or rest * price < min_cost:
-            return maker
-        taker = self.buy(pair, rest)
-        return combine_fills(maker, taker)
+        return order
 
     def sell(self, pair: str, qty: float) -> Fill:
         return self._market_order(pair, "sell", qty)
@@ -570,6 +701,15 @@ class PaperBroker:
         self.slip = slippage_pct / 100.0
         self.balances: dict[str, float] = dict(balances or {})
         self._n = 0
+        self.order_log: list[dict[str, Any]] = []  # orders.jsonl rows, drained by the bot
+
+    @property
+    def last_ok_ms(self) -> int | None:  # the public feed's health (network_down alerts)
+        return getattr(self.market, "last_ok_ms", None)
+
+    @property
+    def last_error_ms(self) -> int | None:
+        return getattr(self.market, "last_error_ms", None)
 
     @classmethod
     def connect(cls, exchange_id: str, **kwargs: Any) -> PaperBroker:
@@ -613,6 +753,22 @@ class PaperBroker:
         return self.market.min_order(pair)
 
     def _fill(self, pair: str, side: str, qty: float) -> Fill:
+        try:
+            fill = self._simulate(pair, side, qty)
+        except OrderError:
+            record_order(
+                self.order_log, pair, side, "market", qty, ts=self.now_ms(),
+                status="rejected", liquidity="taker",
+            )  # fmt: skip
+            raise
+        record_order(
+            self.order_log, pair, side, "market", qty, ts=fill.ts, status="filled",
+            liquidity="taker", qty_filled=fill.qty, price=fill.price, fee_quote=fill.fee_quote,
+            order_id=fill.order_id,
+        )  # fmt: skip
+        return fill
+
+    def _simulate(self, pair: str, side: str, qty: float) -> Fill:
         base, quote = base_of(pair), quote_of(pair)
         if side == "buy":
             price = self.ask(pair) * (1 + self.slip)

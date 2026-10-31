@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .live_exchange import Fill, OrderError, quote_of
+from .live_exchange import Fill, OrderError, quote_of, record_order
 from .models import Candle, base_of
 
 
@@ -577,6 +577,15 @@ class WalletBroker:
         self.on_wait: Callable[[], None] | None = None  # the bot keeps its heartbeat fresh
         self._bal: dict[str, float] = {}
         self._bal_ts = 0.0
+        self.order_log: list[dict[str, Any]] = []  # orders.jsonl rows, drained by the bot
+
+    @property
+    def last_ok_ms(self) -> int | None:  # the public price feed's health (network_down)
+        return getattr(self.market, "last_ok_ms", None)
+
+    @property
+    def last_error_ms(self) -> int | None:
+        return getattr(self.market, "last_error_ms", None)
 
     @classmethod
     def connect(cls, exchange_id: str, ws: WalletSettings, state_dir: Path) -> WalletBroker:
@@ -662,6 +671,25 @@ class WalletBroker:
         return self._swap(pair, "sell", qty, est_out=qty * self.bid(pair))
 
     def _swap(self, pair: str, side: str, amount_in: float, est_out: float) -> Fill:
+        """A swap ticket, logged to the order log: a swap always takes liquidity (taker);
+        its fee is in the price and the network fee in the native coin (fee_quote unknown)."""
+        qty = est_out if side == "buy" else amount_in  # the base amount asked for
+        try:
+            fill = self._swap_ticket(pair, side, amount_in, est_out)
+        except WalletError as exc:
+            status = "cancelled" if "not approved" in str(exc) else "rejected"
+            now = int(self.clock() * 1000)
+            record_order(
+                self.order_log, pair, side, "swap", qty, ts=now, status=status, liquidity="taker"
+            )
+            raise
+        record_order(
+            self.order_log, pair, side, "swap", qty, ts=fill.ts, status="filled",
+            liquidity="taker", qty_filled=fill.qty, price=fill.price, order_id=fill.order_id,
+        )  # fmt: skip
+        return fill
+
+    def _swap_ticket(self, pair: str, side: str, amount_in: float, est_out: float) -> Fill:
         base, quote = self.ws.token(base_of(pair)), self.ws.token(quote_of(pair))
         tin, tout = (quote, base) if side == "buy" else (base, quote)
         for tok in (tin, tout):

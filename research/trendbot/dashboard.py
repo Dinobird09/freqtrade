@@ -26,7 +26,7 @@ import subprocess
 import threading
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -273,6 +273,7 @@ def build_snapshot(
         "regime": state.get("regime"),
         "scanner": _read_json(d / "scanner.json"),
         "lab": _lab_view(d),
+        "health": health_view(d, now),
         "correlations": _correlations(all_candles),
         "capital": {
             **(state.get("capital") or {}),
@@ -327,8 +328,41 @@ def _quote(trades: Sequence[Trade], pairs: dict[str, Any]) -> str:
     return names[0].split("/", 1)[1] if names and "/" in names[0] else "USDT"
 
 
+# ---------------------------------------------------------------------- bot health
+_HEALTH_FILES = ("journal.csv", "orders.jsonl", "uptime.json", "state.json", "alerts.jsonl")
+_HEALTH_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+
+
+def health_view(d: Path, now_ms: int) -> dict[str, Any]:
+    """The Bot health card: scorecard.py's grades plus the last alerts, re-computed only when
+    one of its files changed (and once a minute for the clock)."""
+    from .scorecard import recent_alerts, scorecard
+
+    sig: list[Any] = [now_ms // 60_000]
+    for name in _HEALTH_FILES:
+        try:
+            st = (d / name).stat()
+            sig.append((name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append((name, None))
+    key = str(d.resolve())
+    hit = _HEALTH_CACHE.get(key)
+    if hit is None or hit[0] != tuple(sig):
+        try:
+            mtm = (_read_json(d / "state.json").get("capital") or {}).get("equity_mtm")
+            view = scorecard(d, now_ms=now_ms, equity=mtm)
+            view["alerts"] = recent_alerts(d, 10)
+        except Exception as exc:  # display only: the card says why instead of the page failing
+            log.warning("bot health unavailable for %s: %s", d, exc)
+            view = {"error": _plain(exc), "metrics": [], "alerts": []}
+        hit = (tuple(sig), view)
+        _HEALTH_CACHE[key] = hit
+    return hit[1]
+
+
 # ---------------------------------------------------------------------- 1-second refresh
-_VOLATILE = {"live.json", "heartbeat.json"}  # rewritten every second: overlaid, never cached
+# rewritten every second (uptime.json: every 30 s): overlaid, never a reason to rebuild
+_VOLATILE = {"live.json", "heartbeat.json", "uptime.json"}
 _CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
 LIVE_STALE_MS = 15_000
 
@@ -397,6 +431,7 @@ def overlay_live(
             }
         rows.append(p)
     snap["open_positions"] = rows
+    snap["health"] = health_view(d, now)  # uptime changes without a full rebuild
     from .traders import read_status
 
     snap["traders"] = read_status()  # global (all bots), small: read every second
@@ -573,7 +608,11 @@ MEMORY_HEADERS = {
         "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
     ),
 }
-TOKEN_PAGES = {"/memes": ("memes.html", MEME_HEADERS), "/memory": ("memory.html", MEMORY_HEADERS)}
+TOKEN_PAGES = {
+    "/memes": ("memes.html", MEME_HEADERS),
+    "/memory": ("memory.html", MEMORY_HEADERS),
+    "/builder": ("builder.html", MEMORY_HEADERS),
+}
 MARKET_PAGES: dict[str, tuple[str, dict[str, str]]] = {
     "/market": (
         "market.html",
@@ -687,6 +726,9 @@ def verify_has_data(st: Mapping[str, Any]) -> bool:
     return False
 
 
+STALE_HEARTBEAT_S = 180  # a "running" heartbeat older than this raises heartbeat_stale
+
+
 class Controller:
     """Operator actions behind the dashboard buttons (all go through files the bot reads)."""
 
@@ -700,6 +742,8 @@ class Controller:
         self._settings: tuple[float, Any] | None = None
         self._exited_ms: float | None = None  # when the bot we started was seen to exit
         self._lock = threading.Lock()  # one Start at a time: never two bots on one state dir
+        self._stale_alerted: int | None = None  # wall_ts of the heartbeat alerted as stale
+        self._alerter: tuple[Any, Any] | None = None  # (settings it was built from, Alerter)
         if settings_path is not None:
             self.poll_s = self.settings().poll_seconds
 
@@ -729,6 +773,8 @@ class Controller:
         running = alive or (
             fresh and beat.get("status") == "running" and _pid_alive(beat.get("pid"))
         )
+        if beat.get("status") == "running" and age_s is not None and age_s > STALE_HEARTBEAT_S:
+            self._heartbeat_stale(beat, age_s)
         return {
             "running": bool(running),
             "pid": beat.get("pid"),
@@ -744,6 +790,39 @@ class Controller:
             if (self.dir / "requests").exists()
             else 0,
         }
+
+    def alerter(self) -> Any:
+        """The alert sender for this bot (bot.json "alerts"; alerts.jsonl only without it)."""
+        from .scorecard import Alerter
+
+        try:
+            s = self.settings()
+        except (OSError, ValueError, TypeError):
+            s = None
+        if self._alerter is None or self._alerter[0] is not s:
+            raw = s.alerts if s is not None else None
+            mode, exchange = (s.mode, s.exchange) if s is not None else ("", "")
+            self._alerter = (s, Alerter(raw, self.dir, mode=mode, exchange=exchange))
+        return self._alerter[1]
+
+    def _heartbeat_stale(self, beat: Mapping[str, Any], age_s: float) -> None:
+        """A bot that said "running" stopped beating (crash, frozen PC, sleep, power cut):
+        one heartbeat_stale alert per heartbeat, also across dashboard restarts."""
+        from .scorecard import recent_alerts
+
+        key = int(beat.get("wall_ts") or 0)
+        if key == self._stale_alerted:
+            return
+        self._stale_alerted = key
+        for a in recent_alerts(self.dir, 50):
+            if a.get("event") == "heartbeat_stale" and a.get("heartbeat_wall_ts") == key:
+                return
+        self.alerter().emit(
+            "heartbeat_stale",
+            f"no heartbeat for {age_s / 60:.0f} min although the bot said it was running: it "
+            "may have crashed, or the PC slept, froze or lost power or network",
+            heartbeat_wall_ts=key,
+        )
 
     def act(self, req: dict[str, Any]) -> tuple[bool, str]:  # noqa: C901 - one branch per button
         from .live_bot import post_request, write_control
@@ -948,6 +1027,8 @@ class FleetRuntime:
         self.entries = dict(entries)
         self._start_lock = threading.RLock()  # the fleet's room / approval check is one step
         self._memes: Any = None
+        self._arb: Any = None
+        self._mcp: Any = None
 
     @property
     def memes(self) -> Any:
@@ -957,6 +1038,29 @@ class FleetRuntime:
 
             self._memes = Desk(self.entries[self.names[0]][0])
         return self._memes
+
+    @property
+    def home(self) -> Path:
+        """The first bot's folder: the meme desk, proposals and the arbitrage log live here."""
+        return Path(self.entries[self.names[0]][0])
+
+    @property
+    def arbitrage(self) -> Any:
+        if self._arb is None:
+            from .arbitrage import Monitor
+
+            self._arb = Monitor(self.home)
+        return self._arb
+
+    @property
+    def mcp(self) -> Any:
+        """Chantisimo's MCP server (POST /mcp), for OpenAlice and other MCP apps."""
+        if self._mcp is None:
+            from .dashboard_extras import mcp_tools
+            from .mcp_server import McpServer
+
+            self._mcp = McpServer(mcp_tools(self))
+        return self._mcp
 
     @property
     def names(self) -> list[str]:
@@ -1102,23 +1206,29 @@ class FleetRuntime:
 
     def summary(self) -> dict[str, Any]:
         from .fleet import summary_row
+        from .scorecard import fleet_scorecard
 
-        rows = []
+        rows, health = [], {}
         for n in self.names:
             try:
-                rows.append(summary_row(n, self.snapshot(n)))
+                snap = self.snapshot(n)
+                rows.append(summary_row(n, snap))
+                if (snap.get("health") or {}).get("metrics"):
+                    health[n] = snap["health"]
             except (OSError, ValueError) as exc:
                 rows.append({"name": n, "error": str(exc)})
         f = self.fleet
         return {
             "fleet": self.is_fleet,
             "bots": rows,
+            "diversification": fleet_scorecard(health) if health else None,
             "running": sum(1 for r in rows if r.get("running")),
             "approval_threshold": f.approval_threshold if f else None,
             "max_bots": f.max_bots if f else 1,
         }
 
     def act(self, req: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        from . import dashboard_extras as extras
         from .fleet import FleetError
 
         action = req.get("action")
@@ -1127,6 +1237,8 @@ class FleetRuntime:
             (("meme_",), lambda r: self.memes.act(r)),
             (("memory_",), self.memory_note),
             (("wallet_",), self.wallet_action),
+            (("builder_",), lambda r: extras.builder_action(self, r)),
+            (("openalice_", "proposal_"), lambda r: extras.openalice_action(self, r)),
         )
         for prefixes, handler in routes:  # the cards that keep their own buttons
             if str(action).startswith(prefixes):
@@ -1346,6 +1458,37 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
 
     terminal = Terminal(runtime)
 
+    def _catalog(q: Mapping[str, str]) -> Any:
+        from .builder import catalog
+
+        return catalog()
+
+    def _openalice(q: Mapping[str, str]) -> Any:
+        from .dashboard_extras import openalice_view
+
+        return openalice_view(runtime)
+
+    def _voice_status(q: Mapping[str, str]) -> Any:
+        from .voice import status as voice_status
+
+        ready = {"installed": True, "ready": True, "engine": "custom"}
+        return voice_status() if voice_engine is None else ready
+
+    def _connections(q: Mapping[str, str]) -> Any:
+        from .connections import status as connections_status
+
+        return connections_status()
+
+    json_routes: dict[str, Callable[[Mapping[str, str]], Any]] = {
+        "/api/snapshot": lambda q: runtime.snapshot(q.get("bot")),
+        "/api/fleet": lambda q: runtime.summary(),
+        "/api/voice/status": _voice_status,
+        "/api/connections": _connections,
+        "/api/builder/catalog": _catalog,
+        "/api/arbitrage": lambda q: runtime.arbitrage.view(q),
+        "/api/openalice": _openalice,
+    }
+
     class Handler(BaseHTTPRequestHandler):
         def _send(
             self, status: int, body: bytes, ctype: str, headers: Mapping[str, str] | None = None
@@ -1403,19 +1546,11 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                     name, headers = MARKET_PAGES[path.rstrip("/")]
                     page = _html_template(name)
                     self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8", headers)
-                elif path == "/api/snapshot":
-                    self._json(HTTPStatus.OK, runtime.snapshot(self._query().get("bot")))
-                elif path == "/api/fleet":
-                    self._json(HTTPStatus.OK, runtime.summary())
-                elif path == "/api/voice/status":
-                    from .voice import status as voice_status
-
-                    ready = {"installed": True, "ready": True, "engine": "custom"}
-                    self._json(HTTPStatus.OK, voice_status() if voice_engine is None else ready)
-                elif path == "/api/connections":
-                    from .connections import status as connections_status
-
-                    self._json(HTTPStatus.OK, connections_status())
+                elif path in json_routes:
+                    self._json(HTTPStatus.OK, json_routes[path](self._query()))
+                elif path == "/mcp":  # streamable HTTP without server push: POST only
+                    self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"POST only", "text/plain",
+                               {"Allow": "POST"})  # fmt: skip
                 else:
                     self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
             except Exception as exc:  # never drop the connection: say what went wrong
@@ -1423,6 +1558,9 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
+            if path == "/mcp" and self._host_ok():
+                self._mcp()
+                return
             if not self._host_ok() or path not in ("/api/control", "/api/terminal", "/api/voice"):
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
                 return
@@ -1451,6 +1589,30 @@ def make_handler(  # noqa: C901 - one closure per HTTP verb
                 log.exception("dashboard action failed")
                 code, body = 500, {"ok": False, "message": _plain(exc)}
             self._json(code, body)
+
+        def _mcp(self) -> None:
+            """Chantisimo's MCP server: its own bearer token, answers this computer only."""
+            from .dashboard_extras import mcp_authorized
+
+            if not mcp_authorized(self.headers.get("Authorization", "")):
+                body = b'{"error": "missing or wrong bearer token (TRENDBOT_MCP_SERVER_TOKEN)"}'
+                self._send(HTTPStatus.UNAUTHORIZED, body, "application/json",
+                           {"WWW-Authenticate": "Bearer"})  # fmt: skip
+                return
+            size = int(self.headers.get("Content-Length") or 0)
+            if size > 1_000_000:
+                self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, b"too large", "text/plain")
+                return
+            try:
+                code, reply = runtime.mcp.handle(self.rfile.read(size))
+            except Exception as exc:  # never drop the connection
+                log.exception("MCP request failed")
+                code, reply = 500, {"jsonrpc": "2.0", "id": None,
+                                    "error": {"code": -32603, "message": _plain(exc)}}  # fmt: skip
+            if reply is None:
+                self._send(code, b"", "application/json", {})
+            else:
+                self._send(code, json.dumps(reply, default=str).encode(), "application/json", {})
 
         def _memory(self, as_csv: bool) -> None:
             data = runtime.memory_bank()
