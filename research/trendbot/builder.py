@@ -197,13 +197,21 @@ def public_candles(
                 host = "api.binance.us" if ex == "binanceus" else "api.binance.com"
                 cs = _binance(pair, tf, start, end, fetch, host)
         except (FetchError, OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-            errors.append(f"{ex}: {str(exc)[:120]}")
+            from .connections import plain_error
+
+            why = plain_error(exc.__cause__ or exc) if isinstance(exc, FetchError) else str(exc)
+            errors.append(
+                f"{ex}: {'blocked in your country (HTTP 451)' if '451' in str(exc) else why[:120]}"
+            )
             continue
         cs = [c for c in cs if c.ts + TF_MS[tf] <= end]  # closed candles only
         if len(cs) >= 50:
             return cs, ex
         errors.append(f"{ex}: only {len(cs)} candles")
-    raise BuilderError("no candles: " + "; ".join(errors) + " (try exchange 'demo' offline)")
+    raise BuilderError(
+        "no candles: " + "; ".join(errors) + ". Check the internet connection; the strategy "
+        "builder also has an offline demo market"
+    )
 
 
 # ------------------------------------------------------------------------- the spec

@@ -79,7 +79,7 @@ th { color: var(--text-muted); font-weight: 500; font-size: 11px; position: stic
 .empty { color: var(--text-muted); padding: 18px 8px; text-align: center; }
 @media (max-width: 900px) {
   .wrap { grid-template-columns: minmax(0, 1fr); }
-  .palette { position: static; max-height: none; }
+  .palette { position: static; max-height: 300px; }
 }
 </style>
 </head>
@@ -163,7 +163,9 @@ function sv(tag, attrs) { const n = document.createElementNS(SVGNS, tag); for (c
 function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); return n; }
 function num(x, d = 2) { return x === null || x === undefined || !isFinite(x) ? "–" : Number(x).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }); }
 function title(id) { return NAMES[id] || id.replace(/_/g, " ").replace(/^./, c => c.toUpperCase()); }
-function sigName(id) { return id.replace(/_/g, " ").replace(/\bema200\b/i, "200 EMA").replace(/^./, c => c.toUpperCase()); }
+const SIG_NAMES = { ema200: "200 EMA", ichimoku_cloud: "Ichimoku cloud", rsi_zone: "RSI zone", macd_cross: "MACD cross", obv_trend: "OBV trend",
+  volume_rising: "Volume rising", vwap: "VWAP", fib_zone: "Fib zone", psar_flip: "Parabolic SAR flip", tenkan_kijun: "Tenkan / Kijun cross", atr_rising: "ATR rising" };
+function sigName(id) { return SIG_NAMES[id] || id.replace(/_/g, " ").replace(/^./, c => c.toUpperCase()); }
 function say(text, ok) { const m = clear(document.getElementById("msg")); if (text) m.appendChild(el("div", { class: "msg " + (ok ? "ok" : "err") }, text)); }
 async function control(action, body) {
   if (!CONTROL_TOKEN) return { ok: false, message: "the dashboard was started read-only" };
@@ -326,7 +328,7 @@ async function saveBot() {
   const name = document.getElementById("botname").value.trim();
   if (!name) { say("give the bot a name first"); return; }
   const r = await control("builder_save", { spec: spec(), name });
-  say(r.ok ? `Saved ${r.path} in paper mode. ${r.fleet ? "It is in your fleet: press Start on the dashboard." : "Start it with: trendbot.pyz bot --settings " + r.path}` : r.message, r.ok);
+  say(r.ok ? `Saved ${r.path} in paper mode. ${r.fleet ? r.fleet : "Run it with: trendbot.pyz bot run --settings " + r.path}` : r.message, r.ok);
 }
 
 // ------------------------------------------------------------------ results

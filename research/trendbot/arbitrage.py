@@ -134,14 +134,18 @@ def _kraken(fetch: Fetch) -> Book:
 
 def _coinbase(fetch: Fetch, products: Iterable[str] = COINBASE_PRODUCTS) -> Book:
     out: Book = {}
+    err: FetchError | None = None
     for pid in products:  # Coinbase has no all-products ticker, so only the main pairs
         try:
             t = fetch_json(fetch, f"https://api.exchange.coinbase.com/products/{pid}/ticker")
-        except FetchError:
+        except FetchError as exc:
+            err = exc
             continue
         r = _row(t.get("bid"), t.get("ask"))
         if r:
             out[pid.replace("-", "/")] = r
+    if not out and err is not None:
+        raise err
     return out
 
 
@@ -169,8 +173,10 @@ def books(
         try:
             out[ex] = READERS[ex](fetch)
         except (FetchError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-            msg = str(exc)
-            if "451" in msg:
+            from .connections import plain_error
+
+            msg = plain_error(exc.__cause__ or exc) if isinstance(exc, FetchError) else str(exc)
+            if "451" in str(exc):
                 msg = "blocked in your country (HTTP 451)"
             errors[ex] = msg[:200] or type(exc).__name__
     return out, errors
